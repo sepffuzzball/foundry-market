@@ -1,11 +1,11 @@
 {
   "name": "foundry-market",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Foundry VTT v14 market core (module id `market`). Native browser ESM, no build/transpile.",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "scripts": {
     "test": "node --test",

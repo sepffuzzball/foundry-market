@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.0`).
+  `download` release pointers, with `version` `0.1.1`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -110,7 +110,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.0/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.1/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -124,9 +124,16 @@ released: the tag build's tests/lint/build must pass before the tag's release is
 created.
 
 **Status: unverified in a live Foundry VTT 14 runtime.** The `0.1.0` release URL
-is only functional once that tag's `release` job has completed and published the
-`0.1.0` GitHub release. Until then, install by pointing Foundry at the repo
-directory as a module source, or from the published release once it exists.
+was never published because that tag's CI preview failed: both `0.1.0` runs of the
+`Release` workflow died in the `build` job's `npm test` step with `crypto is
+undefined` at `src/services/model.js:24` (`crypto.getRandomValues`), because the
+workflow ran on Node 18 where the Web Crypto global is not available. No `0.1.0`
+GitHub release was created, so the `0.1.0` download URL is superseded by `0.1.1`.
+The `0.1.1` release URL is only functional once that tag's `release` job has
+completed and published the `0.1.1` GitHub release (the workflow now sets up
+Node 22, where `crypto.getRandomValues` is available). Until then, install by
+pointing Foundry at the repo directory as a module source, or from the published
+release once it exists.
 
 ### Known issues / caveats
 

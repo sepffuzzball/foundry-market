@@ -16,7 +16,7 @@ unit-tested in Node only.
 
 - Foundry VTT **14** (minimum, verified and maximum are all `14`).
 - No dependencies on any game system or other module.
-- Node >= 18 only if you want to run the offline tests (`npm test`).
+- Node >= 22 only if you want to run the offline tests (`npm test`).
 
 ## Install / load
 
@@ -35,18 +35,18 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.0`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.1`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.0/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.1/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
 
-> **The `download` URL is not live until the `0.1.0` tag's release action has
+> **The `download` URL is not live until the `0.1.1` tag's release action has
 > completed** - it must upload `module.zip` and `module.json` to a GitHub release
-> for tag `0.1.0`. Until that release exists, install the module by pointing
+> for tag `0.1.1`. Until that release exists, install the module by pointing
 > Foundry at this repository directory as a module source (the manifest and
 > `src/core/main.js` are unchanged), or download the zip from the release once
 > it is published.
