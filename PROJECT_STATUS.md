@@ -164,6 +164,122 @@ release once it exists.
 - `finite` and `non-restocking` stock modes both currently decrement; the
   restock-policy difference is a later milestone.
 
+---
+
+## Milestone 2 - Shop theming, appearance & storefront interactions (prerelease, in progress)
+
+M2 extends M1 with the shop appearance schema, the fixed 8-theme CSS registry, and
+the corresponding manager/storefront interactions: a GM can set a theme and
+appearance (owner portrait, background, accent color, typography, density,
+animation, music, sound effect, welcome message), preview the change before
+saving, and browse a local media file; a player can browse a themed storefront,
+filter/search/sort the catalog, inspect an item, and opt in to background music.
+The M1 purchase flow and its per-shop lock/ledger are preserved and still
+Node-tested.
+
+M2 is **not** yet verified against a live Foundry VTT 14 runtime. The M2 CSS
+themes and interactions are Node-tested only (mocked `game`/`CONST`/`Hooks`
+boundaries); the exact `foundry.audio.AudioHelper.play` API call, the v14
+`FilePicker` constructor, and the `ApplicationV2` action dispatch (including a
+`data-action` on a `select` for sorting) should be re-checked there. The themes
+ship **no bundled audio**: every theme's `defaultSound` is empty, so background
+music plays only if the GM sets `appearance.music` and the player toggles sound
+on.
+
+### Implemented (M2)
+
+- Appearance schema (`src/services/model.js`): `normalizeAppearance` validates
+  media paths and the accent color strictly (throwing on a bad GM save) and
+  normalizes typography/density/animation radio fields to documented defaults;
+  media-path sanitizing (`sanitizeMediaPath`) is shared with the request layer.
+- Theme registry (`src/themes/registry.js`): the fixed 8-theme set
+  (`THEME_IDS`/`THEMES`/`getTheme`/`normalizeTheme`), display-only metadata
+  (label/blurb/icon glyph/hyphenated `cssClass`), no bundled audio. Plus a safe
+  `registerTheme(metadata)` extension surface: it validates a lower-case slug id,
+  rejects a duplicate (including prototype-chain names `__proto__`/
+  `constructor`/`prototype`) and enforces label/blurb/icon type and length caps,
+  sanitizes an optional `defaultSound` through the media-path sanitizer, and writes
+  only to the in-memory `THEMES`/`THEME_IDS` (never mutating a built-in or writing
+  to the store). `getTheme`/`normalizeTheme` immediately recognize a registered
+  theme, the manager theme dropdown and storefront `theme-<id>` class react to it,
+  and a `resetThemes()` helper restores the exact built-in 8 for tests.
+- Manager appearance editing + preview (`src/ui/manager.js`): theme/appearance
+  fields, `preview-appearance` (validated unsaved current form, never persisted,
+  including the current owner/description/open from the form),
+  `reset-preview` (clears both the draft and the preview), preview and draft
+  cleared on location/shop switch, and a separate `_data.draftShop` + `editingShop`
+  form context that preserves unsaved inputs across re-renders (a rejected
+  save/preview retains the raw input for correction; a successful save clears the
+  draft). The draft is also captured live on any change to a shop-details/
+  appearance field (no re-render) and invalidates any stale preview, so an
+  unsaved edit survives an inventory-action re-render untouched. When a preview
+  is active the `.preview-panel` receives the validated accent color and
+  background image (strict `#rrggbb` and a validated local media path only, stale
+  styles cleared on re-render). `browse-media` using the official v14
+  `foundry.applications.apps.FilePicker` (audio for music/sound effect, image
+  otherwise), validation errors surfaced in the notice with no store write; a
+  valid picker selection is captured into the unsaved draft and invalidates any
+  stale preview so the chosen media survives an inventory-action re-render and can
+  be saved, while an invalid picked path leaves the previous valid input untouched.
+  Inventory rows expose `publicDescription`/`category`/`rarity`, saved under the
+  existing per-shop lock; `_addItemByUuid` defaults them to empty.
+- Storefront browsing/detail/sound (`src/ui/storefront.js`): derived catalog
+  (categories = All + unique from visible public inventory, never offering a
+  category that only appears on a hidden entry; search by name/category/rarity/
+  description; sort featured/name/price ascending), inspect/card detail via click
+  or Enter/Space, `close-detail`, `filter-category`; a `selectedEntry` resolved
+  only against the current derived catalog; both product-card and detail Buy
+  buttons disabled on pending / no active GM / out-of-stock; opt-in background
+  music and a one-shot purchase `soundEffect` played via
+  `foundry.audio.AudioHelper.play` (injected `deps.playSound` for tests), stopped
+  on toggle-off/close/catalog-change/error, with a generation token that prevents
+  a stale in-flight start from leaking a Sound after a stop, and sound-effect
+  playback safe for a synchronous Sound / Promise / synchronous throw. The purchase
+  quantity is bound to `_data.quantity` (defaults to `'1'`), updated by the input's
+  `input`/`change` events without a re-render, and read back by the template
+  `value="{{quantity}}"`, so search/sort/filter/detail re-renders retain the
+  player's in-progress quantity and a purchase validates it as a positive safe
+  integer (rejecting an invalid value with feedback). Styling is applied in JS after
+  render: `--mk-custom-accent` only for a strict `#rrggbb`, `hero.style.backgroundImage`
+  only for a validated local path, old styles cleared on re-render/catalog change.
+  Full viewport sizing via `setPosition` after first render with a cleaned-up
+  resize handler.
+
+### Caveats (M2)
+
+- CSS themes and interactions are Node-tested, **not** verified on a live Foundry
+  VTT 14 install.
+- No bundled audio assets.
+- The manager captures every unsaved details/appearance edit into a
+  `_data.draftShop` on any change to a shop form field (input/change), and the
+  `editingShop` form context overlays that draft over the persisted
+  `selectedShop`; a re-render triggered by an inventory action (open picker,
+  add item, edit/remove an inventory row) keeps the draft, so in-progress
+  metadata edits are never reset. Inventory rows themselves remain bound to the
+  persisted shop (their edits are persisted only by the per-row Save). The
+  draft is discarded only on reset, location/shop switch, or a successful Save.
+- The storefront re-renders on search/sort/category/detail changes, which is
+  handled so the quantity the player typed is retained (bound to `_data.quantity`,
+  read back by the template `value="{{quantity}}"`, validated on purchase). The
+  actor select still resets to its persisted `selectedActorId` on such a re-render,
+  and the search input retains focus and its query.
+
+### Tests (M2)
+
+`tests/ui.test.js` is extended to cover: manager theme/appearance serialization,
+preview unsaved/no stale shop, invalid media rejection, public-field inventory
+GM edit, storefront category/sort/search/detail derivation (without mutating
+`_data.inventory`), sound opt-in & stop/close/catalog-change, purchase sound
+effect gating, safe/cleared styling, manager media picker draft preservation
+(valid picker -> inventory action -> save, preview invalidation, and an invalid
+picker path leaving the previous valid input untouched), storefront quantity
+state retention (quantity survives search/filter/inspect/sort and is validated
+on purchase), and that the M1 purchase/catalog flows are unaffected.
+`tests/themes.test.js` is extended to cover `registerTheme` (slug/duplicate/
+prototype-name rejection, metadata type/length caps, defaultSound sanitization,
+and immediate recognition by `getTheme`/`normalizeTheme`) plus `resetThemes`
+restoring the exact built-in 8.
+
 ### Next (not in M1)
 
 - Live Foundry VTT 14 runtime verification of the wired UI and canvas hooks.

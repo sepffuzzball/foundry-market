@@ -16,6 +16,7 @@ import { store } from '../storage/store.js';
 import { MarketManager } from '../ui/manager.js';
 import { MarketStorefront } from '../ui/storefront.js';
 import { registerPlacements, createMarketMarker } from '../canvas/placements.js';
+import { registerTheme } from '../themes/registry.js';
 
 const MODULE_ID = 'market';
 
@@ -209,6 +210,7 @@ function exposeApi(commerce) {
       return app.render({ force: true });
     },
     placeShop: (shopId) => placeShopMarker(shopId),
+    registerTheme: (metadata) => registerTheme(metadata),
   };
   const module = game.modules.get(MODULE_ID);
   if (module) {

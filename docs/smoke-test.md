@@ -292,11 +292,105 @@ client is the one that exercises the storefront.
 
 ---
 
-## 15. Summary / verdict
+## 15. M2 - Theme, appearance and storefront interactions
 
-Record a pass/fail + notes row for each section. Take **all** sections as the
-minimum signal for M1 - do not claim M1 complete on the strength of `npm test`
-alone (that only mocks the Foundry boundaries). If you are about to run a real
-economy, treat sections 1, 4 (UI/hook shapes), 12 (last-item contention) and
-the multi-GM concurrency note as mandatory, and confirm the two blockers in the
-intro are addressed before you trust a live economy to the module.
+> **Status: Node-tested only.** The M2 CSS themes and interactions are verified
+> by the automated `npm test` suite in Node. This section is the intended
+> real-runtime check for the M2 UI: the `ApplicationV2` action dispatch
+> (including `data-action` on a `select` for sorting), the v14 `FilePicker`
+> constructor and the `foundry.audio.AudioHelper.play` call have NOT yet been
+> exercised on a live v14 install.
+
+### 15.1 GM sets a theme and appearance (and previews it)
+
+1. As the **GM**, open the Market Manager, select a shop, and set the **theme**
+   preset and an **accent color** (`#rrggbb`), then click **Preview appearance**.
+2. Confirm the preview panel updates to reflect the current (unsaved) form -
+   including a theme/accent you just typed but have NOT saved.
+
+**Expected**
+
+- The preview reflects the live form, not the last saved shop.
+- Clicking **Preview** does NOT persist anything (reopen the shop and the old
+  values remain until **Save changes**).
+- Switching location or shop clears the preview.
+- Entering an invalid accent (e.g. `red`) or an unsupported media path (e.g. an
+  `https://` URL) shows a notice and does NOT write to the store.
+
+### 15.2 GM browses a local media file
+
+1. Use the **Browse** button on a music/sound-effect field and confirm it opens
+   an **audio** picker; use it on a portrait/background field and confirm it
+   opens an **image** picker.
+2. Pick a file and confirm the matching input is populated; save and reopen to
+   confirm the value persists.
+
+**Expected**
+
+- The correct picker type opens for each field.
+- The chosen path is written into the matching input; an invalid/remote path
+  shows a notice rather than being saved.
+
+### 15.3 Player browses a themed storefront
+
+1. As the **player**, open a shop whose GM set a theme and appearance. Confirm
+   the storefront renders with the theme's art direction, the custom accent
+   applied, and the hero background image only if a valid local path was set.
+2. Use the **category tabs**, the **search** box and the **sort** dropdown.
+
+**Expected**
+
+- The catalog filters by category, searches by name/category/rarity/description,
+  and sorts by featured (catalog order) / name / price (ascending).
+- The category tabs list **All** plus every distinct category present in the
+  visible public inventory; entries with `visible: false` are absent.
+
+### 15.4 Player inspects an item
+
+1. Click a product card (or focus it and press **Enter**/**Space**); confirm the
+   item detail panel opens.
+2. Close it with the **×** button. Filter/sort/search so the selected item is
+   excluded, then include it again.
+
+**Expected**
+
+- The detail panel shows only that entry's public fields (name, image, category,
+  rarity, public description, price); no item `system` data or `itemUuid`.
+- The detail hides when the item is filtered out, and the **Buy** button still
+  works from both the card and the detail panel.
+
+### 15.5 Player toggles sound (music + purchase effect)
+
+1. As the **player**, toggle **Sound on** in a storefront whose GM set a valid
+   `appearance.music` path. Confirm the music plays.
+2. Toggle **Sound off** - confirm it stops. Also confirm sound stops when the
+   storefront is closed, or when the catalog changes/errors.
+3. Leave sound on and make a successful purchase where the GM set a valid
+   `soundEffect` path; confirm the one-shot plays.
+
+**Expected**
+
+- Background music plays only after an explicit **toggle**, never automatically.
+- The purchase sound effect plays only when sound is enabled AND the path is
+  valid; a playback error surfaces a readable notice and is not sent over the
+  socket.
+
+### 15.6 Viewport sizing
+
+1. Open the storefront and confirm it fills most of the viewport (minus a margin)
+   after the first render. Resize the browser window and confirm it follows.
+
+**Expected**
+
+- No browser Fullscreen API permission prompt is shown.
+- The window is sized against the available viewport and resizes with the window.
+
+## 16. Summary / verdict
+
+Record a pass/fail + notes row for each section. Take **all** sections (1-15) as
+the minimum signal for M1/M2 - do not claim completion on the strength of
+`npm test` alone (that only mocks the Foundry boundaries). If you are about to
+run a real economy, treat sections 1, 4 (UI/hook shapes), 12 (last-item
+contention), 15.3/15.4 (M2 action dispatch) and the multi-GM concurrency note as
+mandatory, and confirm the two blockers in the intro are addressed before you
+trust a live economy to the module.

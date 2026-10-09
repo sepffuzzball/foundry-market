@@ -55,7 +55,8 @@ runtime source.
 
 Open **Settings > Manage Modules**, tick **market**, then **reload the world**.
 On load, `game.modules.get('market').api` is exposed with `store`, `commerce`,
-`getAdapter`, `request`, `openManager`, `openShop`, `placeShop`.
+`getAdapter`, `request`, `openManager`, `openShop`, `placeShop`,
+`registerTheme`.
 
 ### Open the GM Market Manager
 
@@ -108,11 +109,15 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 
 ### Risks
 
-- **Live Foundry VTT 14 runtime is not yet tested.** M1 is wired and unit-tested
-  in Node only (the mocks install `game`/`Hooks`/`CONST`, `JournalEntry` and the
-  actor document API), so the exact `ApplicationV2`/`HandlebarsApplicationMixin`
-  UI and `dropCanvasData` hook shapes should be re-checked against a real v14
-  install. Run `docs/smoke-test.md` before trusting a live economy.
+- **Live Foundry VTT 14 runtime is not yet tested.** M1/M2 are wired and
+  unit-tested in Node only (the mocks install `game`/`Hooks`/`CONST`,
+  `JournalEntry` and the actor document API), so the exact
+  `ApplicationV2`/`HandlebarsApplicationMixin` UI, the `dropCanvasData` hook
+  shapes, the v14 `FilePicker` constructor and the
+  `foundry.audio.AudioHelper.play` call should be re-checked against a real v14
+  install. Run `docs/smoke-test.md` before trusting a live economy. The M2 CSS
+  themes and interactions are Node-tested only, and the themes ship no bundled
+  audio.
 - **Concurrency across GMs is best-effort.** The per-shop lock serializes
   purchases within one client only; across multiple GM clients the ledger is the
   only cross-client guard and it is a read-then-create, not a server-side CAS.
@@ -120,7 +125,7 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 - **No live use yet.** The module has been exercised in tests only; the smoke
   checklist is the intended first real-runtime check.
 
-## What works (M1)
+## What works (M1/M2)
 
 - **UI (wired, not system-tested)**:
   - **Market Manager** (`MarketManager`, GM-only): create/select locations and
@@ -129,12 +134,42 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
     quantity/price/stock mode/visibility, remove entries, place a canvas marker
     and open a player preview. Opened from the Journal sidebar button, the
     Settings > Market menu, or `game.modules.get('market').api.openManager()`.
+  - **Manager M2 additions**: the manager also edits the shop's theme and
+    appearance (owner portrait, background image, accent color, typography,
+    density, animation, music, sound effect, welcome message) from the fixed
+    8-theme registry, previews the change against the unsaved form before saving
+    (never persists), clears the preview on location/shop switch, and browses a
+    local media file with the official v14
+    `foundry.applications.apps.FilePicker` (audio for music/sound effect, image
+    otherwise). A chosen media path is captured into the unsaved draft and
+    invalidates any stale preview, so the selection survives an inventory-action
+    re-render and can be saved; an invalid picked path is rejected with a notice
+    and never erases the previous valid path. Invalid media/accent values surface
+    a notice without writing to the store. The inventory rows expose
+    `publicDescription`, `category` and `rarity`, saved under the same per-shop
+    lock; added items default these to empty (the item system description is not
+    auto-exposed).
   - **Player Storefront** (`MarketStorefront`): requests the catalog through the
     request channel, correlates the response by `requestId`, only trusts
     GM-authored responses, never reads the private store, offers only actors
     the player owns, and disables purchase while there is no active GM / the
     request is pending / the shop is closed / an entry is out of stock.
     Opened via `api.openShop(shopId)` or by clicking a canvas marker.
+  - **Storefront M2 additions**: the catalog view is derived from the visible
+    public inventory with category tabs (All + every distinct category), search
+    by name/category/rarity/description, sorting by featured/name/price, and an
+    inspectable item detail panel (click or Enter/Space) that only tracks an
+    entry that is in the current catalog. The player can toggle background music
+    on (played locally via `foundry.audio.AudioHelper.play`, never over the
+    socket, and stopped on toggle-off/close/catalog change/error) and a one-shot
+    purchase `soundEffect` plays only when sound is enabled and the path is
+    valid. The purchase quantity is bound to state (defaults to `1`) and is
+    retained across search/sort/filter/detail re-renders, so it is never reset
+    while the player is browsing; a purchase validates it as a positive safe
+    integer and rejects an invalid value rather than silently flooring. The
+    storefront sizes itself to the full viewport after first render (no browser
+    Fullscreen API permission request) and cleans up its resize handler on close.
+    The M1 purchase flow is unchanged.
   - **Canvas markers** (`src/canvas/placements.js`): dragging a shop element
     onto the canvas (or clicking "Place shop") creates a public marker
     JournalEntry (default OBSERVER) plus a Scene Note with no private store
@@ -176,6 +211,42 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
   response back to the requester and all GMs. Responses expose only allowlisted
   public shop fields and visible inventory fields - no item `system` data and no
   `itemUuid`.
+
+## Extending themes
+
+The built-in 8-theme registry is display-only: a theme is an `id`, a `label`, a
+`blurb`, an `icon` glyph and an optional `defaultSound` media path. No stylesheet
+is generated by the module; the storefront renders `theme-<id>` (and the manager
+preview renders `.preview-panel.theme-<id>`) on the root element, and the CSS for
+those selectors lives in `styles/market.css` for the built-ins. An external module
+can register its own theme at load time - it is purely in-memory and never writes
+to the market store - and then supply matching CSS:
+
+```js
+// In an external module's init hook (after the market module's hook runs).
+const api = game.modules.get('market')?.api;
+api.registerTheme({
+  id: 'candy-shop',
+  label: 'Candy Shop',
+  blurb: 'A sweet shop of confections and spun sugar.',
+  icon: '\u2764',
+  // optional: a valid local media path; an invalid value is sanitised to ''.
+  defaultSound: 'modules/my-module/sfx/candy.ogg',
+});
+```
+
+```css
+/* The external module's own stylesheet. Only the theme-<id> (and optionally
+   .preview-panel.theme-<id> for the GM preview) selectors need supplying. */
+.theme-candy-shop { --mk-theme-ink:#f7e7ff; --mk-theme-base:#2a1d33; --mk-theme-panel:#3a2a47; --mk-theme-accent:#e07ee0; --mk-theme-muted:#d3b0d6; }
+.theme-candy-shop .shop-hero { background:radial-gradient(ellipse at 50% 0,#6b2a6b,#2a1d33 68%); }
+```
+
+A theme id must be a lower-case slug (letters/digits separated by single
+hyphens) and is rejected if it collides with a built-in id, an already-registered
+id, or a prototype-chain name (`__proto__`/`constructor`/`prototype`). Registering
+a theme never touches shop data: the GM must still set the `theme` field on a
+shop for the storefront to use it.
 
 ## Adapter setup
 

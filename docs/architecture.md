@@ -13,7 +13,8 @@ milestones build on this core.
   (no raw socket for authenticated requests), and bundles `styles/market.css`.
 - `game.modules.get('market').api` is set during `init`. It exposes:
   `store`, `commerce`, `getAdapter(systemId, opts)`, `request(payload)`,
-  `openManager()`, `openShop(shopId)`, and `placeShop(shopId)`.
+  `openManager()`, `openShop(shopId)`, `placeShop(shopId)`, and
+  `registerTheme(metadata)`.
 
 ## Storage model
 
@@ -51,13 +52,20 @@ existed (and therefore must never charge). Exported functions: `listLocations`, 
 Records are normalized before persistence (`src/services/model.js`):
 
 - Location: `id, name, description, theme, createdAt`.
-- Shop: `id, name, locationId, description, theme, owner, open, inventory[],
-  createdAt`.
+- Shop: `id, name, locationId, description, theme, owner, open,
+  appearance {}, inventory[], createdAt`. The `appearance` object (M2) carries
+  only validated styling fields - `backgroundImage`, `ownerPortrait`,
+  `accentColor`, `typography`, `density`, `animation`, `music`, `soundEffect`
+  and `welcomeMessage` - and is always normalized to documented defaults before
+  persistence.
 - Inventory entry: `id, itemUuid, snapshot, name, img, quantity, stockMode
   ('finite'|'unlimited'|'non-restocking'), price (non-negative integer minor
-  units), visible`. `itemUuid` may be empty when the entry is backed by a
-  snapshot alone, and `snapshot` is the serialized item data used as a delivery
-  fallback when the `itemUuid` is absent or deleted.
+  units), visible, publicDescription, category, rarity`. `itemUuid` may be empty
+  when the entry is backed by a snapshot alone, and `snapshot` is the serialized
+  item data used as a delivery fallback when the `itemUuid` is absent or deleted.
+  The public-facing `publicDescription`/`category`/`rarity` fields are empty by
+  default (the item's internal system description is never auto-exposed); the GM
+  fills them in the manager inventory row.
 - Ledger: `id, key, status, payloadHash, userId, shopId, entryId, actorId,
   quantity, unitPrice, totalPrice, payload, outcome, error, compensation,
   createdAt, updatedAt`.
@@ -192,9 +200,17 @@ back to the requester and all GMs.
 - Responses are allowlisted and public-only:
 
 ```
-PUBLIC_SHOP_FIELDS = [id, name, locationId, description, theme, open]
-PUBLIC_ENTRY_FIELDS = [id, name, img, price, quantity, stockMode, visible]
+PUBLIC_SHOP_FIELDS = [id, name, locationId, description, theme, owner,
+                      appearance, open]
+PUBLIC_ENTRY_FIELDS = [id, name, img, price, quantity, stockMode, visible,
+                       publicDescription, category, rarity]
 ```
+
+The public shop projection sanitizes the `appearance` object before sending it
+(media paths collapse to `''` when invalid, the accent color must be empty or a
+strict `#rrggbb`, radio fields fall back to documented defaults, and
+`welcomeMessage` is capped), so a player catalog never leaks an invalid or
+untrusted styling value.
 
 No `itemUuid`, no item `system` data, no raw flags are leaked. `snapshot`
 (which may carry secret system/GM item data) is deliberately **not** exposed;
@@ -222,14 +238,21 @@ and no system/module dependency.
 - `placeShop(shopId)` - create a public canvas marker for a shop at the scene
   center. GM-only (consistent with the canvas `dropCanvasData` path); the shop
   must exist, otherwise no marker/journal is created.
+- `registerTheme(metadata)` - register an additional shop theme in memory. The
+  metadata is `{ id, label, blurb, icon, defaultSound? }`; the id must be a
+  lower-case slug and is rejected on a duplicate or a prototype-chain name. The
+  registered theme is immediately recognized by `getTheme`/`normalizeTheme` and
+  appears in the manager theme dropdown and the storefront `theme-<id>` class.
+  Purely in-memory: it never writes to the market store, and the supplying module
+  must provide the CSS for `theme-<id>` / `.preview-panel.theme-<id>`.
 
 The UI applications read the module `api` and Foundry globals lazily, so they
 also work when opened by a Settings menu entry (`registerMenu`), which
 instantiates them without injected dependencies.
 
-## UI (M1)
+## UI (M1/M2)
 
-The M1 UI is wired on top of the core. It is **not** yet verified against a live
+The UI is wired on top of the core. It is **not** yet verified against a live
 Foundry VTT 14 install - it is unit-tested in Node and uses documented
 `ApplicationV2`/`HandlebarsApplicationMixin` hooks.
 
@@ -255,6 +278,51 @@ The request/response ChatMessages are created with
   re-reads the shop so a concurrent purchase's stock change is never lost. It is
   reachable from a Journal sidebar button, a `registerMenu` Settings entry, and
   `api.openManager()`.
+
+  M2 additions: the manager edits the shop `appearance` (owner portrait,
+  background image, accent color, typography, density, animation, music, sound
+  effect, welcome message) and the `theme`, choosing from the theme registry
+  (`src/themes/registry.js`). The registry exposes the built-in 8 themes plus a
+  safe `registerTheme` surface for external modules (a validated lower-case slug
+  id, label/blurb/icon length rules, an optional `defaultSound` sanitized through
+  the media-path sanitizer, and rejection of duplicates/prototype names) that
+  only updates the in-memory registry - it never mutates a built-in or writes to
+  the store, and the supplying module must provide the CSS for `theme-<id>` /
+  `.preview-panel.theme-<id>`. `_readShopForm()` returns a normalized
+  theme and appearance; appearance validation is strict (media paths and accent
+  color) and an invalid form surfaces a notice without writing to the store.
+  The manager keeps a separate `_data.draftShop` for raw, unsaved form inputs.
+  `preview-appearance`/`save-shop` capture the CURRENT form into the draft, and
+  the details/appearance inputs bind to an `editingShop` context that overlays
+  the draft over the persisted `selectedShop`, so a re-render never resets the
+  GM's in-progress edits; inventory rows stay bound to the persisted
+  `selectedShop`. On every `_onRender` the manager also binds `input`/`change`
+  listeners to the shop-details/appearance fields only (name, owner, theme,
+  description, open and the appearance fields - never the inventory row fields),
+  so any edit captures the RAW form into the draft immediately without a
+  re-render and invalidates any stale preview. Because `_refreshData` spreads and
+  preserves `draftShop`, an inventory-action re-render (open picker, add item,
+  edit/remove an inventory row) never resets the GM's unsaved metadata edits. A
+  validated `previewShop` (only built after validation
+  succeeds, never persisted) uses the normalized appearance and includes the
+  current owner/description/open from the form; when a preview is shown,
+  `.preview-panel` is styled in JS (`--mk-custom-accent` only for a strict
+  `#rrggbb`, `style.backgroundImage` only for a validated local path, any stale
+  values cleared on re-render). On `save`, a rejected
+  appearance preserves the RAW draft (so the GM can correct the exact bad input)
+  and a successful save clears the draft; `reset-preview` clears both the draft
+  and the preview, and switching location/shop clears both too. `browse-media`
+  opens the official v14 `foundry.applications.apps.FilePicker` (audio for
+  music/sound effect, image otherwise) and writes the chosen path into the
+  matching input, validating it against the local media-path rules before use. A
+  valid picker selection also captures the raw draft (and invalidates any stale
+  preview) so the chosen media survives an inventory-action re-render and can be
+  saved; an invalid picked path leaves the previous valid input untouched and
+  surfaces a notice. The inventory rows expose
+  `publicDescription`/`category`/`rarity`, which `_onSaveEntry` reads and
+  persists under the same per-shop lock; `_addItemByUuid` defaults these to
+  empty (the item's system description is not auto-exposed).
+
 - **Player Storefront** (`src/ui/storefront.js`, `MarketStorefront`). Requests
   the catalog through `api.request`, correlates the response by `requestId`,
   verifies the response whisper's author is a GM, and never accesses the private
@@ -263,6 +331,43 @@ The request/response ChatMessages are created with
   there is no active GM, while a request is pending, or when the shop is closed
   or an entry is out of stock; after a successful purchase the catalog refreshes
   without reopening. A GM preview uses the same request channel.
+
+  M2 additions: the catalog view derives a display-only list in
+  `_prepareContext` (without overwriting `_data.inventory`, which the M1
+  purchase/catalog flows read) - categories are computed from the visible public
+  inventory as All + every distinct non-empty category (a category that only
+  appears on a hidden entry is never offered as a filter tab); entries can be
+  searched by name/category/rarity/description and sorted by featured (catalog
+  order), name or price ascending; and a single entry can be inspected (click or
+  Enter/Space on a product card) to show a detail panel that closes with
+  `close-detail`. `selectedEntry` is resolved only against the CURRENT derived
+  catalog, so it clears when the entry disappears or is hidden. Both the
+  product-card and the detail Buy buttons are disabled while a request is
+  pending, with no active GM, or for an out-of-stock entry; a closed shop
+  already hides the whole catalog. Background music plays only after an explicit
+  user toggle (`toggle-sound`), via the documented
+  `foundry.audio.AudioHelper.play({src, volume: 0.25, loop: true})`, injected as
+  `deps.playSound` for tests; it stops on toggle-off, on app close, and on any
+  catalog change/error, and a generation token invalidates any in-flight
+  `_startSound` so a stale resolved Sound is stopped rather than leaked as the
+  live handle. A one-shot `soundEffect` is attempted on a successful purchase
+  only when sound is enabled and the path is valid; it safely handles a
+  synchronous Sound return, a Promise, and a synchronous throw (no `.catch` is
+  attached to a non-Promise), and playback exceptions surface a readable notice
+  without an unhandled rejection and never ride over the socket. The purchase
+  quantity is bound to `_data.quantity` (defaults to `'1'`): the quantity input's
+  `input`/`change` events update the state without a re-render, the template binds
+  `value="{{quantity}}"`, so search/sort/filter/detail re-renders retain the
+  player's in-progress quantity, and `_requestPurchase` reads the live field or the
+  bound state and validates it as a positive safe integer (rejecting an invalid
+  value with feedback rather than silently flooring). Styling is applied
+  in JS after render (never inline template interpolation): a CSS variable
+  `--mk-custom-accent` is set on the app root only for a strict `#rrggbb` accent
+  and cleared on re-render/catalog change, and `hero.style.backgroundImage` is
+  set only when the path passes `sanitizeMediaPath`. After the initial render the
+  window is positioned to the full viewport (minus a margin) via `setPosition`,
+  with a resize handler that is removed on close; no browser Fullscreen API
+  permission is requested.
 - **Canvas markers** (`src/canvas/placements.js`). A draggable shop element sets
   `text/plain` JSON `{"type":"MarketShop","shopId":...}`. On `dropCanvasData`
   only a GM creates a public marker JournalEntry (default OBSERVER) plus a Scene
@@ -276,10 +381,16 @@ The request/response ChatMessages are created with
   at runtime. `JournalEntry.create` is used for the marker journal, and
   `api.placeShop` is GM-gated like the drop path.
 
-## Known limitations (M1)
+## Known limitations (M1/M2)
 
 - The UI and canvas hooks are wired and Node-tested but not yet verified against
-  a live Foundry VTT 14 runtime.
+  a live Foundry VTT 14 runtime. The M2 CSS themes and storefront/manager
+  interactions are likewise Node-tested only; the `ApplicationV2` action
+  dispatch, `FilePicker` and `foundry.audio.AudioHelper.play` calls should be
+  re-checked on a real v14 install.
+- The themes ship no bundled audio: the `defaultSound` of every registered theme
+  is empty, so background music only plays if the GM sets an `appearance.music`
+  path and the player toggles sound on.
 - `Daggerheart`/`DC20`/`Twodsix` need GM-configured generic paths before they
   report support.
 - Generic path updates assume object (not array-index) path segments for the

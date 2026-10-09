@@ -6,7 +6,7 @@
 // hook's `userId` must be a GM). Actors offered for purchase are those the
 // current user owns (`actor.testUserPermission(game.user, OWNER)`).
 
-import { makeId } from '../services/model.js';
+import { makeId, ACCENT_COLOR_RE, sanitizeMediaPath } from '../services/model.js';
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 
@@ -68,6 +68,11 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       buy: this._action('_onBuy'),
       refresh: this._action('_onRefresh'),
       'select-actor': this._action('_onSelectActor'),
+      'filter-category': this._action('_onFilterCategory'),
+      inspect: this._action('_onInspect'),
+      'close-detail': this._action('_onCloseDetail'),
+      'toggle-sound': this._action('_onToggleSound'),
+      'sort-items': this._action('_onSortItems'),
     },
   };
 
@@ -76,6 +81,11 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     this._deps = options.deps || {};
     this._storefrontShopId = options.shopId || options.shop || null;
     this._loaded = false;
+    // Monotonic token for background-music starts. Incremented on every stop so
+    // an in-flight `_startSound` that resolves later detects it was superseded
+    // and stops the stale Sound instead of leaking it as the live handle.
+    this._soundGeneration = 0;
+    this._soundHandle = null;
     this._pendingCatalogRequestId = null;
     this._pendingPurchaseRequestId = null;
     this._pendingPurchaseEntryId = null;
@@ -86,6 +96,8 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
 
   _onClose() {
     if (typeof Hooks !== 'undefined') Hooks.off('createChatMessage', this._bindChat);
+    this._stopSound();
+    this._unbindResize();
   }
 
   _initialData() {
@@ -102,13 +114,35 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       feedback: '',
       notice: '',
       error: null,
+      // Storefront browsing state (M2). These live in `_data`; the display list
+      // is derived in `_prepareContext` so M1 callers inspecting `_data.inventory`
+      // continue to see the raw catalog.
+      sort: 'featured',
+      search: '',
+      categoryFilter: null,
+      selectedEntryId: null,
+      soundEnabled: false,
+      // The raw purchase-quantity string. Bound to the quantity input/change
+      // without a re-render so search/sort/filter/inspect re-renders never reset
+      // the player's in-progress quantity. Defaults to '1'.
+      quantity: '1',
     };
   }
 
   // ---- context / lifecycle -------------------------------------------------
 
   _prepareContext() {
-    return this._data;
+    // Derive the public catalog view from `_data` WITHOUT overwriting
+    // `_data.inventory`, which M1 tests and purchase/catalog logic read.
+    const list = this._catalogEntries();
+    const id = this._data.selectedEntryId;
+    const selectedEntry = (id && list.find((e) => e.id === id)) || null;
+    return {
+      ...this._data,
+      inventory: list,
+      categories: this._catalogCategories(),
+      selectedEntry,
+    };
   }
 
   async _onRender(event) {
@@ -118,9 +152,25 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     if (!this._data.selectedActorId && this._data.actors.length) {
       this._data.selectedActorId = this._data.actors[0].id;
     }
+    this._applyStorefrontStyles();
+    // Restore search focus/caret after a re-render so search-as-you-type keeps
+    // focus (the template rebinds the input value from `_data.search`).
+    if (this._focusSearch) {
+      const search = this.element?.querySelector?.('input[name="search"]');
+      if (search && typeof search.focus === 'function') {
+        search.focus();
+        if (typeof search.setSelectionRange === 'function') {
+          const len = (search.value || '').length;
+          search.setSelectionRange(len, len);
+        }
+      }
+      this._focusSearch = false;
+    }
     if (!this._loaded) {
       this._loaded = true;
       await this._requestCatalog();
+      this._applyViewportPosition();
+      this._bindResize();
     }
   }
 
@@ -284,6 +334,9 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       this._data.error = null;
       this._data.notice = '';
     }
+    // Stop any playing loop on a catalog change/error; restart it only if the
+    // player explicitly opted in and the new catalog has a valid music path.
+    this._syncSound();
     this.render({ force: true });
   }
 
@@ -294,6 +347,7 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     const result = response?.result || { status: 'error' };
     if (result.status === 'committed') {
       this._data.feedback = 'Purchase complete.';
+      this._playSoundEffect();
       this.render({ force: true });
       // Refresh the catalog without reopening the storefront.
       this._requestRefresh();
@@ -352,15 +406,28 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
   }
 
   _readQuantity() {
+    // Prefer the live field (it is the source of truth while the storefront is
+    // on screen and reflects the player's most recent keystroke); fall back to the
+    // bound `_data.quantity` state so a re-render never loses an input.
     const el = this.element?.querySelector?.('[name="quantity"]');
-    if (!el) return 1;
-    const raw = String(el.value).trim();
+    const raw = String(el ? el.value : this._data.quantity ?? '').trim();
     if (raw === '') return 1;
     const n = Number(raw);
     // Reject anything that is not a positive safe integer (no flooring, no
     // silent replacement with a default). Returns null for invalid input so the
     // caller can surface a validation error instead of sending a wrong quantity.
     return Number.isSafeInteger(n) && n >= 1 ? n : null;
+  }
+
+  /**
+   * A live change to the quantity input. Updates `_data.quantity` so a
+   * search/sort/filter/inspect re-render retains the player's in-progress value.
+   * Deliberately does NOT re-render - the value is only read back by the next
+   * re-render via the template binding.
+   */
+  _onQuantityChange(event) {
+    const value = event?.target?.value;
+    if (typeof value === 'string') this._data.quantity = value;
   }
 
   _readField(name) {
@@ -376,25 +443,280 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     const root = this.element;
     if (!root) return;
     const input = root.querySelector('input[name="search"]');
-    if (input) input.addEventListener('input', () => this._filterCatalog(input.value));
+    if (input) input.addEventListener('input', () => this._onSearchInput(input.value));
+    const sortSelect = root.querySelector('select[name="sort"]');
+    if (sortSelect) {
+      sortSelect.addEventListener('change', () => this._onSortItems(null, sortSelect, {}));
+    }
     const actorSelect = root.querySelector('select[name="actorId"]');
     if (actorSelect) {
       actorSelect.addEventListener('change', () => {
         this._data.selectedActorId = actorSelect.value;
       });
     }
+    const quantityInput = root.querySelector('input[name="quantity"]');
+    if (quantityInput) {
+      quantityInput.addEventListener('input', (event) => this._onQuantityChange(event));
+      quantityInput.addEventListener('change', (event) => this._onQuantityChange(event));
+    }
+    root.querySelectorAll('.product-card').forEach((card) => {
+      card.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          this._inspectEntry(card.dataset.entryId);
+        }
+      });
+    });
+  }
+
+  _onSearchInput(value) {
+    this._focusSearch = true;
+    this._filterCatalog(value || '');
   }
 
   _filterCatalog(term) {
-    const query = String(term || '').trim().toLowerCase();
-    const root = this.element;
-    if (!root) return;
-    root.querySelectorAll('.product-card').forEach((card) => {
-      const name = card.querySelector('.product-info h3')?.textContent || '';
-      const imgAlt = card.querySelector('.product-art img')?.alt || '';
-      const hay = `${name} ${imgAlt}`.toLowerCase();
-      card.style.display = !query || hay.includes(query) ? '' : 'none';
+    this._data.search = String(term || '');
+    this.render({ force: true });
+  }
+
+  // ---- catalog derivation ------------------------------------------------------
+
+  _catalogEntries() {
+    const raw = this._data.inventory || [];
+    const query = String(this._data.search || '').trim().toLowerCase();
+    const category = this._data.categoryFilter || null;
+    const list = raw.filter((e) => {
+      if (e.visible === false) return false;
+      if (category && String(e.category || '') !== category) return false;
+      if (query) {
+        const hay = [e.name, e.category, e.rarity, e.publicDescription]
+          .map((v) => String(v ?? '').toLowerCase())
+          .join(' ');
+        if (!hay.includes(query)) return false;
+      }
+      return true;
     });
+    return this._sortCatalog(list);
+  }
+
+  _sortCatalog(list) {
+    const copy = list.slice();
+    const mode = this._data.sort || 'featured';
+    if (mode === 'name') {
+      copy.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    } else if (mode === 'price') {
+      copy.sort((a, b) => Number(a.price || 0) - Number(b.price || 0));
+    }
+    // 'featured' presets the catalog's original order (no reordering).
+    return copy;
+  }
+
+  _catalogCategories() {
+    const entries = this._data.inventory || [];
+    const seen = new Set();
+    const cats = [];
+    for (const e of entries) {
+      // Only categories that appear on VISIBLE public entries belong in the
+      // filter tabs; a hidden entry's category must not surface a tab that
+      // filters the catalog down to nothing.
+      if (e.visible === false) continue;
+      const c = String(e.category || '').trim();
+      if (c && !seen.has(c)) {
+        seen.add(c);
+        cats.push(c);
+      }
+    }
+    cats.sort((a, b) => a.localeCompare(b));
+    const out = [{ id: 'all', label: 'All', active: !this._data.categoryFilter }];
+    for (const c of cats) {
+      out.push({ id: c, label: c, active: this._data.categoryFilter === c });
+    }
+    return out;
+  }
+
+  // ---- catalog actions ---------------------------------------------------------
+
+  async _onFilterCategory(event, target, data) {
+    const id = target?.dataset?.category || data?.dataset?.category;
+    if (!id) return;
+    this._data.categoryFilter = id === 'all' ? null : id;
+    this.render({ force: true });
+  }
+
+  async _onInspect(event, target, data) {
+    const id = target?.dataset?.entryId || data?.dataset?.entryId;
+    if (!id) return;
+    this._inspectEntry(id);
+  }
+
+  _inspectEntry(id) {
+    this._data.selectedEntryId = id;
+    this.render({ force: true });
+  }
+
+  async _onCloseDetail(event, target, data) {
+    this._data.selectedEntryId = null;
+    this.render({ force: true });
+  }
+
+  async _onSortItems(event, target, data) {
+    const value = target?.value ?? data?.value;
+    if (!value) return;
+    this._data.sort = value;
+    this.render({ force: true });
+  }
+
+  async _onToggleSound(event, target, data) {
+    this._data.soundEnabled = !this._data.soundEnabled;
+    if (this._data.soundEnabled) {
+      await this._startSound();
+    } else {
+      this._stopSound();
+    }
+    this.render({ force: true });
+  }
+
+  // ---- sound -------------------------------------------------------------------
+
+  async _startSound() {
+    // Capture the generation now so that, if the play promise resolves AFTER a
+    // toggle-off / catalog change / close (all of which increment the token via
+    // `_stopSound`), the stale resolved Sound is stopped rather than installed
+    // as the live handle.
+    const token = this._soundGeneration;
+    const src = this._data.shop?.appearance?.music || '';
+    if (!src) return;
+    const valid = sanitizeMediaPath(src);
+    if (!valid) {
+      this._data.notice = 'The shop music path is not a valid local asset path.';
+      return;
+    }
+    let sound;
+    try {
+      sound = await this._playSound({ src: valid, volume: 0.25, loop: true });
+    } catch (err) {
+      this._data.notice = 'Could not play the shop music.';
+      return;
+    }
+    if (token !== this._soundGeneration) {
+      // The start was superseded while in flight; a `_stopSound` already ran, so
+      // stop this now-stale Sound and keep the handle null.
+      this._stopSoundHandle(sound);
+      return;
+    }
+    this._soundHandle = sound;
+  }
+
+  /**
+   * Safely stop an arbitrary Sound-like handle. Handles a synchronous `stop()`
+   * throw and an async rejected `stop()` promise without an unhandled rejection.
+   */
+  _stopSoundHandle(handle) {
+    if (!handle || typeof handle.stop !== 'function') return;
+    try {
+      const result = handle.stop();
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch (err) {
+      // No-op: a failed stop is not user-facing.
+    }
+  }
+
+  _stopSound() {
+    // Invalidate any in-flight `_startSound`; a stale resolved sound is stopped
+    // by its own continuation when it sees the token moved.
+    this._soundGeneration += 1;
+    this._stopSoundHandle(this._soundHandle);
+    this._soundHandle = null;
+  }
+
+  _syncSound() {
+    this._stopSound();
+    if (this._data.soundEnabled) this._startSound();
+  }
+
+  _playSound(opts) {
+    if (typeof this._deps.playSound === 'function') return this._deps.playSound(opts);
+    const AudioHelper = foundry?.audio?.AudioHelper || globalThis.AudioHelper;
+    if (AudioHelper && typeof AudioHelper.play === 'function') return AudioHelper.play(opts);
+    return Promise.resolve(null);
+  }
+
+  _playSoundEffect() {
+    if (!this._data.soundEnabled) return;
+    const src = this._data.shop?.appearance?.soundEffect || '';
+    const valid = sanitizeMediaPath(src);
+    if (!valid) return;
+    let result;
+    try {
+      result = this._playSound({ src: valid, volume: 0.25, loop: false });
+    } catch (err) {
+      // A synchronous throw from a playSound mock/stub surfaces as a notice.
+      this._data.notice = 'Could not play the purchase sound effect.';
+      return;
+    }
+    // `_playSound` may return a synchronous Sound object (which has no `.catch`)
+    // or a Promise. Only attach a rejection handler to a real thenable so a sync
+    // return never throws on `.catch is not a function`, and never leaves an
+    // unhandled rejection on a pending promise.
+    if (result && typeof result.catch === 'function') {
+      result.catch(() => {
+        this._data.notice = 'Could not play the purchase sound effect.';
+      });
+    }
+  }
+
+  // ---- storefront styling / viewport --------------------------------------------
+
+  _applyStorefrontStyles() {
+    const root = this.element;
+    if (!root || typeof root.style === 'undefined') return;
+    // Target the `.market-storefront` element (which the app form may wrap);
+    // setting the variable anywhere higher would be overridden by the
+    // selector's own default declaration.
+    const hasClass = typeof root.classList?.contains === 'function';
+    let storeRoot = root;
+    if (!(hasClass && root.classList.contains('market-storefront'))) {
+      const el = typeof root.querySelector === 'function' ? root.querySelector('.market-storefront') : null;
+      if (el) storeRoot = el;
+    }
+    const target = storeRoot && storeRoot.style ? storeRoot : root;
+    // Always clear the previous custom accent so a re-render/catalog change never
+    // leaks a stale color from an earlier shop.
+    target.style.removeProperty('--mk-custom-accent');
+    const accent = this._data.shop?.appearance?.accentColor || '';
+    if (ACCENT_COLOR_RE.test(accent)) {
+      target.style.setProperty('--mk-custom-accent', accent);
+    }
+    const hero =
+      typeof root.querySelector === 'function' ? root.querySelector('.shop-hero') : null;
+    if (hero && hero.style) {
+      hero.style.backgroundImage = '';
+      const bg = sanitizeMediaPath(this._data.shop?.appearance?.backgroundImage || '');
+      if (bg) hero.style.backgroundImage = `url("${bg}")`;
+    }
+  }
+
+  _applyViewportPosition() {
+    if (typeof window === 'undefined') return;
+    if (typeof this.setPosition !== 'function') return;
+    const margin = 40;
+    const width = Math.max(320, (window.innerWidth || 0) - margin);
+    const height = Math.max(400, (window.innerHeight || 0) - margin);
+    this.setPosition({ width, height });
+  }
+
+  _bindResize() {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    this._resizeHandler = () => this._applyViewportPosition();
+    window.addEventListener('resize', this._resizeHandler);
+  }
+
+  _unbindResize() {
+    if (typeof window === 'undefined' || typeof window.removeEventListener !== 'function') return;
+    if (this._resizeHandler) {
+      window.removeEventListener('resize', this._resizeHandler);
+      this._resizeHandler = null;
+    }
   }
 }
 

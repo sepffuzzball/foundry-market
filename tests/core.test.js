@@ -1030,6 +1030,124 @@ test('catalog hides invisible entries', () => {
   assert.equal(catalog.inventory.length, 1);
 });
 
+test('catalog projects owner and sanitized appearance fields', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'The Apothecary',
+    locationId: 'loc1',
+    open: true,
+    theme: 'apothecary',
+    owner: 'Maven Elar',
+    appearance: {
+      backgroundImage: 'modules/apothecary/img/bg.png',
+      ownerPortrait: 'icons/elar.png',
+      accentColor: '#AB12CD',
+      typography: 'display',
+      density: 'compact',
+      animation: 'subtle',
+      music: 'modules/apothecary/sfx/amb.ogg',
+      soundEffect: 'systems/dnd5e/sfx/bell.ogg',
+      welcomeMessage: 'Welcome to the apothecary.',
+    },
+    inventory: [],
+  });
+  const catalog = buildCatalog(shop);
+  assert.equal(catalog.shop.owner, 'Maven Elar');
+  assert.equal(catalog.shop.theme, 'apothecary');
+  assert.deepEqual(catalog.shop.appearance, {
+    backgroundImage: 'modules/apothecary/img/bg.png',
+    ownerPortrait: 'icons/elar.png',
+    accentColor: '#AB12CD',
+    typography: 'display',
+    density: 'compact',
+    animation: 'subtle',
+    music: 'modules/apothecary/sfx/amb.ogg',
+    soundEffect: 'systems/dnd5e/sfx/bell.ogg',
+    welcomeMessage: 'Welcome to the apothecary.',
+  });
+  // Only allowlisted public fields project; no raw store/pricing internals.
+  assert.ok(Object.keys(catalog.shop).every((k) => PUBLIC_SHOP_FIELDS.includes(k)));
+});
+
+test('catalog projects public entry metadata only for visible entries and keeps hidden/snapshot privacy', () => {
+  const entry = normalizeInventoryEntry({
+    id: 'e1',
+    itemUuid: 'Compendium.a.Item.x',
+    snapshot: JSON.stringify({ name: 'Potion', system: { price: { value: 1 } } }),
+    name: 'Potion',
+    price: 25,
+    quantity: 4,
+    publicDescription: 'A red potion.',
+    category: 'Consumable',
+    rarity: 'Common',
+  });
+  const hidden = normalizeInventoryEntry({
+    id: 'e2',
+    itemUuid: 'Compendium.a.Item.y',
+    snapshot: JSON.stringify({ name: 'Ring', system: {} }),
+    name: 'Ring',
+    price: 50,
+    quantity: 1,
+    visible: false,
+    publicDescription: 'A hidden ring.',
+    category: 'Wondrous',
+    rarity: 'Rare',
+  });
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    inventory: [entry, hidden],
+  });
+  const catalog = buildCatalog(shop);
+  assert.equal(catalog.inventory.length, 1, 'only the visible entry projects');
+  const publicEntry = catalog.inventory[0];
+  assert.equal(publicEntry.publicDescription, 'A red potion.');
+  assert.equal(publicEntry.category, 'Consumable');
+  assert.equal(publicEntry.rarity, 'Common');
+  assert.ok(!('itemUuid' in publicEntry), 'itemUuid hidden');
+  assert.ok(!('snapshot' in publicEntry), 'snapshot (possible item/system secret) hidden');
+});
+
+test('buildCatalog never supplies unvalidated raw input to the projection', () => {
+  const raw = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    owner: 42,
+    theme: '',
+    appearance: {
+      backgroundImage: 'https://cdn.example.com/bg.png',
+      ownerPortrait: 'icons/a (1).png',
+      accentColor: 'red',
+      typography: 'fancy',
+      density: 'wide',
+      animation: 'none',
+      music: 'worlds/x/y.ogg?q=1',
+      soundEffect: 'modules/x/../../y.ogg',
+      welcomeMessage: 'Hi',
+    },
+    inventory: [],
+  };
+  assert.doesNotThrow(() => buildCatalog(raw));
+  const catalog = buildCatalog(raw);
+  assert.equal(catalog.shop.theme, 'general-store', 'blank theme fails closed to general-store');
+  assert.equal(catalog.shop.owner, '42', 'owner coerced to a plain string');
+  const appearance = catalog.shop.appearance;
+  assert.equal(appearance.backgroundImage, '');
+  assert.equal(appearance.ownerPortrait, '');
+  assert.equal(appearance.accentColor, '');
+  assert.equal(appearance.typography, 'classic');
+  assert.equal(appearance.density, 'comfortable');
+  assert.equal(appearance.animation, 'full');
+  assert.equal(appearance.music, '');
+  assert.equal(appearance.soundEffect, '');
+  assert.equal(appearance.welcomeMessage, 'Hi');
+  // Every appearance field is a plain string; no unsafe value leaked.
+  assert.ok(Object.values(appearance).every((v) => typeof v === 'string'));
+});
+
 // ------------------------------------------------------------------- schema
 
 test('normalizeLedgerRecord enforces status and key', () => {

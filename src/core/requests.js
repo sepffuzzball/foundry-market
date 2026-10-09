@@ -1,5 +1,4 @@
 // Request handling for the market over ChatMessage.
-//
 // Players whisper request messages (flagged `market`) at the GM(s). The active
 // GM's client processes them and whispers a response back. Requests carry NO
 // private shop data; responses expose only allowlisted public shop fields and
@@ -9,12 +8,24 @@
 // `userId` is trusted as the requester - never the sender recorded inside the
 // payload.
 
+import {
+  TYPOGRAPHY_OPTIONS,
+  DENSITY_OPTIONS,
+  ANIMATION_OPTIONS,
+  WELCOME_MESSAGE_MAX,
+  ACCENT_COLOR_RE,
+  sanitizeMediaPath,
+} from '../services/model.js';
+import { normalizeTheme } from '../themes/registry.js';
+
 export const PUBLIC_SHOP_FIELDS = [
   'id',
   'name',
   'locationId',
   'description',
   'theme',
+  'owner',
+  'appearance',
   'open',
 ];
 export const PUBLIC_ENTRY_FIELDS = [
@@ -25,6 +36,9 @@ export const PUBLIC_ENTRY_FIELDS = [
   'quantity',
   'stockMode',
   'visible',
+  'publicDescription',
+  'category',
+  'rarity',
 ];
 
 export function pickFields(obj, fields) {
@@ -56,9 +70,41 @@ export function publicPurchaseResult(result = {}) {
   };
 }
 
+/**
+ * Non-throwing sanitizer for the public projection of a shop appearance. Even if
+ * an invalid value somehow reached a stored shop, this never leaks it to a
+ * player: media paths collapse to '', the accent color must be empty or a strict
+ * `#rrggbb`, radio fields fall back to their documented defaults, and
+ * welcomeMessage is capped.
+ */
+function sanitizeAppearance(appearance = {}) {
+  return {
+    backgroundImage: sanitizeMediaPath(appearance.backgroundImage),
+    ownerPortrait: sanitizeMediaPath(appearance.ownerPortrait),
+    accentColor:
+      typeof appearance.accentColor === 'string' && ACCENT_COLOR_RE.test(appearance.accentColor)
+        ? appearance.accentColor
+        : '',
+    typography: TYPOGRAPHY_OPTIONS.includes(appearance.typography)
+      ? appearance.typography
+      : 'classic',
+    density: DENSITY_OPTIONS.includes(appearance.density) ? appearance.density : 'comfortable',
+    animation: ANIMATION_OPTIONS.includes(appearance.animation) ? appearance.animation : 'full',
+    music: sanitizeMediaPath(appearance.music),
+    soundEffect: sanitizeMediaPath(appearance.soundEffect),
+    welcomeMessage: String(appearance.welcomeMessage ?? '').slice(0, WELCOME_MESSAGE_MAX),
+  };
+}
+
 /** Allowlisted public shop view. Never includes raw flags or hidden columns. */
 export function publicShop(shop) {
-  return pickFields(shop, PUBLIC_SHOP_FIELDS);
+  const out = pickFields(shop, PUBLIC_SHOP_FIELDS);
+  // Never supply unvalidated raw input: normalize the theme (fails closed to
+  // general-store), keep owner a plain string, and sanitize the appearance.
+  out.theme = normalizeTheme(shop?.theme);
+  out.owner = String(shop?.owner ?? '');
+  out.appearance = sanitizeAppearance(shop?.appearance);
+  return out;
 }
 
 /**

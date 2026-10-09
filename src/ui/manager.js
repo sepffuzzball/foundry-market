@@ -10,10 +10,39 @@
 //     falls back to reading `game.modules.get('market').api` and Foundry globals.
 
 import { shopDragData } from '../canvas/placements.js';
+import { ACCENT_COLOR_RE } from '../services/model.js';
+import {
+  getTheme,
+  THEME_IDS,
+  normalizeTheme,
+  normalizeAppearance,
+  sanitizeMediaPath,
+} from '../themes/registry.js';
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 
 const CURRENCY_LABELS = { dnd5e: 'cp' };
+
+// The shop-details/appearance form fields whose edits must be captured into the
+// unsaved draft as the GM types. Inventory row fields (price, quantity, stock
+// mode, visibility, public fields) and the picker/uuid/search inputs are NOT in
+// this list, so an inventory change never overwrites the captured metadata.
+const SHOP_FORM_FIELDS = [
+  'name',
+  'owner',
+  'theme',
+  'description',
+  'open',
+  'ownerPortrait',
+  'backgroundImage',
+  'accentColor',
+  'typography',
+  'density',
+  'animation',
+  'music',
+  'soundEffect',
+  'welcomeMessage',
+];
 
 export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
   static PARTS = {
@@ -56,6 +85,9 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       'delete-entry': this._action('_onDeleteEntry'),
       'place-shop': this._action('_onPlaceShop'),
       'open-shop': this._action('_onOpenShop'),
+      'preview-appearance': this._action('_onPreviewAppearance'),
+      'reset-preview': this._action('_onResetPreview'),
+      'browse-media': this._action('_onBrowseMedia'),
     },
   };
 
@@ -73,6 +105,14 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       stockModes: ['finite', 'unlimited', 'non-restocking'],
       pickerOpen: false,
       pickerItems: [],
+      themeOptions: THEME_IDS.map((id) => ({ id, label: getTheme(id).label })),
+      themeMeta: null,
+      previewShop: null,
+      // Raw, unsaved form inputs for the selected shop. This is captured on a
+      // Preview or Save attempt and drives the `editingShop` form bindings so a
+      // re-render never resets the GM's in-progress edits. Cleared on reset,
+      // shop/location switch and a successful save.
+      draftShop: null,
       notice: '',
     };
   }
@@ -185,7 +225,57 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
   // ---- context / lifecycle -------------------------------------------------
 
   _prepareContext(options) {
+    // The preview panel is a local, unsaved look at the current form. When no
+    // preview is active fall back to the persisted shop theme so the panel is
+    // never rendered with stale/missing metadata.
+    const themeId = this._data.previewShop?.theme || this._data.selectedShop?.theme;
+    this._data.themeMeta = this._themeMetaFor(themeId);
+    // The details/appearance form inputs bind to `editingShop`, which reflects a
+    // captured unsaved draft when one exists so a re-render never resets the GM's
+    // in-progress edits. Inventory rows stay bound to the persisted `selectedShop`.
+    this._data.editingShop = this._buildEditingShop();
     return this._data;
+  }
+
+  /**
+   * Build the shop object used for the details/appearance form bindings. When a
+   * captured draft exists it overrides the persisted values for the form fields;
+   * otherwise the persisted `selectedShop` is used verbatim. Inventory is always
+   * drawn from `selectedShop`, never from this object.
+   */
+  _buildEditingShop() {
+    const persisted = this._data.selectedShop || {};
+    const draft = this._data.draftShop;
+    if (!draft) return persisted;
+    return {
+      ...persisted,
+      name: draft.name ?? persisted.name,
+      owner: draft.owner ?? persisted.owner,
+      theme: draft.theme ?? persisted.theme,
+      description: draft.description ?? persisted.description,
+      open: draft.open ?? persisted.open,
+      appearance: this._mergeAppearance(persisted.appearance, draft.appearance),
+    };
+  }
+
+  _mergeAppearance(base, edits) {
+    const out = { ...(base || {}) };
+    for (const key of Object.keys(edits || {})) {
+      if (edits[key] !== undefined) out[key] = edits[key];
+    }
+    return out;
+  }
+
+  _themeMetaFor(themeId) {
+    const meta = themeId ? getTheme(normalizeTheme(themeId)) : null;
+    if (!meta) return null;
+    return {
+      id: meta.id,
+      label: meta.label,
+      glyph: meta.icon,
+      blurb: meta.blurb,
+      cssClass: meta.cssClass,
+    };
   }
 
   async _onRender(event) {
@@ -196,6 +286,8 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       return;
     }
     this._bindDnd();
+    this._bindShopForm();
+    this._applyPreviewStyles();
   }
 
   _currencyLabel() {
@@ -215,6 +307,8 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
         selectedLocationId: null,
         selectedShopId: null,
         selectedShop: null,
+        previewShop: null,
+        draftShop: null,
         notice: 'Only the Game Master can manage the market.',
       };
       return;
@@ -245,6 +339,7 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       selectedShop,
       currencyLabel: this._currencyLabel(),
       stockModes: ['finite', 'unlimited', 'non-restocking'],
+      previewShop: null,
       notice: '',
     };
   }
@@ -268,6 +363,8 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     const id = target?.dataset?.locationId || data?.dataset?.locationId;
     this._data.selectedLocationId = id;
     this._data.selectedShopId = null;
+    this._data.previewShop = null;
+    this._data.draftShop = null;
     await this._refreshData();
     this.render({ force: true });
   }
@@ -283,6 +380,8 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     if (!name) return;
     const shop = await this._store.createShop({ name, locationId });
     this._data.selectedShopId = shop.id;
+    this._data.previewShop = null;
+    this._data.draftShop = null;
     await this._refreshData();
     this.render({ force: true });
   }
@@ -290,6 +389,8 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
   async _onSelectShop(event, target, data) {
     const id = target?.dataset?.shopId || data?.dataset?.shopId;
     this._data.selectedShopId = id;
+    this._data.previewShop = null;
+    this._data.draftShop = null;
     await this._refreshData();
     this.render({ force: true });
   }
@@ -298,10 +399,25 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     const shopId = this._data.selectedShopId;
     const shop = this._data.selectedShop;
     if (!shopId || !shop) return;
-    // _readShopForm excludes inventory, so the metadata patch can never clobber
-    // stock that a concurrent purchase or add-item just changed. The per-shop
-    // lock still serializes the read+merge+write against purchases.
-    const patch = this._readShopForm();
+    // Capture the RAW current form into the draft so an invalid save keeps the
+    // GM's exact inputs for correction on the next render. `_validateShopForm`
+    // excludes inventory, so the metadata patch can never clobber stock that a
+    // concurrent purchase or add-item just changed. The per-shop lock still
+    // serializes the read+merge+write against purchases. Appearance validation
+    // is strict (media path + accent color), and an invalid form must surface in
+    // the notice without writing to the store.
+    const draft = this._captureShopForm();
+    let patch;
+    try {
+      patch = this._validateShopForm(draft);
+    } catch (err) {
+      this._data.draftShop = draft;
+      this._data.notice = err?.message
+        ? String(err.message).replace(/^\[market\]\s*/, '')
+        : 'Invalid shop settings.';
+      this.render({ force: true });
+      return;
+    }
     await this._withShopLock(shopId, async () => {
       const next = await this._store.updateShop(shopId, patch);
       if (!next) {
@@ -309,6 +425,9 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       }
     });
     await this._refreshData();
+    // A successful save clears the captured draft; `_refreshData` preserves it
+    // across inventory edits, so this explicit reset is what discards it.
+    this._data.draftShop = null;
     this.render({ force: true });
   }
 
@@ -342,6 +461,9 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     const quantity = this._readNumber(tr, 'quantity');
     const stockMode = this._readFieldIn(tr, 'stockMode');
     const visible = this._readChecked(tr, 'visible');
+    const publicDescription = this._readFieldIn(tr, 'publicDescription');
+    const category = this._readFieldIn(tr, 'category');
+    const rarity = this._readFieldIn(tr, 'rarity');
     if (price == null || quantity == null || !stockMode) return;
     const shopId = this._data.selectedShopId;
     if (!shopId) return;
@@ -355,7 +477,16 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       }
       const inventory = shop.inventory.map((e) =>
         e.id === entryId
-          ? { ...e, price, quantity, stockMode, visible: visible !== false }
+          ? {
+              ...e,
+              price,
+              quantity,
+              stockMode,
+              visible: visible !== false,
+              publicDescription,
+              category,
+              rarity,
+            }
           : e
       );
       await this._store.updateShop(shopId, { inventory });
@@ -393,6 +524,127 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     await this._openShop(shopId);
   }
 
+  // ---- appearance preview / media browse --------------------------------------
+
+  /**
+   * Build a temporary shop from the CURRENT form (including unsaved appearance
+   * edits), normalize it, and render a preview. Never persists; the preview is
+   * purely local to this manager session and is discarded on save/switch.
+   */
+  async _onPreviewAppearance(event, target, data) {
+    const shop = this._data.selectedShop;
+    if (!shop) return;
+    // Capture the RAW form into the draft BEFORE validating so that, if the
+    // preview is rejected, the exact input is preserved for correction. The
+    // preview is only shown after validation succeeds.
+    const draft = this._captureShopForm();
+    let form;
+    try {
+      form = this._validateShopForm(draft);
+    } catch (err) {
+      this._data.draftShop = draft;
+      this._data.notice = err?.message
+        ? String(err.message).replace(/^\[market\]\s*/, '')
+        : 'Invalid appearance settings.';
+      this._data.previewShop = null;
+      this.render({ force: true });
+      return;
+    }
+    this._data.draftShop = draft;
+    // Preview uses the CURRENT form values (not the persisted shop) for every
+    // field the template renders, and only the validated/normalized appearance.
+    this._data.previewShop = {
+      id: shop.id,
+      name: form.name || shop.name,
+      owner: form.owner,
+      description: form.description,
+      open: form.open,
+      theme: form.theme,
+      appearance: form.appearance,
+    };
+    this._data.notice = '';
+    this.render({ force: true });
+  }
+
+  async _onResetPreview(event, target, data) {
+    this._data.draftShop = null;
+    this._data.previewShop = null;
+    this._data.notice = '';
+    this.render({ force: true });
+  }
+
+  /**
+   * Browse for a local media path. music/soundEffect open the audio picker;
+   * every other field opens the image picker. Uses the official v14 FilePicker
+   * constructor with a callback that writes the chosen path into the matching
+   * form input. Tests inject `deps.browseMedia(type, setValue)`.
+   */
+  async _onBrowseMedia(event, target, data) {
+    const fieldName = target?.dataset?.mediaTarget || data?.dataset?.mediaTarget;
+    if (!fieldName) return;
+    const type = fieldName === 'music' || fieldName === 'soundEffect' ? 'audio' : 'image';
+    const setValue = (path) => this._setMediaField(fieldName, path);
+    if (typeof this._deps.browseMedia === 'function') {
+      const chosen = await this._deps.browseMedia(type, setValue);
+      // If the injectable already wrote the input via setValue, treat a truthy
+      // return as an additional confirmation (idempotent). A null/undefined
+      // return means the picker was cancelled.
+      if (chosen && chosen !== true) setValue(chosen);
+      return;
+    }
+    // Official Foundry v14 FilePicker; the callback writes the input directly.
+    // Access the picker via the namespaced `foundry.applications.apps.FilePicker`
+    // (not the legacy global `FilePicker`), which is the v14 canonical class.
+    const Picker = foundry?.applications?.apps?.FilePicker;
+    if (typeof Picker === 'function') {
+      const picker = new Picker({ type, callback: setValue });
+      picker.render(true);
+    }
+  }
+
+  _setMediaField(fieldName, path) {
+    const valid = sanitizeMediaPath(path);
+    if (!valid) {
+      // Leave the input untouched so a previously chosen valid path is never
+      // erased, and surface a readable notice instead.
+      this._data.notice = 'Selected file is not a valid local asset path.';
+      return;
+    }
+    const input = this.element?.querySelector?.(`[name="${fieldName}"]`);
+    if (input) input.value = valid;
+    this._data.notice = '';
+    // Capture the chosen media into the unsaved draft and invalidate any stale
+    // preview, so an inventory-action re-render preserves the chosen media and
+    // the GM can still save it.
+    this._onShopFormChange({});
+  }
+
+  /**
+   * Apply the validated preview appearance to the live `.preview-panel` DOM. The
+   * preview shop has already passed `normalizeAppearance` (so its media paths and
+   * accent color are safe), but this method re-checks each style defensively:
+   * `--mk-custom-accent` is set only for a strict `#rrggbb`, and the background
+   * image only for a valid local media path. Any previously applied style is
+   * cleared first so a re-render never leaks a stale value from an earlier shop.
+   */
+  _applyPreviewStyles() {
+    const root = this.element;
+    if (!root || typeof root.querySelector !== 'function') return;
+    const panel = root.querySelector('.preview-panel');
+    if (!panel || typeof panel.style === 'undefined') return;
+    const appearance = this._data.previewShop?.appearance || {};
+    if (typeof panel.style.removeProperty === 'function') {
+      panel.style.removeProperty('--mk-custom-accent');
+    }
+    const accent = appearance.accentColor || '';
+    if (ACCENT_COLOR_RE.test(accent) && typeof panel.style.setProperty === 'function') {
+      panel.style.setProperty('--mk-custom-accent', accent);
+    }
+    panel.style.backgroundImage = '';
+    const bg = sanitizeMediaPath(appearance.backgroundImage || '');
+    if (bg) panel.style.backgroundImage = `url("${bg}")`;
+  }
+
   // ---- item add helper ------------------------------------------------------
 
   async _addItemByUuid(uuid) {
@@ -428,6 +680,11 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
         quantity: 1,
         stockMode: 'finite',
         visible: true,
+        // Public catalog fields default empty: the item's system description is
+        // intentionally not auto-exposed. The GM fills these in the inventory row.
+        publicDescription: '',
+        category: '',
+        rarity: '',
       })
     );
     this._data.notice = '';
@@ -464,14 +721,55 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     return !!scope?.querySelector?.(`[name="${name}"]`)?.checked;
   }
 
-  _readShopForm() {
+  /**
+   * Capture the RAW current values of every shop-details/appearance form input.
+   * This is the unsaved draft: it carries the exact user input (including an
+   * invalid media path or accent color) so a rejected preview/save can restore
+   * it through `editingShop` for the GM to correct. No validation is performed.
+   */
+  _captureShopForm() {
     return {
       name: this._readField('name'),
       owner: this._readField('owner'),
       theme: this._readField('theme'),
       description: this._readField('description'),
       open: this._readField('open'),
+      appearance: {
+        ownerPortrait: this._readField('ownerPortrait'),
+        backgroundImage: this._readField('backgroundImage'),
+        accentColor: this._readField('accentColor'),
+        typography: this._readField('typography'),
+        density: this._readField('density'),
+        animation: this._readField('animation'),
+        music: this._readField('music'),
+        soundEffect: this._readField('soundEffect'),
+        welcomeMessage: this._readField('welcomeMessage'),
+      },
     };
+  }
+
+  /**
+   * Normalize/validate a captured raw form. Appearance is validated strictly
+   * (media paths + accent color) and can throw; the theme always normalizes to a
+   * known id. The caller shows the validation error in the notice and skips the
+   * store write.
+   */
+  _validateShopForm(raw) {
+    return {
+      name: raw.name,
+      owner: raw.owner,
+      theme: normalizeTheme(raw.theme),
+      description: raw.description,
+      open: raw.open,
+      appearance: normalizeAppearance(raw.appearance),
+    };
+  }
+
+  _readShopForm() {
+    // Read the current form and normalize/validate it, throwing on an invalid
+    // appearance value. Reads from the live DOM (used by callers that do not
+    // capture a draft, e.g. the tests).
+    return this._validateShopForm(this._captureShopForm());
   }
 
   // ---- drag / drop wiring -----------------------------------------------------
@@ -514,6 +812,47 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       const hay = `${label} ${item.querySelector('img')?.alt || ''}`.toLowerCase();
       item.style.display = !query || hay.includes(query) ? '' : 'none';
     });
+  }
+
+  // ---- unsaved-form capture (live draft) ------------------------------------
+
+  /**
+   * Bind `input`/`change` listeners on the shop-details/appearance form fields so
+   * an edit captures the raw form into `_data.draftShop` immediately, without a
+   * re-render. This is what keeps unsaved metadata alive across the re-renders an
+   * inventory action (open picker / add item / edit inventory row) triggers: the
+   * draft is preserved by `_refreshData`, and `editingShop` overlays it onto the
+   * persisted shop so an in-progress edit is never reset. Inventory row fields
+   * are intentionally not bound here - `_captureShopForm` only reads the shop
+   * details/appearance inputs anyway. A stable marker prevents a duplicate
+   * listener from stacking when the same DOM node survives a re-render.
+   */
+  _bindShopForm() {
+    const root = this.element;
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    const handler = (event) => this._onShopFormChange(event);
+    for (const name of SHOP_FORM_FIELDS) {
+      root.querySelectorAll(`[name="${name}"]`).forEach((el) => {
+        if (el.__marketFormBound) return;
+        el.__marketFormBound = true;
+        if (typeof el.addEventListener === 'function') {
+          el.addEventListener('input', handler);
+          el.addEventListener('change', handler);
+        }
+      });
+    }
+  }
+
+  /**
+   * A live edit to any shop-details/appearance field. Captures the RAW current
+   * form into the draft (the exact user input, including an invalid value) and
+   * invalidates the stale preview. Deliberately does NOT re-render: the draft is
+   * only read back by the next re-render (`_prepareContext` -> `editingShop`),
+   * and the preview is hidden by that re-render since `previewShop` is now null.
+   */
+  _onShopFormChange(event) {
+    this._data.draftShop = this._captureShopForm();
+    this._data.previewShop = null;
   }
 }
 

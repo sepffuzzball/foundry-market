@@ -10,6 +10,6 @@
   "scripts": {
     "test": "node --test",
     "build": "sh scripts/package.sh",
-    "lint": "node --check src/core/main.js && node --check src/core/requests.js && node --check src/storage/store.js && node --check src/adapters/index.js && node --check src/services/commerce.js && node --check src/services/pricing.js && node --check src/services/model.js && node --check src/ui/manager.js && node --check src/ui/storefront.js && node --check src/canvas/placements.js && node --check tests/core.test.js && node --check tests/ui.test.js"
+    "lint": "node --check src/core/main.js && node --check src/core/requests.js && node --check src/themes/registry.js && node --check src/storage/store.js && node --check src/adapters/index.js && node --check src/services/commerce.js && node --check src/services/pricing.js && node --check src/services/model.js && node --check src/ui/manager.js && node --check src/ui/storefront.js && node --check src/canvas/placements.js && node --check tests/core.test.js && node --check tests/themes.test.js && node --check tests/ui.test.js"
   }
 }
