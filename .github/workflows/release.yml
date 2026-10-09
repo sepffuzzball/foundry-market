@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Test, lint, build and upload artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify dist
+        run: |
+          # dist/module.zip must exist and be non-empty.
+          test -s dist/module.zip || { echo "dist/module.zip is empty or missing"; exit 1; }
+          # module.json must be at the archive root (exact first-entry match).
+          if ! unzip -Z1 dist/module.zip | grep -qx 'module.json'; then
+            echo "module.json not found at the archive root"; exit 1
+          fi
+          # dist/module.json must be byte-for-byte identical to the manifest.
+          cmp -s module.json dist/module.json || { echo "dist/module.json differs from module.json"; exit 1; }
+          # Excluded paths must not leak into the archive.
+          for p in tests graphify-out node_modules; do
+            if unzip -Z1 dist/module.zip | grep -q "$p/"; then
+              echo "unexpected '$p/' entry in archive"; exit 1
+            fi
+          done
+          echo "dist verified"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    name: Create / update release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Verify tag matches manifest version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          manifest_version="$(node -e "const m=require('./dist/module.json'); process.stdout.write(m.version)")"
+          if [ "$tag" != "$manifest_version" ]; then
+            echo "release tag '$tag' does not match manifest version '$manifest_version'" >&2
+            exit 1
+          fi
+          echo "tag '$tag' matches manifest version '$manifest_version'"
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: |
+            dist/module.json
+            dist/module.zip

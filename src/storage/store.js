@@ -1,0 +1,223 @@
+// Persistence for the market core.
+//
+// Every location, shop and ledger record is stored in the flag data of its own
+// dedicated GM-only JournalEntry. The journals are created by the GM and are
+// never added to a player-visible folder, so players never see them in the
+// Journal sidebar; only the market code reads and writes them.
+//
+// The record shape within `flags.market` is:
+//   { schemaVersion, kind: 'location'|'shop'|'ledger', record: {...} }
+//
+// All stores go through an injectable `docAccess` adapter so Node tests can
+// drive the real logic against an in-memory document store.
+
+import {
+  SCHEMA_VERSION,
+  LOCATION_KIND,
+  SHOP_KIND,
+  LEDGER_KIND,
+  normalizeLocation,
+  normalizeShop,
+  normalizeInventoryEntry,
+  normalizeLedgerRecord,
+  makeId,
+} from '../services/model.js';
+
+const SCOPE = 'market';
+
+function flagScope(doc) {
+  return doc?.flags?.[SCOPE];
+}
+
+/**
+ * Default document-access implementation backed by Foundry's journal
+ * collection. Referenced lazily so importing this module under Node never
+ * touches `game`.
+ */
+function defaultDocAccess() {
+  return {
+    async listJournalEntries() {
+      return game.journal.filter((e) => flagScope(e)?.schemaVersion === SCHEMA_VERSION);
+    },
+    async getJournalEntry(id) {
+      return game.journal.get(id);
+    },
+    async createJournalEntry({ name, flags }) {
+      // Explicitly GM-only: players get no read permission (`default: 0`),
+      // so the market's internal journals never leak into the player sidebar
+      // even if they are not placed in a player-hidden folder.
+      // Use the document class static `create` (Foundry V14) rather than the
+      // collection `.create`, so this works regardless of collection shape.
+      const DocumentClass = game.journal?.documentClass || globalThis.JournalEntry;
+      return DocumentClass.create({ name, flags, ownership: { default: 0 } });
+    },
+    async updateJournalEntry(doc, patch) {
+      return doc.update(patch);
+    },
+  };
+}
+
+export function createStore(docAccess) {
+  async function listRecords(kind) {
+    const docs = await docAccess.listJournalEntries();
+    const out = [];
+    for (const doc of docs) {
+      const f = flagScope(doc);
+      if (f?.kind === kind) out.push(normalizeRecordForKind(kind, f.record));
+    }
+    return out;
+  }
+
+  function normalizeRecordForKind(kind, record) {
+    if (!record) return null;
+    switch (kind) {
+      case LOCATION_KIND:
+        return normalizeLocation(record);
+      case SHOP_KIND:
+        return normalizeShop(record);
+      case LEDGER_KIND:
+        return normalizeLedgerRecord(record);
+      default:
+        return record;
+    }
+  }
+
+  async function findJournalByKindAndId(kind, id) {
+    const docs = await docAccess.listJournalEntries();
+    return (
+      docs.find((doc) => {
+        const f = flagScope(doc);
+        return f?.kind === kind && f.record?.id === id;
+      }) || null
+    );
+  }
+
+  async function findRecordByKindAndId(kind, id) {
+    if (!id) return null;
+    const doc = await findJournalByKindAndId(kind, id);
+    return doc ? normalizeRecordForKind(kind, flagScope(doc).record) : null;
+  }
+
+  async function insertRecord(kind, record, name) {
+    const flags = { [SCOPE]: { schemaVersion: SCHEMA_VERSION, kind, record } };
+    const doc = await docAccess.createJournalEntry({
+      name: name || record.name || kind,
+      flags,
+    });
+    const stored = flagScope(doc)?.record;
+    return normalizeRecordForKind(kind, stored ?? record);
+  }
+
+  async function updateRecord(kind, id, nextRecord, name) {
+    const doc = await findJournalByKindAndId(kind, id);
+    if (!doc) return null;
+    const flags = { schemaVersion: SCHEMA_VERSION, kind, record: nextRecord };
+    await docAccess.updateJournalEntry(doc, { flags: { [SCOPE]: flags } });
+    return normalizeRecordForKind(kind, nextRecord);
+  }
+
+  async function listLocations() {
+    return listRecords(LOCATION_KIND);
+  }
+
+  async function createLocation(data = {}) {
+    const record = normalizeLocation(data);
+    return insertRecord(LOCATION_KIND, record, record.name);
+  }
+
+  async function updateLocation(id, patch = {}) {
+    const existing = await findRecordByKindAndId(LOCATION_KIND, id);
+    if (!existing) return null;
+    const record = normalizeLocation({ ...existing, ...patch });
+    return updateRecord(LOCATION_KIND, id, record, record.name);
+  }
+
+  async function listShops({ locationId } = {}) {
+    const shops = await listRecords(SHOP_KIND);
+    if (locationId) return shops.filter((s) => s.locationId === locationId);
+    return shops;
+  }
+
+  async function createShop(data = {}) {
+    const record = normalizeShop(data);
+    return insertRecord(SHOP_KIND, record, record.name);
+  }
+
+  async function findShop(id) {
+    return findRecordByKindAndId(SHOP_KIND, id);
+  }
+
+  async function updateShop(id, patch = {}) {
+    const existing = await findShop(id);
+    if (!existing) return null;
+    const record = normalizeShop({ ...existing, ...patch });
+    return updateRecord(SHOP_KIND, id, record, record.name);
+  }
+
+  async function addInventoryEntry(shopId, entryData = {}) {
+    const existing = await findShop(shopId);
+    if (!existing) return null;
+    const entry = normalizeInventoryEntry(entryData);
+    const inventory = [...existing.inventory, entry];
+    const record = normalizeShop({ ...existing, inventory });
+    await updateRecord(SHOP_KIND, shopId, record, record.name);
+    return entry;
+  }
+
+  // --- Ledger ----------------------------------------------------------------
+  // The ledger is a separate set of GM-only JournalEntries, one per purchase
+  // request, keyed for idempotency by `${userId}:${requestId}`.
+
+  async function listLedgers() {
+    return listRecords(LEDGER_KIND).map((r) => r);
+  }
+
+  async function findLedgerByKey(key) {
+    const records = await listRecords(LEDGER_KIND);
+    return records.find((r) => r.key === key) || null;
+  }
+
+  async function createLedger(record) {
+    const normalized = normalizeLedgerRecord(record);
+    // Ledger records are keyed by idempotency key, so never create a second
+    // record for an existing key (prevents duplicate JournalEntries on a race).
+    // Returns `{ record, created }` so callers can tell whether their key
+    // already existed (and must NOT charge) versus was newly persisted.
+    const existing = await findLedgerByKey(normalized.key);
+    if (existing) return { record: existing, created: false };
+    const created = await insertRecord(LEDGER_KIND, normalized, `Ledger: ${normalized.key}`);
+    return { record: created, created: true };
+  }
+
+  async function updateLedger(id, patch = {}) {
+    const doc = await findJournalByKindAndId(LEDGER_KIND, id);
+    if (!doc) return null;
+    const current = normalizeLedgerRecord(flagScope(doc).record);
+    const next = normalizeLedgerRecord({ ...current, ...patch });
+    const flags = { schemaVersion: SCHEMA_VERSION, kind: LEDGER_KIND, record: next };
+    await docAccess.updateJournalEntry(doc, { flags: { [SCOPE]: flags } });
+    return next;
+  }
+
+  return {
+    listLocations,
+    createLocation,
+    updateLocation,
+    listShops,
+    createShop,
+    updateShop,
+    addInventoryEntry,
+    findShop,
+    listLedgers,
+    findLedgerByKey,
+    createLedger,
+    updateLedger,
+    // Utility used by tests and the runtime to create ids.
+    makeId,
+  };
+}
+
+// The default store instance used at runtime. It wires document access to the
+// live game API lazily; no global is touched here.
+export const store = createStore(defaultDocAccess());
+export default store;

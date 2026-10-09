@@ -1,0 +1,80 @@
+<section class="market-app market-manager" aria-label="Market manager">
+  <header class="market-topbar">
+    <div class="market-brand"><span class="market-sigil" aria-hidden="true">M</span><div><p class="market-eyebrow">The market ledger</p><h1>Foundry Market</h1></div></div>
+    <span class="market-role">GM workspace</span>
+  </header>
+  <div class="manager-layout">
+    <aside class="manager-rail" aria-label="Market locations and shops">
+      <div class="rail-heading"><div><p class="market-eyebrow">Your world</p><h2>Locations</h2></div><button class="market-icon-button" type="button" data-action="create-location" aria-label="Create location">+</button></div>
+      {{#if locations.length}}
+      <nav class="location-list" aria-label="Locations">
+        {{#each locations as |location|}}
+        <button type="button" class="location-button {{#if (eq ../selectedLocationId location.id)}}is-selected{{/if}}" data-action="select-location" data-location-id="{{location.id}}" aria-current="{{#if (eq ../selectedLocationId location.id)}}true{{else}}false{{/if}}">
+          <span class="location-mark" aria-hidden="true">⌂</span><span>{{location.name}}</span>
+        </button>
+        {{/each}}
+      </nav>
+      {{else}}
+      <p class="market-muted rail-empty">No locations yet. Create one to begin.</p>
+      {{/if}}
+      <div class="rail-divider"></div>
+      <div class="rail-heading shop-heading"><div><p class="market-eyebrow">Selected location</p><h2>Shops</h2></div><button class="market-icon-button" type="button" data-action="create-shop" aria-label="Create shop">+</button></div>
+      {{#if shops.length}}
+      <nav class="shop-list" aria-label="Shops">
+        {{#each shops as |shop|}}
+        <button type="button" class="shop-button {{#if (eq ../selectedShop.id shop.id)}}is-selected{{/if}}" data-action="select-shop" data-shop-id="{{shop.id}}" aria-current="{{#if (eq ../selectedShop.id shop.id)}}true{{else}}false{{/if}}">
+          <span class="shop-dot {{#if shop.open}}is-open{{/if}}" aria-hidden="true"></span><span class="shop-button-copy"><strong>{{shop.name}}</strong><small>{{shop.inventoryCount}} {{#if (eq shop.inventoryCount 1)}}item{{else}}items{{/if}}</small></span><span class="shop-chevron" aria-hidden="true">›</span>
+        </button>
+        {{/each}}
+      </nav>
+      {{else}}
+      <p class="market-muted rail-empty">No shops in this location.</p>
+      {{/if}}
+    </aside>
+
+    <main class="manager-main">
+      {{#if selectedShop}}
+      <div class="manager-title-row"><div><p class="market-eyebrow">Shop settings / inventory</p><h2>{{selectedShop.name}}</h2></div><span class="market-state {{#if selectedShop.open}}state-open{{else}}state-closed{{/if}}"><i aria-hidden="true"></i>{{#if selectedShop.open}}Open to players{{else}}Closed{{/if}}</span></div>
+      <section class="editor-panel" aria-labelledby="details-heading">
+        <div class="section-heading"><div><span class="section-number">01</span><div><p class="market-eyebrow">Identity</p><h3 id="details-heading">Shop details</h3></div></div><button type="button" class="market-button market-button-quiet" data-action="save-shop">Save changes</button></div>
+        <div class="editor-fields">
+          <label class="market-field field-wide"><span>Shop name</span><input type="text" name="name" value="{{selectedShop.name}}" autocomplete="off"></label>
+          <label class="market-field"><span>Shopkeeper</span><input type="text" name="owner" value="{{selectedShop.owner}}" autocomplete="off"></label>
+          <label class="market-field"><span>Display theme</span><input type="text" name="theme" value="{{selectedShop.theme}}" autocomplete="off"></label>
+          <label class="market-field field-wide"><span>Description</span><textarea name="description" rows="3">{{selectedShop.description}}</textarea></label>
+          <label class="market-check"><input type="checkbox" name="open" {{#if selectedShop.open}}checked{{/if}}><span class="check-art" aria-hidden="true"></span><span><strong>Shop is open</strong><small>Players can view this storefront.</small></span></label>
+          <input type="hidden" name="locationId" value="{{selectedLocationId}}">
+        </div>
+      </section>
+      <section class="inventory-panel" data-drop-zone aria-labelledby="inventory-heading">
+        <div class="section-heading"><div><span class="section-number">02</span><div><p class="market-eyebrow">What is on the shelves</p><h3 id="inventory-heading">Inventory <span class="count-pill">{{selectedShop.inventory.length}}</span></h3></div></div><button type="button" class="market-button market-button-dark" data-action="add-item-picker"><span aria-hidden="true">+</span> Add item</button></div>
+        {{#if selectedShop.inventory.length}}
+        <div class="inventory-table-wrap"><table class="inventory-table"><thead><tr><th scope="col">Item</th><th scope="col">Price</th><th scope="col">Quantity</th><th scope="col">Stock</th><th scope="col"><span class="visually-hidden">Visible</span></th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead><tbody>
+          {{#each selectedShop.inventory as |entry|}}
+          <tr data-entry-id="{{entry.id}}"><td><div class="inventory-item"><span class="item-thumb">{{#if entry.img}}<img src="{{entry.img}}" alt="">{{else}}<span aria-hidden="true">✦</span>{{/if}}</span><strong>{{entry.name}}</strong></div></td><td class="price-cell"><input type="number" name="price" value="{{entry.price}}" min="0" step="1" aria-label="Price for {{entry.name}}"><small>{{../currencyLabel}}</small></td><td><input type="number" name="quantity" value="{{entry.quantity}}" min="0" step="1" aria-label="Quantity for {{entry.name}}"></td><td><select name="stockMode" aria-label="Stock mode for {{entry.name}}">{{#each ../stockModes as |mode|}}<option value="{{mode}}" {{#if (eq entry.stockMode mode)}}selected{{/if}}>{{mode}}</option>{{/each}}</select></td><td><input type="checkbox" name="visible" {{#if entry.visible}}checked{{/if}} aria-label="Visible for {{entry.name}}"></td><td><button class="market-icon-button" type="button" data-action="save-entry" aria-label="Save {{entry.name}}">✓</button> <button class="market-icon-button remove-entry" type="button" data-action="delete-entry" data-entry-id="{{entry.id}}" aria-label="Remove {{entry.name}}">×</button></td></tr>
+          {{/each}}
+        </tbody></table></div>
+        {{else}}
+        <div class="empty-shelf"><span class="empty-glyph" aria-hidden="true">✧</span><h4>The shelves are bare</h4><p>Add an item from your world inventory to stock this shop.</p><button type="button" class="market-button market-button-outline" data-action="add-item-picker">Choose an item</button></div>
+        {{/if}}
+      </section>
+      {{#if notice}}<p class="market-notice" role="status" aria-live="polite">{{notice}}</p>{{/if}}
+      {{#if pickerOpen}}
+      <section class="add-item-panel" aria-labelledby="add-item-heading">
+        <div class="section-heading"><div><span class="section-number">03</span><div><p class="market-eyebrow">Stock the shelves</p><h3 id="add-item-heading">Add an item</h3></div></div></div>
+        <div class="editor-fields">
+          <label class="market-field field-wide"><span>Item UUID</span><div class="uuid-row"><input type="text" name="itemUuid" placeholder="Paste an Item UUID, or drop an item here..." autocomplete="off"><button type="button" class="market-button market-button-dark" data-action="add-item-uuid">Add</button></div></label>
+        </div>
+        <label class="market-search"><span class="visually-hidden">Search items</span><span aria-hidden="true">⌕</span><input type="search" name="pickerSearch" placeholder="Browse the world and compendiums..." autocomplete="off"></label>
+        {{#if pickerItems.length}}
+        <ul class="picker-list">{{#each pickerItems as |item|}}<li><button type="button" class="picker-item" data-action="add-item" data-uuid="{{item.uuid}}">{{#if item.img}}<img src="{{item.img}}" alt="">{{else}}<span class="item-thumb" aria-hidden="true">✦</span>{{/if}}<span>{{item.name}}</span></button></li>{{/each}}</ul>
+        {{else}}<p class="market-muted">No items found in the world or compendiums.</p>{{/if}}
+      </section>
+      {{/if}}
+      <div class="manager-footer-actions"><button type="button" class="market-button market-button-quiet" data-action="place-shop">Place shop</button><button type="button" class="market-button market-button-quiet" data-action="open-shop">View storefront</button></div>
+      {{else}}
+      <div class="manager-welcome"><span class="welcome-seal" aria-hidden="true">✧</span><p class="market-eyebrow">A world of possibility</p><h2>Set the scene<br>for a good trade.</h2><p>Select a shop to manage its details and stock, or create a new one in the selected location.</p>{{#if notice}}<p class="market-notice" role="status" aria-live="polite">{{notice}}</p>{{/if}}<button type="button" class="market-button market-button-dark" data-action="create-shop">Create a shop <span aria-hidden="true">→</span></button></div>
+      {{/if}}
+    </main>
+  </div>
+</section>

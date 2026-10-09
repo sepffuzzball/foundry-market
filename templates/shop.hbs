@@ -1,0 +1,36 @@
+<section class="market-app market-storefront" aria-label="{{shop.name}} storefront">
+  <header class="storefront-header"><a class="storefront-brand" href="#" aria-label="Foundry Market home"><span class="market-sigil" aria-hidden="true">M</span><span>FOUNDRY <b>MARKET</b></span></a><button type="button" class="market-button market-button-quiet refresh-button" data-action="refresh"><span aria-hidden="true">↻</span> Refresh</button></header>
+  {{#if shop}}
+  <main class="storefront-content">
+    <section class="shop-hero theme-{{shop.theme}}" aria-labelledby="store-title">
+      <div class="hero-ornament" aria-hidden="true"><span></span><i>✧</i><span></span></div>
+      <p class="market-eyebrow">A place to find the unusual</p><h1 id="store-title">{{shop.name}}</h1>
+      {{#if shop.owner}}<p class="shop-owner">Kept by <strong>{{shop.owner}}</strong></p>{{/if}}
+      {{#if shop.description}}<p class="shop-description">{{shop.description}}</p>{{/if}}
+      <span class="hero-status {{#if shop.open}}status-open{{else}}status-closed{{/if}}"><i aria-hidden="true"></i>{{#if shop.open}}Open for trade{{else}}Temporarily closed{{/if}}</span>
+    </section>
+    {{#if shop.open}}
+    <section class="catalog" aria-labelledby="catalog-heading">
+      <div class="catalog-toolbar"><div><p class="market-eyebrow">Carefully chosen goods</p><h2 id="catalog-heading">The collection</h2></div><label class="market-search"><span class="visually-hidden">Search items</span><span aria-hidden="true">⌕</span><input type="search" name="search" placeholder="Find something..." autocomplete="off"></label></div>
+      {{#if inventory.length}}
+      <div class="product-grid">{{#each inventory as |entry|}}
+        <article class="product-card"><div class="product-art">{{#if entry.img}}<img src="{{entry.img}}" alt="">{{else}}<span class="portrait-fallback" aria-hidden="true"><i>✦</i></span>{{/if}}<span class="stock-tag product-stock">{{#if (eq entry.stockMode "unlimited")}}Always available{{else}}{{entry.quantity}} in stock{{/if}}</span></div><div class="product-info"><h3>{{entry.name}}</h3><div class="product-buy-row"><p class="product-price"><strong>{{entry.price}}</strong><span>{{../currencyLabel}}</span></p><button type="button" class="buy-button" data-action="buy" data-entry-id="{{entry.id}}" aria-label="Buy {{entry.name}}" {{#if (or ../pending (not ../hasGM) (and (ne entry.stockMode "unlimited") (lte entry.quantity 0)))}}disabled{{/if}}>Buy <span aria-hidden="true">→</span></button></div></div></article>
+      {{/each}}</div>
+      {{else}}
+      <div class="storefront-empty"><span aria-hidden="true">✧</span><h3>Nothing on the shelves just yet</h3><p>Check back later. New goods may arrive soon.</p></div>
+      {{/if}}
+    </section>
+    {{else}}
+    <div class="storefront-notice" role="status"><span aria-hidden="true">◷</span><div><h2>The shop is closed</h2><p>This storefront is not taking orders right now. Please check back another time.</p></div></div>
+    {{/if}}
+    {{#if actors.length}}
+    <div class="purchase-dock"><label for="market-actor">Shopping as</label><select id="market-actor" name="actorId" data-action="select-actor"><option value="">Choose a character</option>{{#each actors as |actor|}}<option value="{{actor.id}}" {{#if (eq ../selectedActorId actor.id)}}selected{{/if}}>{{actor.name}}</option>{{/each}}</select><label class="quantity-label" for="market-quantity">Qty</label><input id="market-quantity" type="number" name="quantity" min="1" value="1" inputmode="numeric" aria-label="Purchase quantity"></div>
+    {{else}}<p class="market-muted actor-note">No eligible characters are available for this purchase.</p>{{/if}}
+    {{#if feedback}}<p class="market-feedback" role="status" aria-live="polite">{{feedback}}</p>{{/if}}
+    {{#if pending}}<p class="market-pending" role="status" aria-live="polite"><span class="pending-mark" aria-hidden="true"></span> Processing your request...</p>{{/if}}
+  </main>
+  {{else}}
+  <main class="storefront-missing"><span class="welcome-seal" aria-hidden="true">✧</span><p class="market-eyebrow">No destination selected</p><h1>This market has<br>no open door.</h1><p>Select a shop to browse its wares.</p>{{#if loading}}<p class="market-muted">Loading the storefront...</p>{{else}}{{#unless hasGM}}<p class="market-muted">A Game Master may need to open a shop first.</p>{{/unless}}<button type="button" class="market-button market-button-dark" data-action="refresh">Try again <span aria-hidden="true">↻</span></button>{{/if}}</main>
+  {{/if}}
+  <footer class="storefront-footer"><span>FOUNDRY MARKET</span><span>Good finds travel far.</span></footer>
+</section>
