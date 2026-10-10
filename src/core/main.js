@@ -31,6 +31,7 @@ import {
   publicAdvancedOrder,
 } from './requests.js';
 import { store } from '../storage/store.js';
+import { createBackupService } from '../storage/backup.js';
 import { MarketManager } from '../ui/manager.js';
 import { MarketStorefront } from '../ui/storefront.js';
 import { registerPlacements, createMarketMarker } from '../canvas/placements.js';
@@ -297,7 +298,7 @@ function placeShopMarker(shopId) {
   });
 }
 
-function exposeApi(commerce, automation, advanced = {}) {
+function exposeApi(commerce, automation, advanced = {}, backup = null) {
   const api = {
     store,
     commerce,
@@ -537,6 +538,26 @@ function exposeApi(commerce, automation, advanced = {}) {
     },
     placeShop: (shopId) => placeShopMarker(shopId),
     registerTheme: (metadata) => registerTheme(metadata),
+    // M6 GM-only portable backup. The raw backup service and the store are NOT
+    // exposed: a caller only ever receives the bounded `{status, backup/warnings}`
+    // export result or the `{status, dryRun/counts/idMap/warnings}` preview /
+    // `{status, createdLocationIds, createdShopIds, warnings}` import result.
+    // Each wrapper guards on THIS user being the active GM before delegating, and
+    // the service itself re-checks active-GM internally - defense in depth, never
+    // the only guard. Backup state is never routed through a player request/chat;
+    // the manager owns the export/preview/import UI.
+    backup: {
+      exportPortable: () => {
+        if (!backup) return Promise.resolve({ status: 'error', error: 'server-error' });
+        if (!isActiveGM()) return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+        return backup.exportPortable();
+      },
+      importPortable: (raw, opts = {}) => {
+        if (!backup) return Promise.resolve({ status: 'error', error: 'server-error' });
+        if (!isActiveGM()) return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+        return backup.importPortable(raw, opts);
+      },
+    },
   };
   const module = game.modules.get(MODULE_ID);
   if (module) {
@@ -626,6 +647,7 @@ let valuationService = null;
 let serviceCommerce = null;
 let preorderCommerce = null;
 let theftCommerce = null;
+let backupService = null;
 let automationRunInFlight = null;
 let automationRunQueued = false;
 
@@ -770,13 +792,27 @@ Hooks.once('init', () => {
     now: () => Date.now(),
     logger: console,
   });
+  // M6 GM-only portable backup. Shares commerce's per-shop lock runner for
+  // interface parity with the other GM services (importing fresh ids never
+  // updates an existing shop, so the lock is accepted but not used for writes),
+  // uses the same active-GM predicate and the id generator. The service holds
+  // the FULL normalized shop records - never a player projection - and is the
+  // single GM-private owner of export/import; it is exposed only through the
+  // bounded `api.backup` wrappers above.
+  backupService = createBackupService({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    makeId,
+    logger: console,
+  });
   exposeApi(commerceInstance, automationService, {
     cart: cartCommerce,
     services: serviceCommerce,
     preorders: preorderCommerce,
     theft: theftCommerce,
     valuations: valuationService,
-  });
+  }, backupService);
 });
 
 Hooks.once('ready', () => {

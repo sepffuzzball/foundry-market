@@ -26,6 +26,11 @@ import {
   GenericAdapter,
   Dnd5eAdapter,
   DaggerheartAdapter,
+  DC20Adapter,
+  TwodsixAdapter,
+  DC20_DENOMINATIONS,
+  DC20_DENOMINATION_FACTOR,
+  dc20DenominationToCopper,
   readPath,
   readIntegerPath,
   setPath,
@@ -35,6 +40,8 @@ import {
   copperToDenominations,
   denominationToCopper,
   priceValueToCopper,
+  dndCurrencyFactors,
+  formatCopperAsGP,
 } from '../src/adapters/index.js';
 import {
   createCommerce,
@@ -298,6 +305,170 @@ test('Dnd5eAdapter getItemPrice converts to copper integer', async () => {
   assert.deepEqual(price, { amount: 2, denomination: 'gp', minorUnits: 200 });
 });
 
+// ------------------------------------------------------- dc20rpg + twodsix
+
+test('DC20 denomination conversion in integer copper (cp/sp/gp/pp)', () => {
+  assert.deepEqual(DC20_DENOMINATIONS, ['cp', 'sp', 'gp', 'pp'], 'no ep in DC20');
+  assert.equal(dc20DenominationToCopper('cp'), 1);
+  assert.equal(dc20DenominationToCopper('sp'), 10);
+  assert.equal(dc20DenominationToCopper('gp'), 100);
+  assert.equal(dc20DenominationToCopper('pp'), 1000);
+  assert.equal(DC20_DENOMINATION_FACTOR['ep'], undefined);
+  assert.throws(() => dc20DenominationToCopper('ep'), /unknown currency/);
+  assert.throws(() => dc20DenominationToCopper('btc'), /unknown currency/);
+});
+
+test('DC20Adapter getBalance/debit/credit convert cp/sp/gp/pp to integer cp', async () => {
+  const adapter = new DC20Adapter();
+  const actor = createMockActor({ currency: { gp: 5, sp: 2 } });
+  assert.equal(await adapter.getBalance(actor), 520);
+
+  const debit = await adapter.debit(actor, 200);
+  assert.equal(debit.newBalance, 320);
+  assert.equal(actor.system.currency.gp, 3);
+  assert.equal(actor.system.currency.sp, 2);
+  assert.equal(actor.system.currency.cp, 0);
+
+  const credit = await adapter.credit(actor, 50);
+  assert.equal(credit.newBalance, 370);
+  assert.equal(actor.system.currency.gp, 3);
+  assert.equal(actor.system.currency.sp, 7);
+  assert.equal(actor.system.currency.cp, 0);
+});
+
+test('DC20Adapter debit rejects when funds are insufficient', async () => {
+  const adapter = new DC20Adapter();
+  const actor = createMockActor({ currency: { sp: 1 } });
+  await assert.rejects(() => adapter.debit(actor, 20), /insufficient funds/);
+});
+
+test('DC20Adapter rejects a nonzero unknown wallet denomination', async () => {
+  const adapter = new DC20Adapter();
+  // ep is not a DC20 denomination and carries a nonzero balance -> reject.
+  const actor = createMockActor({ currency: { gp: 1, ep: 1 } });
+  await assert.rejects(() => adapter.getBalance(actor), /unknown currency/);
+  // A zero balance on an unknown denomination is ignored.
+  const zero = createMockActor({ currency: { gp: 1, ep: 0 } });
+  assert.equal(await adapter.getBalance(zero), 100);
+});
+
+test('DC20Adapter wallet rejects negative, fractional and overflow values', async () => {
+  const adapter = new DC20Adapter();
+  await assert.rejects(() => adapter.getBalance(createMockActor({ currency: { cp: -1 } })), />= 0/);
+  await assert.rejects(() => adapter.getBalance(createMockActor({ currency: { sp: 1.5 } })), /safe integer/);
+  // Overflow.credit rejects a balance that would exceed a safe integer.
+  const overflow = createMockActor({ currency: { gp: 1 } });
+  await assert.rejects(() => adapter.credit(overflow, Number.MAX_SAFE_INTEGER), /overflowed/);
+});
+
+test('DC20Adapter getItemPrice reads system.price.value/currency (default gp)', async () => {
+  const adapter = new DC20Adapter();
+  const gp = await adapter.getItemPrice({ system: { price: { value: 2, currency: 'gp' } } });
+  assert.deepEqual(gp, { amount: 2, denomination: 'gp', minorUnits: 200 });
+  // currency defaults to "gp" when absent.
+  const dflt = await adapter.getItemPrice({ system: { price: { value: 3 } } });
+  assert.deepEqual(dflt, { amount: 3, denomination: 'gp', minorUnits: 300 });
+  // A non-gp denomination scales to cp minor units exactly.
+  const sp = await adapter.getItemPrice({ system: { price: { value: 5, currency: 'sp' } } });
+  assert.deepEqual(sp, { amount: 5, denomination: 'sp', minorUnits: 50 });
+});
+
+test('DC20Adapter getItemPrice rejects unknown denomination, fractional and overflow', async () => {
+  const adapter = new DC20Adapter();
+  await assert.rejects(
+    () => adapter.getItemPrice({ system: { price: { value: 1, currency: 'ep' } } }),
+    /unknown currency denomination/
+  );
+  await assert.rejects(
+    () => adapter.getItemPrice({ system: { price: { value: -1 } } }),
+    />= 0/
+  );
+  await assert.rejects(
+    () => adapter.getItemPrice({ system: { price: { value: 1.5 } } }),
+    /safe integer/
+  );
+  await assert.rejects(
+    () => adapter.getItemPrice({ system: { price: { value: Number.MAX_SAFE_INTEGER, currency: 'pp' } } }),
+    /overflow/
+  );
+});
+
+test('DC20Adapter deliverItem creates an embedded Item with system.quantity', async () => {
+  const adapter = new DC20Adapter();
+  const source = makeSourceItem();
+  const actor = createMockActor({});
+  const delivered = await adapter.deliverItem(actor, source, { quantity: 3 });
+  assert.ok(delivered.id);
+  assert.equal(actor.items.length, 1);
+  assert.equal('_id' in actor.items[0], false);
+  assert.equal(actor.items[0].system.quantity, 3);
+  // source never mutated and still carries _id.
+  assert.equal(source.toObject()._id, 'srcItem');
+  const removed = await adapter.removeItem(actor, delivered.id);
+  assert.equal(removed, true);
+  assert.deepEqual(actor.removedIds, [delivered.id]);
+});
+
+test('TwodsixAdapter supports numeric system.financeValues.cash only', async () => {
+  const adapter = new TwodsixAdapter();
+  const actor = createMockActor({ system: { financeValues: { cash: 100 } } });
+  assert.equal(await adapter.getBalance(actor), 100);
+
+  const debit = await adapter.debit(actor, 30);
+  assert.equal(debit.newBalance, 70);
+  assert.equal(actor.system.financeValues.cash, 70);
+  assert.equal('patchLog' in actor && actor.patchLog.length, 1, 'one update wrote cash');
+  assert.equal(actor.patchLog[0]['system.financeValues.cash'], 70);
+
+  const credit = await adapter.credit(actor, 5);
+  assert.equal(credit.newBalance, 75);
+  assert.equal(actor.system.financeValues.cash, 75);
+});
+
+test('TwodsixAdapter fails closed for an unsupported/non-numeric cash actor', async () => {
+  const adapter = new TwodsixAdapter();
+  await assert.rejects(() => adapter.getBalance(createMockActor({})), /finite number/);
+  await assert.rejects(
+    () => adapter.getBalance(createMockActor({ system: { financeValues: { cash: '0' } } })),
+    /finite number/
+  );
+  await assert.rejects(
+    () => adapter.getBalance(createMockActor({ system: { financeValues: { cash: 1.5 } } })),
+    /safe integer/
+  );
+  await assert.rejects(
+    () => adapter.getBalance(createMockActor({ system: { financeValues: { cash: -1 } } })),
+    />= 0/
+  );
+  // A cash overflow on credit is rejected before any update.
+  const overflow = createMockActor({ system: { financeValues: { cash: 1 } } });
+  await assert.rejects(() => adapter.credit(overflow, Number.MAX_SAFE_INTEGER), /overflowed/);
+  assert.equal(overflow.system.financeValues.cash, 1, 'no patch applied on overflow');
+});
+
+test('TwodsixAdapter getItemPrice maps system.price 1:1 to credits', async () => {
+  const adapter = new TwodsixAdapter();
+  const price = await adapter.getItemPrice({ system: { price: 50 } });
+  assert.deepEqual(price, { amount: 50, denomination: 'credits', minorUnits: 50 });
+  await assert.rejects(() => adapter.getItemPrice({ system: { price: -1 } }), />= 0/);
+  await assert.rejects(() => adapter.getItemPrice({ system: { price: 1.5 } }), /safe integer/);
+});
+
+test('TwodsixAdapter deliverItem creates an embedded Item with system.quantity', async () => {
+  const adapter = new TwodsixAdapter();
+  const source = makeSourceItem();
+  const actor = createMockActor({ system: { financeValues: { cash: 100 } } });
+  const delivered = await adapter.deliverItem(actor, source, { quantity: 2 });
+  assert.ok(delivered.id);
+  assert.equal(actor.items.length, 1);
+  assert.equal('_id' in actor.items[0], false);
+  assert.equal(actor.items[0].system.quantity, 2);
+  assert.equal(source.toObject()._id, 'srcItem');
+  const removed = await adapter.removeItem(actor, delivered.id);
+  assert.equal(removed, true);
+  assert.deepEqual(actor.removedIds, [delivered.id]);
+});
+
 test('generic adapter requires configured paths', async () => {
   const bare = new GenericAdapter();
   assert.equal(bare.supported, false);
@@ -306,13 +477,18 @@ test('generic adapter requires configured paths', async () => {
   await assert.rejects(bare.getBalance(createMockActor()), /not configured/);
 });
 
-test('getAdapter falls back to generic and reports unsupported subclasses', () => {
+test('getAdapter routes first-class dc20rpg/twodsix and unsupported daggerheart', () => {
   assert.ok(getAdapter('some-unknown-system') instanceof GenericAdapter);
   const dh = getAdapter('daggerheart');
   assert.ok(dh instanceof DaggerheartAdapter);
   assert.equal(dh.supported, false, 'daggerheart reports unsupported without config');
-  assert.equal(getAdapter('twodsix').supported, false);
-  assert.equal(getAdapter('dc20').supported, false);
+  assert.ok(getAdapter('dc20rpg') instanceof DC20Adapter);
+  assert.equal(getAdapter('dc20rpg').supported, true, 'dc20rpg is first-class supported');
+  assert.ok(getAdapter('twodsix') instanceof TwodsixAdapter);
+  assert.equal(getAdapter('twodsix').supported, true, 'twodsix is first-class supported');
+  // The legacy 'dc20' system-id alias resolves to the same first-class adapter.
+  assert.ok(getAdapter('dc20') instanceof DC20Adapter);
+  assert.equal(getAdapter('dc20').supported, true);
   const dhConfig = getAdapter('daggerheart', {
     config: { walletPath: 'flags.w', itemPricePath: 'system.p' },
   });
@@ -1967,6 +2143,169 @@ test('dnd5e credit detects an overflowed balance', async () => {
   const adapter = new Dnd5eAdapter();
   const actor = createMockActor({ currency: { gp: 1 } });
   await assert.rejects(() => adapter.credit(actor, Number.MAX_SAFE_INTEGER), /overflowed/);
+});
+
+// ------------------------------------------------------ M6 dynamic currency config
+
+// The canonical gp-per-unit config (1 cp = 0.01 gp ... 1 pp = 10 gp) must
+// reproduce the legacy copper factors exactly and format GP exactly.
+test('M6: canonical currency config reproduces legacy copper factors', () => {
+  const config = {
+    cp: { conversion: 0.01 },
+    sp: { conversion: 0.1 },
+    ep: { conversion: 0.5 },
+    gp: { conversion: 1 },
+    pp: { conversion: 10 },
+  };
+  assert.deepEqual(dndCurrencyFactors(config), { cp: 1, sp: 10, ep: 50, gp: 100, pp: 1000 });
+  assert.equal(formatCopperAsGP(125, config), '1.25');
+  assert.equal(formatCopperAsGP(1250, config), '12.5');
+});
+
+test('M6: scientific-notation conversion strings parse exactly', () => {
+  // cp 1e-2 == 0.01 gp-per-unit, gp 1: factor[gp] is exactly 100.
+  assert.deepEqual(
+    dndCurrencyFactors({ cp: { conversion: '1e-2' }, gp: { conversion: 1 } }),
+    { cp: 1, gp: 100 }
+  );
+  // 1.23e+4 gp vs 1e+2 cp: factor[gp] = 12300 / 100 = 123.
+  assert.deepEqual(
+    dndCurrencyFactors({ cp: { conversion: '1e+2' }, gp: { conversion: '1.23e+4' } }),
+    { cp: 1, gp: 123 }
+  );
+  // The exact rational is used for GP formatting too: 125 cp * 0.01 gp = 1.25 gp.
+  assert.equal(
+    formatCopperAsGP(125, { cp: { conversion: '1e-2' }, gp: { conversion: 1 } }),
+    '1.25'
+  );
+});
+
+test('M6: an unsafe decimal conversion scale is rejected', () => {
+  // 1e200 is a finite, positive decimal whose scientific scale (200) exceeds the
+  // supported bound, so it fails closed instead of building a huge power of ten.
+  assert.throws(
+    () => dndCurrencyFactors({ cp: { conversion: '1e200' }, gp: { conversion: 1 } }),
+    /scale|exponent/i
+  );
+  // A huge negative scale (1e-200) is likewise rejected.
+  assert.throws(
+    () => dndCurrencyFactors({ cp: { conversion: '1e-200' }, gp: { conversion: 1 } }),
+    /scale|exponent/i
+  );
+});
+
+test('M6: Dnd5eAdapter honors CONFIG.DND5E.currencies when present', async () => {
+  const saved = globalThis.CONFIG;
+  globalThis.CONFIG = {
+    DND5E: {
+      currencies: {
+        pp: { conversion: 10 },
+        gp: { conversion: 1 },
+        ep: { conversion: 0.5 },
+        sp: { conversion: 0.1 },
+        cp: { conversion: 0.01 },
+      },
+    },
+  };
+  try {
+    const adapter = new Dnd5eAdapter();
+    const actor = createMockActor({ currency: { gp: 5 } });
+    assert.equal(await adapter.getBalance(actor), 500);
+    assert.deepEqual(dndCurrencyFactors({
+      cp: { conversion: 0.01 },
+      gp: { conversion: 1 },
+    }), { cp: 1, gp: 100 });
+  } finally {
+    if (saved === undefined) delete globalThis.CONFIG;
+    else globalThis.CONFIG = saved;
+  }
+});
+
+test('M6: custom dynamic currency config converts through derived factors', async () => {
+  const config = { cp: { conversion: 0.02 }, gp: { conversion: 1 } };
+  assert.deepEqual(dndCurrencyFactors(config), { cp: 1, gp: 50 });
+  assert.equal(formatCopperAsGP(105, config), '2.1');
+  assert.equal(formatCopperAsGP(125, config), '2.5');
+
+  const adapter = new Dnd5eAdapter({ currencyConfig: config });
+  const actor = createMockActor({ currency: { gp: 2, cp: 5 } });
+  assert.equal(await adapter.getBalance(actor), 105);
+
+  const debit = await adapter.debit(actor, 50);
+  assert.equal(debit.newBalance, 55);
+  assert.equal(actor.system.currency.gp, 1, 'decomposed to 1 gp');
+  assert.equal(actor.system.currency.cp, 5, 'decomposed to 5 cp');
+
+  const price = await adapter.getItemPrice({ system: { price: { value: 1, denomination: 'gp' } } });
+  assert.equal(price.minorUnits, 50, 'item gp converts to 50 cp');
+});
+
+test('M6: getAdapter forwards a currencyConfig to the dnd5e adapter', async () => {
+  const adapter = getAdapter('dnd5e', { currencyConfig: { cp: { conversion: 0.02 }, gp: { conversion: 1 } } });
+  assert.ok(adapter instanceof Dnd5eAdapter);
+  const actor = createMockActor({ currency: { gp: 2, cp: 5 } });
+  assert.equal(await adapter.getBalance(actor), 105);
+});
+
+test('M6: malformed conversion, inexact ratio and overflow fail closed before an update', async () => {
+  // malformed (zero) conversion
+  const zero = new Dnd5eAdapter({ currencyConfig: { cp: { conversion: 0 }, gp: { conversion: 1 } } });
+  const a = createMockActor({ currency: { gp: 1 } });
+  await assert.rejects(() => zero.debit(a, 1), /conversion/);
+  assert.equal(a.system.currency.gp, 1, 'wallet unchanged after a failed config');
+  assert.equal(a.patchLog.length, 0, 'no patch applied');
+
+  // inexact ratio (1 gp / 0.03 cp is not a whole number of copper)
+  const inexact = new Dnd5eAdapter({ currencyConfig: { cp: { conversion: 0.03 }, gp: { conversion: 1 } } });
+  const b = createMockActor({ currency: { gp: 1 } });
+  await assert.rejects(() => inexact.debit(b, 1), /factor|whole number/);
+  assert.equal(b.patchLog.length, 0, 'no patch applied');
+
+  // factor overflow (1 gp / 1e-18 cp overflows a safe integer)
+  const overflow = new Dnd5eAdapter({
+    currencyConfig: { cp: { conversion: '0.000000000000000001' }, gp: { conversion: 1 } },
+  });
+  const c = createMockActor({ currency: { gp: 1 } });
+  await assert.rejects(() => overflow.debit(c, 1), /safe integer|factor/);
+  assert.equal(c.patchLog.length, 0, 'no patch applied');
+});
+
+test('M6: an unknown currency denomination with nonzero balance is rejected', async () => {
+  const adapter = new Dnd5eAdapter({ currencyConfig: { cp: { conversion: 0.02 }, gp: { conversion: 1 } } });
+  // ep is not configured and carries a nonzero balance -> reject.
+  const actor = createMockActor({ currency: { gp: 1, ep: 1 } });
+  await assert.rejects(() => adapter.getBalance(actor), /unknown currency/);
+  // A zero balance on an unknown denomination is ignored.
+  const zero = createMockActor({ currency: { gp: 1, ep: 0 } });
+  assert.equal(await adapter.getBalance(zero), 50);
+});
+
+test('M6: item price rejects fractional minor units and overflow under a dynamic factor', async () => {
+  const adapter = new Dnd5eAdapter({ currencyConfig: { cp: { conversion: 0.02 }, gp: { conversion: 1 } } });
+  // 0.03 gp * 50 cp/gp = 1.5 cp -> not representable.
+  await assert.rejects(
+    () => adapter.getItemPrice({ system: { price: { value: 0.03, denomination: 'gp' } } }),
+    /sub-copper|representable/i
+  );
+  // An overflowing product is rejected rather than wrapping.
+  const defaultAdapter = new Dnd5eAdapter();
+  await assert.rejects(
+    () => defaultAdapter.getItemPrice({ system: { price: { value: Number.MAX_SAFE_INTEGER, denomination: 'gp' } } }),
+    /overflow/i
+  );
+});
+
+test('M6: item price rejects fractional copper exactly with no tolerance', async () => {
+  const adapter = new Dnd5eAdapter();
+  // 1000000.005 gp * 100 cp/gp = 100000000.5 cp -> fractional copper, rejected
+  // exactly (no tolerance that could round a large float to a whole integer).
+  await assert.rejects(
+    () => adapter.getItemPrice({ system: { price: { value: 1000000.005, denomination: 'gp' } } }),
+    /sub-copper|representable/i
+  );
+  // A large exact integer value still converts to an exact safe integer.
+  const ok = await adapter.getItemPrice({ system: { price: { value: 1000000, denomination: 'gp' } } });
+  assert.equal(ok.minorUnits, 100000000, '1000000 gp is exactly 100000000 cp');
 });
 
 // --------------------------------------------------------------- store default

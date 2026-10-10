@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.4`).
+  `download` release pointers, with `version` `0.1.5`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -55,10 +55,18 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
   modes), `Dnd5eAdapter` (cp/sp/ep/gp/pp in integer copper, item
   `system.price.value/denomination`, finite fractional `value` converted to
   copper only when exactly representable, sub-copper rejected, integer overflow
-  detected on all currency conversions), and `Daggerheart`/`DC20`/`Twodsix`
-  subclasses that explicitly report unsupported until the generic paths are
-  configured (no guessed paths). Item delivery preserves `item.toObject()`
-  minus `_id`/`ownership`/`folder`/`sort` without mutating the source.
+  detected on all currency conversions), `DC20Adapter` (first-class, source-
+  backed against dc20rpg 0.10.7.0: wallet `system.currency.{cp,sp,gp,pp}` in
+  integer cp factors 1/10/100/1000, item `system.price.{value,currency}` default
+  `gp`, `system.quantity`; unknown nonzero denominations / negative / fractional /
+  overflow / unknown price denominations rejected), and `TwodsixAdapter`
+  (first-class, source-backed against Twodsix 7.7.0: numeric
+  `system.financeValues.cash` ONLY - never the `system.finances.cash` display
+  string - as a non-negative safe integer, item `system.price` credits with no
+  conversion, `system.quantity`). The `DaggerheartAdapter` remains an explicitly-
+  unsupported generic subclass until the GM configures the generic paths (no
+  guessed price path). Item delivery preserves `item.toObject()` minus
+  `_id`/`ownership`/`folder`/`sort` without mutating the source.
 - Commerce (`src/services/commerce.js`): GM-only `purchase(...)` that re-reads
   shop/actor, resolves the item source from `itemUuid` or a valid snapshot
   (refusing an entry with neither), validates open/visible/stock/funds (quoted
@@ -124,7 +132,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.4/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.5/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -146,13 +154,13 @@ GitHub release was created, so the `0.1.0` download URL is superseded by `0.1.1`
 which was published as a prerelease (the workflow now sets up Node 22, where
 `crypto.getRandomValues` is available).
 
-The **`0.1.3` release was published** as a prerelease (tag `0.1.3`, carrying
-`module.json` and `module.zip` release assets), so the `0.1.3` download URL is
-live and installable. The **`0.1.4` release is being prepared but not yet
-published**: the `0.1.4` download URL is live only once that tag's `release` job
-completes and publishes the `0.1.4` GitHub release. Until then, install by
+The **`0.1.4` release was published** as a prerelease (tag `0.1.4`, carrying
+`module.json` and `module.zip` release assets), so the `0.1.4` download URL is
+live and installable. The **`0.1.5` release is being prepared but not yet
+published**: the `0.1.5` download URL is live only once that tag's `release` job
+completes and publishes the `0.1.5` GitHub release. Until then, install by
 pointing Foundry at the repo directory as a module source, or from the published
-`0.1.4` release once it exists.
+`0.1.5` release once it exists.
 
 ### Known issues / caveats
 
@@ -163,8 +171,10 @@ pointing Foundry at the repo directory as a module source, or from the published
   the Foundry boundaries (`game`/`Hooks`/`CONST`, `JournalEntry`, the actor
   document API) instead of a live runtime, so passing tests do not establish V14
   behavior - run the manual checklist in `docs/smoke-test.md` for that.
-- The `Daggerheart`/`DC20`/`Twodsix` adapters only report support once the GM
-  configures the generic adapter path settings.
+- The `Daggerheart` adapter only reports support once the GM configures the
+  generic adapter path settings; `DC20` and `Twodsix` are first-class and report
+  support regardless (use `getAdapter('generic', config)` for a custom generic
+  configuration).
 - Generic path updates assume object (non-array-index) path segments for the
   wallet and item price.
 - Compensation is best-effort; `needsRecovery` ledger entries require manual
@@ -1773,3 +1783,268 @@ resolved and covered by the test suite:
   can read "no order" and both can apply effects). No cross-client atomicity is
   claimed; verifying and hardening this against two live GM clients is deferred
   to M6 testing.
+
+## Milestone 6 - Dynamic dnd5e currency conversion, system adapters, portable backup & M6 review (implemented locally; live Foundry VTT 14 smoke pending)
+
+M6 is **implemented locally and Node-tested, but not yet verified against a live
+Foundry VTT 14 install** - so it is **not** claimed complete until the user runs
+the corresponding smoke sections on a real v14 runtime and confirms the
+behavior. The M6 work covers several independent slices. First, it removes the
+hardcoded dnd5e copper factors from `Dnd5eAdapter` and makes currency conversion
+data-driven from a validated GP-per-unit table, so a campaign that runs a custom
+exchange rate (for example the canonical default `cp: 0.01`, a COS-style
+`cp: 0.02`, or the live `CONFIG.DND5E.currencies`) is respected without any code
+change; the adoption curve is preserved, the canonical fallback reproduces the
+legacy factors exactly, and all existing integer-copper records continue to read
+and write unchanged. Second, it adds a pure portable import/export backup format
+(`src/storage/backup-format.js`) that validates and normalizes a self-contained
+GM-private backup of every location and shop and plans a collision-safe import
+into a target world, plus the GM-only portable backup service
+(`src/storage/backup.js`), the runtime `api.backup` wrappers and the manager
+backup panel. Third, it adds the deterministic concurrency/recovery suite
+(`tests/multiplayer.test.js`), the keyboard/contrast/reduced-motion
+accessibility CSS (`styles/market.css`) and the offline performance benchmark
+(`scripts/benchmark.mjs` + `tests/performance.test.js`). All of it is
+Node-tested only - no live verification has been run.
+
+### Implemented (M6)
+
+- **Dynamic currency config (`opts.currencyConfig`).** `Dnd5eAdapter` accepts an
+  optional `currencyConfig` getter or object. Each denomination must be
+  `{ conversion: <GP value per unit> }` (a positive finite decimal). When
+  omitted, the adapter reads the live `CONFIG?.DND5E?.currencies`, whose
+  `conversion` is already the GP value per unit (e.g. cp.conversion === 0.01,
+  gp.conversion === 1), and passes it through with no reciprocal; if no usable
+  `CONFIG` is present it falls back to a canonical default
+  (`{ pp: 10, gp: 1, ep: 0.5, sp: 0.1, cp: 0.01 }`) that reproduces the legacy
+  factors.
+- **Exact, fail-closed normalization.** The config is normalized per operation
+  into per-denomination copper factors using BigInt rational arithmetic
+  (`conversion[d] / conversion.cp`). Normalization throws before any wallet
+  update on: a missing `cp`/`gp`, a non-finite or non-positive conversion, a
+  factor that is not a positive safe integer, a `gp` factor below 1, or a ratio
+  that is not a whole number of copper. Unknown denominations with a nonzero
+  balance are rejected; unknown zero balances are ignored.
+- **Factor-driven wallet and items.** `getBalance` / `debit` / `credit` read and
+  write every configured denomination using its factor (no fixed
+  `cp`/`sp`/`ep`/`gp`/`pp` constants remain), decompose balances greedily in
+  largest-factor-first order, and detect safe-integer overflow. `getItemPrice`
+  converts `item.system.price.value` via the factor for
+  `item.system.price.denomination` by multiplying an exact BigInt
+  decimal-rational value by the factor and rejecting any fractional copper
+  exactly (with no float tolerance) plus safe-integer overflow. A single config
+  snapshot is used per operation, avoiding a torn read from a changing getter.
+- **Exact decimal parsing with scientific notation.** The internal rational
+  parser accepts plain and scientific-notation decimal strings (`1e-7`,
+  `1.23e+4`) exactly, with a bounded exponent and a capped decimal scale so an
+  unsafe scale (e.g. `1e200`) fails closed instead of building an unbounded
+  power of ten. All factor and item-price math remains BigInt/integer guarded.
+- **New exports.** `dndCurrencyFactors(config)` returns the per-denomination
+  copper factors, and `formatCopperAsGP(copper, config)` renders an integer
+  copper amount as an exact decimal GP string (BigInt-backed, no float error).
+  `DENOMINATIONS` and `DENOMINATION_FACTOR` remain for legacy callers.
+- **Portable import/export backup format (`src/storage/backup-format.js`).** A
+  pure, Node-importable, no-store-write module that validates and normalizes a
+  `foundry-market-portable` backup (`{ format, formatVersion: 1, locations,
+  shops }`) and plans a collision-safe import. `normalizeBackup(raw)` returns
+  deep-normalized plain-object clones (never mutating the input) and rejects
+  unknown/future format versions, non-array `locations`/`shops`, the
+  1000-location/1000-shop caps, a >5 MiB serialized UTF-8 payload (measured on
+  the RAW input before any clone/normalization - so an oversized field the
+  normalizer would discard is refused without a costly traversal - and again on
+  the normalized output), duplicate location/shop ids, a shop referencing a
+  missing/empty location, and a travel schedule referencing a missing location.
+  It also rejects any non-plain JSON (functions, non-plain prototypes, cycles,
+  BigInt). The raw walk that enforces this never mutates the caller's objects:
+  cycle detection uses an ancestor `WeakSet` plus an explicit path stack (never
+  a sentinel property), so a deeply frozen, non-extensible valid backup is
+  accepted unchanged. `planBackupImport(backup,
+  { existingLocationIds, existingShopIds, makeId })` gives every imported
+  top-level location and shop a fresh, distinct, 120-char-bounded id that avoids
+  the existing world ids, remaps `shop.locationId` and
+  `automation.travel.locationIds` (and any embedded NPC `shopId`), preserves
+  inventory entry ids, and resets stale automation clock state
+  (`entry.restock.lastCycle`, `automation.travel.lastCycle` and the whole
+  `automation.diagnostics` block) while retaining the configuration. The remap
+  and id reservation run through `Map`/`Set` key spaces, so a source id that
+  collides with a prototype name (`__proto__`, `constructor`) is an ordinary key
+  and maps correctly. `warnings`
+  channels report cross-world staleness instead of silently carrying it. A v0
+  legacy backup (`{ version: 0, locations, shops }`) is migrated to v1 **only
+  when every source object normalizes**; an invalid v0 source rejects the whole
+  backup rather than being silently coerced. That migration is strictly
+  **portable-format only** - it rewrites the backup payload shape and
+  re-normalizes every record; it is **not** a JournalEntry schema migration
+  (`SCHEMA_VERSION` stays `1`, and the store only lists journal flags whose
+  `schemaVersion === SCHEMA_VERSION`), so a pre-existing journal carrying an
+  older schema-v0 is not auto-migrated - it is simply not enumerated, and the
+  import only ever creates fresh schema-v1 records.
+- **GM-private, never a player projection.** The portable backup is written from
+  the full normalized shop records - private item snapshots, per-entry access
+  gates, `commerce.valuations` (including the private `actorUuid`/`fingerprint`),
+  `commerce.funds` and the whole `automation` config - never a `publicShop`
+  projection. Ledger records, reputation records/events and advanced orders are
+  deliberately excluded as not portable; shop actor references that cross into
+  the world (NPC `actorUuid`, access/valuation actor lists) stay and surface a
+  staleness warning.
+- **GM-only portable backup service (`src/storage/backup.js`).** An effectful
+  layer on top of the pure format module that actually reads/writes the store.
+  `createBackupService({ store, runShopExclusive, isActiveGM, makeId, logger })`
+  returns `exportPortable()` and `importPortable(raw, { dryRun })`. `exportPortable`
+  re-checks the active-GM predicate before EVERY store read and, on a handover
+  between the locations read and the shops read, stops without the second read
+  and reports `not-active-gm` with no private backup returned; it then lists every
+  location and shop and normalizes them into a canonical v1 backup, returning
+  `{ status: 'ok', backup, warnings }`. `importPortable` rejects a non-object or
+  invalid/oversized backup via `normalizeBackup` before any store access
+  (returning `invalid-backup`); the world read, id planning and collision
+  preflight then run via `planBackupImport` and preflight every cross-reference
+  (a before-write failure returns `import-preflight-failed`; no raw exception
+  string ever leaks into a result), with the active-GM predicate re-checked
+  before EVERY one of those store reads so a handover between the locations read
+  and the shops read stops cleanly and reports `not-active-gm` (nothing written).
+  With `dryRun: true` those read/plan/preflight
+  steps run separately OUTSIDE the serialized write queue (it only previews the
+  remap and returns counts/id-mapping/warnings, writing nothing); the reported
+  `idMap` is built from null-prototype objects so a source id such as `__proto__`
+  or `constructor` is a safe own key that survives JSON serialization. Otherwise
+  it serializes the import on a module-scoped in-flight promise and re-runs the
+  world read, id planning and collision preflight FRESH inside that queue, so two
+  concurrent imports never plan against the same pre-write world state. It then
+  creates every location first then every shop (both sequentially), re-checks the
+  active-GM predicate immediately before each create, and requires a non-null
+  returned record matching the planned id - never overwriting an existing record
+  (ids are always fresh). A create failure, a create that persists then
+  throws/null (detected by re-reading the store with `findShop`/`listLocations`
+  so a landed write is never hidden), or a GM handover after any write returns
+  `{ status: 'partial', createdLocationIds, createdShopIds, error:
+  'import-partial', warnings }` with bounded id lists and no automatic rollback
+  (written records remain). The active-GM predicate is re-checked before that
+  recovery re-read too: on a handover the re-read is skipped and the partial
+  result carries an uncertain-create warning (`"the created record may not be
+  reported"`) instead of falsely claiming whether the write landed. A handover
+  before any write returns `not-active-gm`. Operational live records are never
+  deleted or dropped, **no complete cross-GM atomicity is claimed** (an import is
+  not an all-or-nothing transaction across GM clients - a mid-import interruption
+  leaves partial results visible and never auto-rolls back), and the service is
+  Node-tested only (no runtime/UI wiring yet).
+- **Runtime + manager backup panel wiring.** `main.js` builds the
+  `createBackupService` instance in `init` (after commerce) and exposes it only
+  through the bounded `api.backup.exportPortable`/`importPortable` wrappers,
+  each active-GM guarded before delegating (the raw service/store are never
+  exposed). The GM manager gains an in-game backup panel with
+  `export-backup`/`preview-backup`/`import-backup` actions, all DOM-scoped and
+  active-GM gated. Export compact-serializes the backup, checks its UTF-8 byte
+  length against `MAX_BACKUP_BYTES` BEFORE any download, and only then downloads
+  the JSON locally (Blob object URL + anchor + `URL.revokeObjectURL`); an export
+  that exceeds the portable bound is refused with `export-too-large` (no
+  download) so a saved backup is always importable back. The backup is never
+  routed through a player request or chat message. Preview reads the selected
+  file only when it is at most 5 MiB
+  (`File.size` is checked before `text()`), parses the JSON, and runs a dry-run
+  import (`dryRun: true`), caching the raw backup and the File object so the real
+  import can reuse them exactly; the preview context carries only counts and
+  bounded warnings. Import requires BOTH the confirmation checkbox and an
+  existing preview computed from the currently selected file (a file change
+  invalidates a stale preview), reports ok/partial honestly (bounded created
+  ids), and clears the cached raw/checkbox and refreshes locations/shops on
+  success/partial. `backupSummary`/`backupPreview` are sanitized plain objects -
+  counts, at most 20 warnings and bounded created-id lists - never raw backup
+  JSON.
+- **Concurrency / recovery validation (M6) (`tests/multiplayer.test.js`).** A
+  pure Node suite that drives the real market services (commerce purchase, cart
+  checkout, selling, preorders, theft, automation) through a single unified fake
+  store with a controllable per-shop lock, and asserts the exact, deterministic
+  boundaries of the module's no-distributed-atomicity claim. It covers: 50
+  simultaneous purchases on one shop under the shared `runShopExclusive` lock
+  (exactly 30 commit and 20 fail `insufficient-stock` on a stock of 30 - no
+  oversell, no double-debit, one ledger per success; the exact committed subset is
+  scheduler-dependent but the aggregates are deterministic, so it is never flaky);
+  50 mixed purchase/cart/automation ops under the same lock (exactly the sold
+  units charged once, no lost stock update); idempotent replay (no second charge,
+  no second ledger); two independent shops under separate locks (no cross-shop
+  stock/funds contamination); GM-handoff refusal of queued sell/cart/automation
+  operations (`not-active-gm`/`idle` with no stale write, because the active-GM
+  predicate is re-checked after every await boundary); preorder/theft replay plus
+  pending/needsRecovery across request ids (no re-debit, no re-create, no second
+  claim, and a competing fulfill/cancel under a distinct request id surfacing
+  `needsRecovery` without double-running); injected applies-then-throws recovery
+  for a shop write (recovered as `failed`, wallet refunded, shop restored), a
+  ledger commit (resolved `committed` by re-reading the persisted terminal status)
+  and an advanced-order commit (recovered via re-read, replay never re-debits);
+  and the multi-GM race boundaries - two independent GM service instances (separate
+  lock maps) on the atomic fake store never double-charge, while a gated
+  `beforeCreateLedger` barrier forces both clients to observe "no record" before
+  either inserts and reproduces the documented JournalEntry read-then-create
+  double-charge window deterministically (both commit, wallet double-debited for
+  the same key). The fake store's read-then-create is deliberately atomic (no
+  `await` between the existence scan and the insert), which masks the real-store
+  race, so the gated test is the only place the window is reproduced.
+- **M6 limitation, documented not hidden.** No distributed/transactional
+  atomicity is claimed. The per-shop lock and every read-then-create guard are
+  per-client; the only cross-client guard is best-effort ledger/advanced-order
+  idempotency. The gated interleaving test reproduces the double-charge window on
+  purpose rather than pretending it does not exist.
+- **M6 keyboard accessibility CSS (`styles/market.css`).** The global
+  `.market-app :is(button, input, select, textarea, a, [tabindex]):focus-visible`
+  rule keeps a visible 3px gold outline plus a dark halo on both the light
+  manager and the dark storefront surfaces, and the manager/backup/entry surfaces
+  each carry their own `:focus-visible` outline (`.backup-panel`, `.product-card`
+  / `.entry-detail`, the `.weekday-option` and `.market-check` custom controls).
+  The custom controls never rely on colour alone: `.weekday-option` and
+  `.market-check` hide the native input but render an explicit `:checked` state
+  (gold fill + visible glyph/check on a white-on-gold contrast) and an explicit
+  `:focus-visible` outline on the styled art. A contrast palette is defined via
+  the `--mk-*` tokens and per-surface light/dark ink lines. Reduced motion is
+  honoured both by a `.motion-off` class (`.motion-off *`, plus the preview
+  panel variant) and by a global `@media (prefers-reduced-motion: reduce)` rule
+  that disables transitions, animations and smooth scrolling across the app.
+  There is no automated axe/screen-reader run in the suite; the intended check is
+  the manual keyboard/screen-reader checklist in `docs/smoke-test.md` section 23.
+- **M6 offline performance benchmark (`scripts/benchmark.mjs` +
+  `tests/performance.test.js`).** `npm run benchmark` (or
+  `node scripts/benchmark.mjs [entryCount]`) imports only Foundry-free functions,
+  runs 10 discarded warmup iterations then 100 measured iterations per workload,
+  and prints a median / p95 (ms) report for normalization, public-catalog build
+  and automation policy at a large inventory size (default 1000 entries). The
+  numbers are example wall-clock timings on the machine that runs the script -
+  not a CI gate, and no live Foundry VTT 14 profile exists yet. The deterministic
+  O(N) guarantee lives in `tests/performance.test.js`: it asserts bounded output
+  and a leak-free projection at 1000 entries, counts array reads via a Proxy to
+  prove `planAutomation` does no O(N^2) repeated global work, and adds a single
+  very generous 10 s catastrophic-regression-only wall-clock guard so a slow/loaded
+  CI never flips a test that is only measuring scaling.
+
+### Deferred (M6)
+
+- **Live Foundry VTT 14 smoke.** The dynamic conversion behavior (CONFIG-driven
+  read, the COS-style custom-rate rosette, and the GP-equivalent formatter) has
+  only been exercised in Node unit tests; confirm on a real v14 runtime that a
+  GM-configured exchange rate drives wallet/item conversion and that no
+  existing integer-copper records break. The portable backup format's
+  validate + import-plan flow is likewise only Node-tested; confirm on a live
+  v14 runtime that a normalized backup's exports can be verified and that the
+  planned import ids/references are accepted by the real store.
+- **No UI surface.** Currency configuration is supplied to the adapter via
+  `opts.currencyConfig`; there is no manager/storefront control for a GM to
+  edit a conversion table in-game yet. (The portable backup now has a manager
+  panel and runtime wiring, so this remaining gap covers currency config only.)
+- **Live adapter / generic tests are pending.** The DC20/Twodsix adapters and the
+  generic-fallback paths are validated against **offline fixtures**; the real
+  system install field access (and the `generic` configured fallback in a live
+  system) has not been exercised on a Foundry VTT 14 runtime yet.
+- **Multiplayer Foundry load and keyboard/screen reader are pending.** The
+  deterministic concurrency/recovery suite (`tests/multiplayer.test.js`) runs in
+  Node against a fake store; it has not been exercised under a real multi-client
+  Foundry load. Likewise the M6 accessibility CSS is present but there is no
+  automated axe/screen-reader run - the manual keyboard/screen-reader check
+  (`docs/smoke-test.md` section 23) has not been run.
+- **The cross-GM race is unresolved.** The per-shop lock and every read-then-create
+  guard remain per-client, and the module does **not** claim cross-GM atomicity.
+  The gated Node test reproduces the double-charge window deterministically, but
+  verifying and hardening against two live GM clients is still open.
+- **Schema-v0 Journal data is not auto-migrated.** A pre-existing market
+  JournalEntry carrying `schemaVersion` 0 is not rewritten in place by the backup
+  path (the v0->v1 migration is strictly **backup-format only**, rewriting the
+  backup payload); such a journal is simply not enumerated, and only fresh
+  schema-v1 records are ever created.

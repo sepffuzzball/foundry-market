@@ -424,7 +424,14 @@ export function normalizeNpc(raw = {}) {
   );
   const personality = isValidPersonality(raw.personality) ? raw.personality : 'honest';
   const visible = raw.visible === false ? false : true;
-  return { id, name, role, actorUuid, portrait, greeting, personality, visible };
+  const npc = { id, name, role, actorUuid, portrait, greeting, personality, visible };
+  // An optional embedded shop id reference is preserved (never defaulted) so a
+  // portable backup can remap a stale cross-world shopId on import. It is
+  // omitted entirely when absent, keeping the common NPC shape unchanged.
+  if (raw.shopId != null) {
+    npc.shopId = assertString(raw.shopId, 'npcs[].shopId', { allowEmpty: true });
+  }
+  return npc;
 }
 
 function ownerNpc(owner, social, shopId) {

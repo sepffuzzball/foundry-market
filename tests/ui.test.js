@@ -17,6 +17,11 @@ import {
   responseMessageData,
 } from '../src/core/requests.js';
 import { createLockMap } from '../src/services/commerce.js';
+import {
+  MAX_BACKUP_BYTES,
+  BACKUP_FORMAT,
+  normalizeBackup,
+} from '../src/storage/backup-format.js';
 
 // ---- Foundry global stubs (installed before importing the UI modules) --------
 
@@ -5536,4 +5541,538 @@ test('storefront M5: a needsRecovery cart replay keeps the cart and surfaces rec
   });
   assert.equal(app._data.cartLines.length, 1, 'cart kept on a needsRecovery replay');
   assert.ok(app._data.feedback.includes('pending recovery'));
+});
+
+// ---- M6: GM-only portable backup manager panel --------------------------------
+
+test('manager backup export downloads the backup locally and never posts to chat', async () => {
+  let exported = 0;
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      exportPortable: async () => {
+        exported += 1;
+        return {
+          status: 'ok',
+          backup: {
+            format: 'foundry-market-portable',
+            formatVersion: 1,
+            locations: [{ id: 'L1' }],
+            shops: [{ id: 'S1', locationId: 'L1' }],
+            warnings: [],
+          },
+          warnings: ['A caveat'],
+        };
+      },
+    },
+  });
+  app.render = async () => {};
+
+  let chatCreates = 0;
+  const prevChat = globalThis.ChatMessage;
+  globalThis.ChatMessage = { create: () => { chatCreates += 1; } };
+  try {
+    await app._onExportBackup({}, {}, {});
+  } finally {
+    globalThis.ChatMessage = prevChat;
+  }
+
+  assert.equal(exported, 1, 'export service invoked');
+  assert.equal(chatCreates, 0, 'no ChatMessage created for an export');
+  assert.equal(app._data.backupSummary.status, 'exported');
+  assert.equal(app._data.backupSummary.kind, 'export');
+  assert.equal(app._data.backupSummary.locations, 1);
+  assert.equal(app._data.backupSummary.shops, 1);
+  assert.deepEqual(app._data.backupSummary.warnings, ['A caveat']);
+  assert.equal(app._data.notice, 'Backup exported.');
+});
+
+test('manager backup export surfaces an export failure without a download or chat', async () => {
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      exportPortable: async () => ({ status: 'error', error: 'export-failed' }),
+    },
+  });
+  app.render = async () => {};
+  await app._onExportBackup({}, {}, {});
+  assert.equal(app._data.backupSummary.status, 'error');
+  assert.equal(app._data.backupSummary.error, 'export-failed');
+  assert.match(app._data.notice, /Export failed: export-failed/);
+});
+
+// Install a minimal `document`/`URL` stub so `_downloadBackup` actually builds a
+// Blob and creates/revokes an object URL, capturing the Blob for assertion.
+// Without these globals `_downloadBackup` still returns `{status:'ok'}` but never
+// produces a Blob, which is what the near-limit size/importability test needs.
+function installBackupDownloadMock() {
+  const created = [];
+  let nextUrl = 0;
+  const prevDocument = globalThis.document;
+  const prevURL = globalThis.URL;
+  globalThis.document = {
+    createElement: () => ({
+      href: '',
+      download: '',
+      style: {},
+      click: () => {},
+    }),
+    body: {
+      appendChild: () => {},
+      removeChild: () => {},
+    },
+  };
+  globalThis.URL = {
+    createObjectURL: (blob) => {
+      created.push(blob);
+      return `blob:${++nextUrl}`;
+    },
+    revokeObjectURL: () => {},
+  };
+  return {
+    created,
+    restore: () => {
+      globalThis.document = prevDocument;
+      globalThis.URL = prevURL;
+    },
+  };
+}
+
+function utf8Length(str) {
+  return new TextEncoder().encode(str).length;
+}
+
+test('manager backup export compacts the backup, size-checks it, and only downloads an importable payload', async () => {
+  // A valid portable backup whose COMPACT serialized bytes are just under the
+  // 5 MiB bound. The payload is built from the same `normalizeBackup` output the
+  // export service actually returns, so the size gate is measured against the
+  // real normalized export and the roundtrip import stays within the bound. The
+  // export path must compact-serialize (no pretty-print), check the UTF-8 byte
+  // count against MAX_BACKUP_BYTES BEFORE any download, and only then hand the
+  // Blob to the browser - so a download can never be un-importable.
+  const minimal = {
+    format: 'foundry-market-portable',
+    formatVersion: 1,
+    locations: [{ id: 'L1', name: 'Town', description: '', theme: '', createdAt: 1 }],
+    shops: [
+      {
+        id: 'S1',
+        name: 'General Store',
+        locationId: 'L1',
+        description: '',
+        theme: '',
+        owner: '',
+        open: true,
+        npcs: [],
+        inventory: [],
+        commerce: {},
+        automation: {},
+        createdAt: 1,
+      },
+    ],
+  };
+  const backup = normalizeBackup(minimal);
+  const baseBytes = utf8Length(JSON.stringify(backup));
+  // Pad the shop description so the NORMALIZED serialized total sits just below
+  // the bound (leaving headroom so the idempotent roundtrip normalize never
+  // pushes it back over).
+  const pad = Math.max(0, MAX_BACKUP_BYTES - baseBytes - 200);
+  backup.shops[0].description = 'a'.repeat(pad);
+  const serializedBytes = utf8Length(JSON.stringify(backup));
+  assert.ok(serializedBytes <= MAX_BACKUP_BYTES, 'near-limit backup is within the bound');
+  assert.ok(serializedBytes > MAX_BACKUP_BYTES - 1200, 'backup is near the limit');
+
+  let exported = 0;
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      exportPortable: async () => {
+        exported += 1;
+        return { status: 'ok', backup, warnings: [] };
+      },
+    },
+  });
+  app.render = async () => {};
+
+  const download = installBackupDownloadMock();
+  try {
+    await app._onExportBackup({}, {}, {});
+  } finally {
+    download.restore();
+  }
+
+  assert.equal(exported, 1, 'export service invoked');
+  assert.equal(app._data.backupSummary.status, 'exported');
+  assert.equal(app._data.notice, 'Backup exported.');
+  assert.equal(download.created.length, 1, 'exactly one Blob was downloaded');
+
+  const text = await download.created[0].text();
+  assert.ok(!text.includes('\n'), 'the export is compact JSON (no pretty-print)');
+  assert.equal(utf8Length(text), serializedBytes, 'the downloaded bytes match the serialized backup');
+  // The exported payload must be importable back: normalizeBackup accepts it.
+  const roundtrip = normalizeBackup(JSON.parse(text));
+  assert.equal(roundtrip.format, BACKUP_FORMAT);
+  assert.equal(roundtrip.locations.length, 1);
+  assert.equal(roundtrip.shops.length, 1);
+  assert.equal(roundtrip.shops[0].locationId, 'L1');
+});
+
+test('manager backup export refuses a backup that exceeds the portable size bound without downloading', async () => {
+  // A single shop with an over-5 MiB description pushes the compact serialization
+  // past MAX_BACKUP_BYTES, so `_downloadBackup` must refuse (no Blob, no click)
+  // and the manager must surface `export-too-large` with a clear notice.
+  const bigBackup = {
+    format: 'foundry-market-portable',
+    formatVersion: 1,
+    locations: [{ id: 'L1', name: 'Town', description: '', theme: '', createdAt: 1 }],
+    shops: [
+      {
+        id: 'S1',
+        name: 'General Store',
+        locationId: 'L1',
+        description: 'x'.repeat(MAX_BACKUP_BYTES + 1),
+        theme: '',
+        owner: '',
+        open: true,
+        npcs: [],
+        inventory: [],
+        commerce: {},
+        automation: {},
+        createdAt: 1,
+      },
+    ],
+    warnings: [],
+  };
+  assert.ok(
+    utf8Length(JSON.stringify(bigBackup)) > MAX_BACKUP_BYTES,
+    'oversized backup exceeds the bound'
+  );
+
+  let exported = 0;
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      exportPortable: async () => {
+        exported += 1;
+        return { status: 'ok', backup: bigBackup, warnings: [] };
+      },
+    },
+  });
+  app.render = async () => {};
+
+  const download = installBackupDownloadMock();
+  try {
+    await app._onExportBackup({}, {}, {});
+  } finally {
+    download.restore();
+  }
+
+  assert.equal(exported, 1, 'export service invoked');
+  assert.equal(download.created.length, 0, 'no Blob is downloaded for an oversized export');
+  assert.equal(app._data.backupSummary.status, 'error');
+  assert.equal(app._data.backupSummary.error, 'export-too-large');
+  assert.match(app._data.notice, /exceeds 5 MB/);
+});
+
+test('manager backup preview reads the selected file only when it is at most 5 MB', async () => {
+  let textCalls = 0;
+  const bigFile = {
+    size: MAX_BACKUP_BYTES + 1,
+    text: async () => {
+      textCalls += 1;
+      return '{}';
+    },
+  };
+  const app = new MarketManager({ deps: { systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app.render = async () => {};
+  app.element = fakeElement({ '[name="backupFile"]': { files: [bigFile] } });
+  await app._onPreviewBackup({}, {}, {});
+  assert.equal(textCalls, 0, 'text() is not called for an oversized file');
+  assert.equal(app._data.backupPreview, null);
+  assert.match(app._data.notice, /larger than 5 MB/);
+});
+
+test('manager backup preview runs a dry-run import and caches the raw backup', async () => {
+  const raw = { format: 'foundry-market-portable', formatVersion: 1, locations: [{ id: 'L1' }], shops: [] };
+  const file = { size: 100, text: async () => JSON.stringify(raw) };
+  let dryRun = false;
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      importPortable: async (r, opts) => {
+        assert.deepEqual(r, raw, 'the exact parsed backup is passed');
+        assert.equal(opts.dryRun, true, 'preview uses a dry run');
+        dryRun = true;
+        return {
+          status: 'ok',
+          dryRun: true,
+          counts: { locations: 1, shops: 0 },
+          idMap: { locations: { L1: 'new-loc' }, shops: {} },
+          warnings: [],
+        };
+      },
+    },
+  });
+  app.render = async () => {};
+  app.element = fakeElement({ '[name="backupFile"]': { files: [file] } });
+  await app._onPreviewBackup({}, {}, {});
+  assert.ok(dryRun, 'dry-run import invoked');
+  assert.equal(app._data.backupPreview.locations, 1);
+  assert.equal(app._data.backupPreview.shops, 0);
+  assert.equal(app._data.notice, '');
+  assert.deepEqual(app._backupRaw, raw, 'raw backup cached for the real import');
+  assert.equal(app._backupFile, file, 'the selected File object is cached');
+});
+
+test('manager backup preview rejects a file that is not valid JSON', async () => {
+  const file = { size: 100, text: async () => 'not-json{' };
+  let preview = 0;
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      importPortable: async () => {
+        preview += 1;
+        return { status: 'ok', dryRun: true, counts: { locations: 0, shops: 0 }, warnings: [] };
+      },
+    },
+  });
+  app.render = async () => {};
+  app.element = fakeElement({ '[name="backupFile"]': { files: [file] } });
+  await app._onPreviewBackup({}, {}, {});
+  assert.equal(preview, 0, 'no dry-run for invalid JSON');
+  assert.equal(app._data.backupPreview, null);
+  assert.match(app._data.notice, /not valid JSON/);
+});
+
+test('manager backup import requires the confirmation checkbox', async () => {
+  let imports = 0;
+  const raw = { format: 'foundry-market-portable', formatVersion: 1, locations: [], shops: [] };
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      importPortable: async () => {
+        imports += 1;
+        return { status: 'ok', createdLocationIds: [], createdShopIds: [], warnings: [] };
+      },
+    },
+  });
+  app.render = async () => {};
+  app._refreshData = async () => {};
+  app._data.backupPreview = { locations: 0, shops: 0, warnings: [] };
+  app._backupRaw = raw;
+  app._backupFile = { size: 100 };
+  app.element = fakeElement({ '[name="confirmImport"]': fakeCheckbox({ checked: false }) });
+  await app._onImportBackup({}, {}, {});
+  assert.equal(imports, 0, 'no import without confirmation');
+  assert.equal(app._data.notice, 'Check the confirmation box to import.');
+  assert.equal(app._data.backupPreview.locations, 0, 'preview kept for a valid import');
+  app.element = fakeElement({ '[name="confirmImport"]': fakeCheckbox({ checked: true }) });
+  await app._onImportBackup({}, {}, {});
+  assert.equal(imports, 1, 'import proceeds once confirmed');
+  assert.equal(app._data.notice, 'Imported 0 locations and 0 shops.');
+  assert.equal(app._data.backupSummary.status, 'imported');
+  assert.equal(app._backupRaw, null, 'cached raw cleared after import');
+  assert.equal(app._data.backupPreview, null);
+});
+
+test('manager backup import refuses when the selected file changed since the preview', async () => {
+  let imports = 0;
+  const raw = { format: 'foundry-market-portable', formatVersion: 1, locations: [], shops: [] };
+  const fileA = { size: 100, name: 'a.json' };
+  const fileB = { size: 100, name: 'b.json' };
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      importPortable: async () => {
+        imports += 1;
+        return { status: 'ok', createdLocationIds: [], createdShopIds: [], warnings: [] };
+      },
+    },
+  });
+  app.render = async () => {};
+  app._refreshData = async () => {};
+  app._data.backupPreview = { locations: 0, shops: 0, warnings: [] };
+  app._backupRaw = raw;
+  app._backupFile = fileA;
+  // A DIFFERENT File object is now in the DOM => stale preview invalid.
+  app.element = fakeElement({
+    '[name="backupFile"]': { files: [fileB] },
+    '[name="confirmImport"]': fakeCheckbox({ checked: true }),
+  });
+  await app._onImportBackup({}, {}, {});
+  assert.equal(imports, 0, 'no import for a changed file');
+  assert.equal(app._data.backupPreview, null);
+  assert.equal(app._data.notice, 'The selected file changed; preview it again before importing.');
+  // After a re-render the file input's selection is lost but the stored file
+  // reference is still the one the preview was built from => still valid.
+  app._data.backupPreview = { locations: 0, shops: 0, warnings: [] };
+  app._backupRaw = raw;
+  app.element = fakeElement({
+    '[name="backupFile"]': { files: [] },
+    '[name="confirmImport"]': fakeCheckbox({ checked: true }),
+  });
+  await app._onImportBackup({}, {}, {});
+  assert.equal(imports, 1, 'valid import when the DOM reset but the stored file is unchanged');
+});
+
+test('manager backup import is blocked for a non-active GM', async () => {
+  let calls = 0;
+  const app = new MarketManager({ deps: { systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => false } });
+  app.render = async () => {};
+  app._refreshData = async () => {};
+
+  await app._onExportBackup({}, {}, {});
+  assert.match(app._data.notice, /active Game Master/);
+
+  app._data.notice = '';
+  await app._onPreviewBackup({}, {}, {});
+  assert.match(app._data.notice, /active Game Master/);
+
+  app._data.notice = '';
+  await app._onImportBackup({}, {}, {});
+  assert.match(app._data.notice, /active Game Master/);
+  assert.equal(calls, 0);
+});
+
+test('manager backup import reports a partial outcome honestly', async () => {
+  const raw = { format: 'foundry-market-portable', formatVersion: 1, locations: [], shops: [] };
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      importPortable: async (r, opts) => {
+        assert.equal(opts.dryRun, false, 'real import is not a dry run');
+        return {
+          status: 'partial',
+          createdLocationIds: ['L-new-1'],
+          createdShopIds: ['S-new-1', 'S-new-2'],
+          error: 'import-partial',
+          warnings: ['W'],
+        };
+      },
+    },
+  });
+  app.render = async () => {};
+  app._refreshData = async () => {};
+  app._data.backupPreview = { locations: 1, shops: 2, warnings: [] };
+  app._backupRaw = raw;
+  app._backupFile = { size: 100 };
+  app.element = fakeElement({
+    '[name="backupFile"]': { files: [] },
+    '[name="confirmImport"]': fakeCheckbox({ checked: true }),
+  });
+  await app._onImportBackup({}, {}, {});
+  assert.equal(app._data.backupSummary.status, 'partial');
+  assert.equal(app._data.backupSummary.kind, 'import');
+  assert.equal(app._data.backupSummary.createdLocations, 1);
+  assert.equal(app._data.backupSummary.createdShops, 2);
+  assert.deepEqual(app._data.backupSummary.createdLocationIds, ['L-new-1']);
+  assert.deepEqual(app._data.backupSummary.createdShopIds, ['S-new-1', 'S-new-2']);
+  assert.equal(app._data.backupSummary.error, 'import-partial');
+  assert.deepEqual(app._data.backupSummary.warnings, ['W']);
+  assert.match(app._data.notice, /partially completed/);
+  assert.match(app._data.notice, /L-new-1/);
+  assert.equal(app._backupRaw, null, 'cached raw cleared');
+  assert.equal(app._backupFile, null, 'cached file cleared');
+  assert.equal(app._data.backupPreview, null);
+  assert.equal(app._data.backupSummary.createdLocationIds.length, 1, 'bounded created-id list projected');
+});
+
+test('manager backup warnings are bounded to twenty entries', () => {
+  const app = new MarketManager({ deps: { systemId: () => 'dnd5e' } });
+  const warnings = Array.from({ length: 30 }, (_, i) => `w${i}`);
+  const sanitized = app._sanitizeBackupWarnings(warnings);
+  assert.equal(sanitized.length, 20, 'warnings bounded to 20');
+  assert.deepEqual(sanitized, warnings.slice(0, 20));
+});
+
+test('manager backup template gates backup actions on the active GM', () => {
+  const template = readFileSync(new URL('../templates/manager.hbs', import.meta.url), 'utf8');
+  assert.match(
+    template,
+    /data-action="export-backup"[^>]*\{\{#unless isActiveGM\}\}disabled/,
+    'Export backup disabled for a non-active GM'
+  );
+  assert.match(
+    template,
+    /data-action="preview-backup"[^>]*\{\{#unless isActiveGM\}\}disabled/,
+    'Preview import disabled for a non-active GM'
+  );
+  assert.match(
+    template,
+    /data-action="import-backup"[^>]*\{\{#unless isActiveGM\}\}disabled/,
+    'Import backup disabled for a non-active GM'
+  );
+  // The summary block must not render both an "Added N..." line and an "N
+  // locations..." line at once.
+  assert.ok(!/createdLocations.*?\{\{#if backupSummary\.locations\}\}/s.test(template), 'no duplicated count lines');
+});
+
+test('runtime api.backup is active-GM gated and never exposes the raw service', async () => {
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {}, get: () => '' };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+
+  const prevTime = globalThis.game.time;
+  globalThis.game.time = { worldTime: 1000 };
+
+  try {
+    await import('../src/core/main.js');
+    fireHook('init');
+
+    const api = globalThis.game.modules.get('market').api;
+    assert.ok(api, 'module api attached');
+    assert.equal(typeof api.backup, 'object', 'backup surface exposed');
+    assert.equal(typeof api.backup.exportPortable, 'function', 'exportPortable surface exposed');
+    assert.equal(typeof api.backup.importPortable, 'function', 'importPortable surface exposed');
+
+    const prevUser = globalThis.game.user;
+    const prevUsers = globalThis.game.users;
+    try {
+      // Non-active GM: rejected before any store read, no service call leaks.
+      globalThis.game.user = { id: 'player1', isGM: false };
+      globalThis.game.users = Object.assign({}, prevUsers, {
+        activeGM: { id: 'gm1' },
+        filter: () => [],
+      });
+      const idle = await api.backup.exportPortable();
+      assert.equal(idle.status, 'error');
+      assert.equal(idle.error, 'not-active-gm');
+      const idleImport = await api.backup.importPortable({});
+      assert.equal(idleImport.status, 'error');
+      assert.equal(idleImport.error, 'not-active-gm');
+
+      // Active GM: routes into the live service and returns the bounded result.
+      globalThis.game.user = { id: 'gm1', isGM: true };
+      const res = await api.backup.exportPortable();
+      assert.equal(res.status, 'ok');
+      assert.equal(res.backup.format, 'foundry-market-portable');
+      assert.ok(Array.isArray(res.backup.locations));
+      assert.ok(Array.isArray(res.backup.shops));
+    } finally {
+      globalThis.game.user = prevUser;
+      globalThis.game.users = prevUsers;
+    }
+  } finally {
+    if (prevTime === undefined) delete globalThis.game.time;
+    else globalThis.game.time = prevTime;
+  }
 });

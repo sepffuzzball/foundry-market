@@ -11,6 +11,11 @@ with a fresh world where you can discard the data. You need at least two browser
 clients (one on an **active GM** user, one on a **player** user). The player
 client is the one that exercises the storefront.
 
+This checklist targets the current **0.1.5** prerelease. **No live Foundry VTT
+14 verification has been run yet** for M1-M6 - the automated `npm test` suite
+only mocks the Foundry boundaries, so every section below is the intended manual
+real-runtime check and nothing here has yet been confirmed on a live install.
+
 > **Do NOT use the module for a live economy yet.** M1 has not claimed
 > completion and two blockers remain before it is safe for real play:
 >
@@ -789,6 +794,13 @@ client is the one that exercises the storefront.
   appears in a personalized catalog only for an allowlisted actor or one meeting
   `minReputation`. An actor who is neither allowlisted nor above the threshold
   never sees it.
+- **No access data leaks.** When a `backroom` entry is projected into a
+  personalized catalog, the projected entry never carries the private per-entry
+  gate - no `access`, no `actorUuids`/allowlist, no `minReputation`, and no item
+  `snapshot`. Only the same allowlisted public fields as any other entry are
+  emitted (id, name, img, price, quantity, stockMode, visible, and the catalog's
+  decorated availability flags). Confirm by inspecting the storefront response
+  for an allowed actor and asserting it matches the bounded public surface.
 - An invalid character UUID (not matching `Actor.<id>`) or an out-of-range
   `minReputation`/`depositBps`/`maxPerActor` fails closed with a notice and no
   write.
@@ -892,15 +904,245 @@ client is the one that exercises the storefront.
   submission) as a completed sale - only a committed checkout, a fulfilled
   service, or a resolved theft are reported complete.
 
-## 21. Summary / verdict
+## 21. M6 - GM manager portable backup panel
 
-Record a pass/fail + notes row for each section. Take **all** sections (1-20) as
-the minimum signal for M1/M2/M3/M4/M5 - do not claim completion on the strength of
-`npm test` alone (that only mocks the Foundry boundaries). If you are about to
+> **Status: Node-tested only.** The M6 portable backup runtime wiring
+> (`api.backup`) and the manager `.backup-panel` are Node-tested; confirm the
+> export/preview/import flow on a real v14 runtime. A None restore can be
+> produced harmlessly as part of this follow-up.
+
+### 21.1 GM exports a backup and downloads it locally
+
+1. As the **GM**, open the **Foundry Market** manager and scroll to the
+   **GM backup & restore** panel (section 09).
+2. Click **Export backup**.
+3. A JSON file downloads locally (browser download, never a chat message).
+
+**Expected**
+
+- The panel shows a "Backup status" summary with the exported location/shop
+  counts and any warnings (e.g. cross-world Actor UUID staleness).
+- The downloaded file is the COMPACT serialized backup (no pretty-print) and it
+  is always under the 5 MiB portable bound, so it can be imported back.
+- No message is posted to chat and no player request is sent.
+- A non-active GM sees the **Export backup** button disabled plus the note
+  "Only the active Game Master can export or import backups."
+- An export whose compact serialization exceeds 5 MiB is refused with no
+  download and a "backup exceeds 5 MB" note (never saves an un-importable file).
+
+### 21.2 GM previews an import before restoring
+
+1. As the **GM**, create a backup in another (or this) world via
+   **Export backup**, then save it as a file.
+2. In the manager, choose that file in the **Choose backup JSON (up to 5 MB)**
+   file input and click **Preview import**.
+
+**Expected**
+
+- The panel shows an "Import preview" summary: `N locations · N shops will be
+  added`, plus any preview warnings.
+- Nothing is written (preview is a dry run).
+- Choosing a *different* file invalidates the previous preview; the import
+  button refuses until the new file is previewed.
+
+### 21.3 GM imports a backup (confirm + preview required)
+
+1. After a successful preview, tick **"I understand this adds records and may
+   partially complete."** and click **Import backup**.
+
+**Expected**
+
+- The import runs; the panel reports "Added N locations and N shops" (or a
+  partial report with the bounded created ids and `import-partial`).
+- Un-ticking the confirm box (or importing without a preview) refuses the import
+  with a clear notice and writes nothing.
+- On success/partial the locations and shops rails refresh.
+
+### 21.4 Privacy of the exported backup
+
+1. Export a backup for a shop that has private data - a `backroom` entry, an item
+   `snapshot`, a `commerce.valuations` record (which carries a private
+   `actorUuid`/`fingerprint`), finite merchant `funds` and an `automation` config.
+2. Open the downloaded JSON and scan the top-level records.
+
+**Expected**
+
+- The backup is a GM-private write built from the full normalized shop records:
+  private item snapshots, per-entry access gates, `commerce.valuations`,
+  `commerce.funds` and the whole `automation` config are present - never a
+  `publicShop` projection.
+- Ledger records, reputation records/events and advanced orders are deliberately
+  **excluded** (not portable); they do not appear in the exported JSON.
+- Cross-world Actor references (NPC `actorUuid`, access/valuation actor lists)
+  stay in the file and surface a staleness warning rather than being silently
+  dropped.
+
+### 21.5 Partial-after-write (no rollback, no complete cross-GM atomicity)
+
+1. Start an **Import backup** and, after the first records have been written,
+   have the active-GM role change (hand the GM to another client mid-import, or
+   make the GM user stop being active after a few creates).
+2. Note the report and then reload the world.
+
+**Expected**
+
+- The import reports `{ status: 'partial', createdLocationIds, createdShopIds,
+  error: 'import-partial', warnings }` with bounded id lists - never a false
+  all-or-nothing success.
+- Written records **remain**; nothing is auto-rolled back. The partial locations/
+  shops are visible after reload and are listed in the bounded created-id report.
+- No complete cross-GM atomicity is claimed: an import is not a transactional
+  all-or-nothing operation across GM clients, and a mid-import interruption
+  leaves partial results visible with no automatic rollback.
+
+## 22. M6 - Dynamic dnd5e currency conversion and system adapters (live runtime)
+
+> **Status: Node-tested only.** The dynamic dnd5e CONFIG-driven conversion, the
+> DC20/Twodsix runtime adapters and the Daggerheart-configured-generic adapter are
+> verified by the automated `npm test` suite in Node. This section is the intended
+> real-runtime check on a live v14 install.
+
+### 22.1 dnd5e dynamic CONFIG conversion
+
+1. As the **GM**, use a dnd5e 6.x world. Configure a non-default currency config
+   via `opts.currencyConfig` (or rely on the live `CONFIG.DND5E.currencies`).
+2. As the **player**, buy an item and confirm the wallet debit and the item price
+   are read through the conversion table.
+
+**Expected**
+
+- The read/write uses the live `CONFIG.DND5E.currencies` factors: each
+  denomination's `conversion` is the GP value per unit (e.g. `cp.conversion ===
+  0.01`, `gp.conversion === 1`) and is used directly - no reciprocal is applied.
+- No existing integer-copper records break under a GM-configured exchange rate.
+- All factor math uses exact decimal-string BigInt rationals, never binary float
+  rounding; a config whose ratios do not resolve to whole copper pieces fails
+  closed before any wallet write.
+
+### 22.2 DC20 / Twodsix runtime adapter
+
+1. As the **GM**, run the same purchase in a **dc20rpg** world (or the `dc20`
+   legacy alias) and in a **Twodsix (Traveller)** world.
+
+**Expected**
+
+- DC20: cp/sp/gp/pp are converted to integer copper (cp) via the adapter, and the
+  wallet is debited/credited in that system's representation.
+- Twodsix: the wallet is read and written at the configured
+  `system.financeValues.cash` credits path.
+- Both deliver the purchased Item (embedded) and never mutate the source Item.
+
+### 22.3 Daggerheart (configured generic)
+
+1. As the **GM**, use a **daggerheart** world with the generic adapter paths
+   (wallet/price/delivery) left unconfigured, then configure them and reload.
+
+**Expected**
+
+- With the generic paths unconfigured, the marketplace reports the adapter as
+  unsupported (`supported === false`) rather than guessing a price path.
+- After configuring the generic paths, the adapter reports support and the
+  storefront can transact. Daggerheart has no native item price, so no price path
+  is invented - only the GM-configured generic path is used.
+
+## 23. M6 - Accessibility (keyboard, screen reader, contrast, reduced motion)
+
+> **Status: CSS + Node-tested only.** The CSS is present in
+> `styles/market.css` and the Node suite covers the data/UI logic, but there is
+> no automated axe/screen-reader run. This section is the intended manual
+> check on a live install and with a screen reader.
+
+### 23.1 Keyboard focus
+
+1. As the **GM**, open the Market Manager; as the **player**, open the storefront.
+2. Tab through every interactive element on both surfaces (buttons, inputs,
+   selects, textareas, links and any `[tabindex]` element), and through the custom
+   controls: the `.market-check` checkbox, the `.weekday-option` weekday picker,
+   and the product/entry cards.
+
+**Expected**
+
+- A visible `:focus-visible` outline (3px gold plus a dark halo) is shown on every
+  keyboard-focused element on **both** the light manager and the dark storefront.
+- The custom controls never rely on colour alone: each shows an explicit
+  `:checked` state (gold fill + visible glyph/check with white-on-gold contrast)
+  and an explicit `:focus-visible` outline on the styled art.
+
+### 23.2 Screen reader
+
+1. With a screen reader active, navigate the storefront and the manager.
+
+**Expected**
+
+- The custom `.market-check` and `.weekday-option` controls expose an accessible
+  name and role and are operable with the keyboard; the 1px visually-hidden native
+  inputs are still exposed to assistive tech (they are only visually hidden, never
+  removed from the accessibility tree).
+
+### 23.3 Contrast
+
+1. Inspect the manager (light paper) and storefront (dark iron) surfaces against
+   the `--mk-*` token palette.
+
+**Expected**
+
+- Text meets a usable contrast ratio on both surfaces (the palette is tuned for
+  legibility on the warm-paper and dark-iron backgrounds). Record any contrast
+  failures here rather than assuming the themed palette is accessible.
+
+### 23.4 Reduced motion
+
+1. With the OS "reduce motion/transparency" preference enabled, or by toggling the
+   `.motion-off` class on the app/preview, resize/open the storefront and trigger
+   animations.
+
+**Expected**
+
+- Transitions, animations and smooth scrolling are disabled: the global
+  `@media (prefers-reduced-motion: reduce)` rule and the `.motion-off` /
+  `.preview-panel.motion-off` overrides both disable them, and the reward/glow
+  animation does not run.
+
+## 24. M6 - Performance benchmark (offline, optional)
+
+> **Status: Optional, manual, machine-dependent.** This section is NOT a live
+> Foundry VTT 14 profile and is not a CI gate. It is a human-facing timing report.
+
+### 24.1 Run the benchmark
+
+1. From the repository root, run `npm run benchmark` (or
+   `node scripts/benchmark.mjs [entryCount]`; default entry count is 1000).
+
+**Expected**
+
+- The script prints a median / p95 (ms) report for normalization, public-catalog
+  build and automation policy. The numbers are example wall-clock timings on the
+  run machine only - treat them as indicative, not as a pass/fail gate. A live
+  Foundry VTT 14 profile is not yet captured.
+
+### 24.2 Guard
+
+1. Run `npm test` and confirm `tests/performance.test.js` passes on a loaded
+   machine.
+
+**Expected**
+
+- The deterministic O(N) guarantee is asserted by counting array reads (a Proxy
+  probe) and proving `planAutomation` does no O(N^2) repeated global work; the
+  only wall-clock assertion is a very generous 10 s catastrophic-regression-only
+  guard, so normal CI slowness does not flip it.
+
+## 25. Summary / verdict
+
+Record a pass/fail + notes row for each section. Take **all** sections (1-24) as
+the minimum signal for M1/M2/M3/M4/M5/M6 - do not claim completion on the strength
+of `npm test` alone (that only mocks the Foundry boundaries). If you are about to
 run a real economy, treat sections 1, 4 (UI/hook shapes), 12 (last-item
 contention), 15.3/15.4 (M2 action dispatch), 16.4 (M3 personalized quote), 17.5
 (M4 active-GM automation), 18.2/18.5 (M5 cart checkout and whole-item selling),
 19.3 (M5 GM advanced-order adjudication), 20.2/20.3 (M5 order adjudication and
-buyback funds/balance), 20.5 (M5 recovery) and
+buyback funds/balance), 20.5 (M5 recovery), 21.3/21.4/21.5 (M6 backup import,
+privacy and partial-after-write), 22.1-22.3 (M6 dynamic conversion and system
+adapter runtime), 23.1-23.4 (M6 keyboard/screen-reader accessibility) and
 the multi-GM concurrency note as mandatory, and confirm the two blockers in the
 intro are addressed before you trust a live economy to the module.

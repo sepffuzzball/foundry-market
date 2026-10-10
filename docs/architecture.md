@@ -387,15 +387,315 @@ system's wallet/item representation:
   is converted to copper only when exactly representable (`0.1` gp -> `10` cp);
   sub-copper values are rejected, and all currency conversions detect safe
   integer overflow.
+
+### Dynamic dnd5e currency conversion (M6)
+
+`Dnd5eAdapter` no longer hardcodes the classic copper factors. It accepts an
+optional `opts.currencyConfig`, which is either a getter function or a plain
+object. Each configured denomination must be `{ conversion: <GP value per
+unit> }` (a positive finite decimal, e.g. cp.conversion === 0.01). When
+`opts.currencyConfig` is omitted the adapter reads the live
+`CONFIG?.DND5E?.currencies` if present; `CONFIG.DND5E.currencies[d].conversion`
+is already the GP value per unit (cp.conversion === 0.01, gp.conversion === 1),
+so it is passed through with no reciprocal. If neither an explicit config nor a
+usable `CONFIG` is available (for example under Node tests) it falls back to a
+canonical default that reproduces the legacy factors exactly:
+`{ pp: 10, gp: 1, ep: 0.5, sp: 0.1, cp: 0.01 }` GP-per-unit.
+
+The config is normalized once per wallet operation into per-denomination copper
+factors, computed as an exact BigInt rational `conversion[d] / conversion.cp`.
+A single snapshot is used for the duration of one `getBalance` / `debit` /
+`credit` / `getItemPrice` call, so a config getter that changes mid-operation
+cannot produce a torn read. Normalization fails closed (before any wallet
+update) on: a missing `cp`/`gp`, a non-finite or non-positive conversion, a
+factor that is not a positive safe integer, a `gp` factor below 1, or a ratio
+that is not a whole number of copper (fractional-copper factors are rejected).
+Every configured denomination is read and written using its factor - no fixed
+`cp`/`sp`/`ep`/`gp`/`pp` constants remain in the adapter - so a custom conversion
+table (for example `{ cp: 0.02, gp: 1 }`) is supported. Unknown denominations
+carrying a nonzero balance are rejected (fail closed); unknown zero balances are
+ignored. `getBalance` reads the configured denominations, `debit`/`credit` write
+back a greedy largest-factor-first breakdown across only the configured
+denominations, and `getItemPrice` converts `item.system.price.value` using the
+factor for `item.system.price.denomination`, multiplying an exact BigInt
+decimal-rational value by the factor and rejecting any fractional copper
+exactly (with no float tolerance), as well as safe-integer overflow. All
+decimal parsing is BigInt-rational based: `decimalToRational` accepts plain and
+scientific-notation decimal strings (`1e-7`, `1.23e+4`) exactly, with a bounded
+exponent and a capped decimal scale so an unsafe scale (e.g. `1e200`) fails
+closed instead of building an unbounded power of ten.
+
+Two module-level helpers are exported for callers that need the same math:
+
+- `dndCurrencyFactors(config)` - returns the per-denomination copper factors
+  (for the canonical default this is `{ cp: 1, sp: 10, ep: 50, gp: 100, pp: 1000 }`).
+- `formatCopperAsGP(copper, config)` - formats an integer copper amount as an
+  exact decimal GP string (`125` with the canonical config -> `"1.25"`; with
+  `{ cp: { conversion: 0.02 }, gp: { conversion: 1 } }` -> `"2.5"`).
+  All arithmetic is BigInt-based, so no floating-point error is introduced.
+
+The legacy `DENOMINATIONS` and `DENOMINATION_FACTOR` exports are unchanged and
+continue to exist for callers that do not go through the adapter.
+
+### Portable import/export backup format (M6) (`src/storage/backup-format.js`)
+
+The market core can be exported to and imported from a **portable backup**: a
+single, self-contained, plain-JSON payload that captures every location and
+every shop in fully normalized form. `src/storage/backup-format.js` is a pure,
+Node-importable module (no Foundry globals, no store writes, no runtime) that
+validates and normalizes such a backup and plans a collision-safe import into a
+target world. It is deliberately decoupled from `src/storage/store.js` - it does
+not read or write any JournalEntry, so it can be exercised entirely under Node
+and used as a transport/merge layer.
+
+**v1 format.** A v1 backup is `{ format: 'foundry-market-portable',
+formatVersion: 1, locations, shops }`, where `locations` and `shops` are the
+normalized store records. `normalizeBackup(raw)` returns a deep-normalized,
+plain-object clone in exactly this shape (`{ format, formatVersion, locations,
+shops, warnings }`) and never mutates its input.
+
+**GM-private, not player projection.** The backup is written from the full
+normalized records - never a `publicShop` projection. Every private field a
+player storefront would hide is retained: item `snapshot` data, per-entry
+`access` gates, `commerce.valuations` (including the private `actorUuid` and
+`fingerprint`), `commerce.funds`, the whole `automation` config (hours, travel,
+events, diagnostics) and the restock schedules. Nothing a GM or a player sees in
+the public catalog is used as the export basis.
+
+**What is excluded.** Ledger records, reputation records/events and advanced
+orders are NOT portable (they are idempotency-keyed runtime state tied to a
+player/GM and a world) and are deliberately excluded from the backup. Only
+locations and shops ride along. Shop actor references that cross into the world
+(NPC `actorUuid`, per-entry access actor lists, specials actor lists and every
+valuation's `actorUuid`) are retained as-is and surface a `warnings` entry,
+because the import cannot remap a world Actor UUID it does not know - so the GM
+is told those may be stale rather than having them silently break.
+
+**Validation.** `normalizeBackup` fails closed with a bounded error (never a
+silent drop) on all of:
+- an unknown/future format - anything other than `format ===
+  'foundry-market-portable'` with `formatVersion === 1`; a `formatVersion > 1`
+  is reported as a future version, anything else as unsupported.
+- a non-object top level, or a `locations`/`shops` that is not an array.
+- more than `MAX_BACKUP_LOCATIONS` (1000) locations or `MAX_BACKUP_SHOPS`
+  (1000) shops.
+- a serialized UTF-8 payload larger than `MAX_BACKUP_BYTES` (5 MiB) - measured
+  on the RAW input BEFORE any deep clone/normalization (so an oversized field a
+  normalizer would discard is refused without a costly traversal), and again on
+  the canonical normalized output after normalization. The raw-size pre-check
+  runs as a single `JSON.stringify` after a manual plain-JSON walk.
+- a location or shop that does not normalize (for example a missing `name`).
+- duplicate location ids or duplicate shop ids.
+- a shop whose `locationId` is empty/absent or references a location not
+  present in the backup.
+- a travel schedule (`automation.travel.locationIds`) that references a
+  location not present in the backup.
+- any non-plain JSON: a function, a non-plain object prototype (Date, RegExp,
+  class instance), a circular reference, or a BigInt anywhere in the payload.
+  The raw walk that enforces this never mutates the caller's objects: cycle
+  detection uses an ancestor `WeakSet` plus an explicit path stack (never a
+  sentinel property), so a deeply frozen, non-extensible valid input is accepted
+  unchanged and no `__marketBackupPath` marker is ever added to a node.
+
+**v0 legacy migration.** `normalizeBackup` also accepts a v0 legacy backup,
+`{ version: 0, locations, shops }`, and migrates it to v1 - but only when every
+source location/shop actually normalizes through `normalizeLocation` /
+`normalizeShop`; an invalid v0 source object rejects the whole backup rather
+than being silently coerced. That migration is strictly **portable-format
+only**: it rewrites the backup file's own `version: 0` payload into the
+`formatVersion: 1` shape and re-normalizes every record through the current
+schema on import. It is **not** a JournalEntry schema migration. The module's
+own `schemaVersion` stored in `flags.market` (see `SCHEMA_VERSION` in
+`src/services/model.js`) stays `1`; the store's default doc access only ever
+lists JournalEntry flags whose `schemaVersion === SCHEMA_VERSION`, so a
+pre-existing journal carrying an older schema-v0 is **not** auto-migrated by
+the backup path - it is simply not enumerated, and the import only ever creates
+fresh schema-v1 records via `createJournalEntry`. No existing journal is
+rewritten in place.
+
+**Import planning.** `planBackupImport(backup, { existingLocationIds,
+existingShopIds, makeId })` consumes a validated backup and returns
+`{ locations, shops, warnings }` - deep clones that are safe to write into a NEW
+world. Every imported top-level location and shop receives a fresh, distinct id
+that avoids `existingLocationIds` and `existingShopIds` and is bounded to the
+120-char market-id rule, so a backup can never collide with an existing world
+record or with another imported record. Shop `locationId` and
+`automation.travel.locationIds` are remapped through the new location ids, and
+any embedded `shopId` present on an NPC record is remapped through the new shop
+ids. The remap and the id reservation all run through `Map`/`Set` key spaces, so
+a source id that collides with a prototype name (`__proto__`, `constructor`) is
+an ordinary key and maps correctly. Inventory entry ids are preserved - they are only meaningful within a new
+shop, never globally. Stale automation clock state is NOT carried across worlds:
+each inventory entry's `restock.lastCycle`, each shop's
+`automation.travel.lastCycle` and the whole `automation.diagnostics` block are
+reset to their defaults while the automation/restock configuration is retained.
+If the injected `makeId` is absent, the module uses the schema default; a
+degenerate generator that keeps returning a used id still produces distinct,
+bounded ids via a deterministic `<base>_<n>` suffix.
+
+**Import warnings ("report, not silently stale").** `planBackupImport` reports
+any inventory entry whose item source depends on a reference that may not
+resolve in the target world instead of silently accepting it: an entry carrying
+an `itemUuid` is reported because the UUID may be stale cross-world (the
+retained `snapshot` is the source secondary reference), and an entry with no
+`itemUuid` is reported as relying solely on its embedded snapshot (a live item
+reference is unsupported for it). The `warnings` channel is the only place this
+surfaces; nothing is written elsewhere.
+
+**Tests.** `tests/backup-format.test.js` covers the v1 happy path, v0->v1
+migration and migration rejection, deep-invalid and unknown/future format
+rejection, the 1000/1000 caps and the 5 MiB size bound (including an oversized
+field the normalizer would discard), duplicate id rejection, missing
+shop-location and travel-location references, plain-JSON rejection (functions,
+non-plain prototypes, cycles, BigInt), acceptance of a deeply frozen valid
+backup with no sentinel property added (v1), the GM-private export contract
+(private snapshots, access gates, valuations and automation config are
+preserved, never a player projection), source immutability of both
+`normalizeBackup` and `planBackupImport`, fresh distinct + collision-safe
+import ids, locationId/travel/NPC-shopId remapping, inventory entry id
+preservation, automation clock-state reset, and the import source-staleness
+warnings.
+
+### GM-only portable backup service (M6) (`src/storage/backup.js`)
+
+`src/storage/backup-format.js` is pure; `src/storage/backup.js` is the
+effectful layer that actually reads and writes the store on behalf of a portable
+backup. `createBackupService({ store, runShopExclusive, isActiveGM, makeId,
+logger })` returns `{ exportPortable, importPortable }`. It is deliberately
+GM-only and serialized on a single in-flight client. The runtime (`src/core/main.js`)
+builds the service in `init` and exposes it only through the bounded
+`api.backup.exportPortable`/`importPortable` wrappers (each active-GM guarded
+before delegating; the raw service/store are never exposed), and the GM manager
+(`src/ui/manager.js`) owns the in-game backup panel - see the manager actions
+section below. The methods are also Node-testable against a real store.
+
+**Export.** `exportPortable()` re-checks `isActiveGM()` immediately before EVERY
+store read, then lists every location and shop and runs them through
+`normalizeBackup` in the canonical v1 shape, returning `{ status: 'ok', backup,
+warnings }`. The active-GM predicate is re-checked between the two reads, so a
+handover after the locations read stops before reading shops and reports
+`not-active-gm` with no private backup returned; no store read ever happens for a
+non-active GM. The backup is GM-private in full normalized form (snapshots,
+access gates, valuations, commerce and automation config) - never a
+`publicShop` projection. Because the export only ever reads location/shop records,
+ledger, reputation and advanced order runtime records never appear in the output.
+
+**Import.** `importPortable(raw, { dryRun = false } = {})`:
+- Returns `{ status: 'error', error: 'not-active-gm' }` when the caller is not
+  the active GM, before touching the store.
+- Rejects a non-object `raw` and any invalid/oversized/out-of-format backup via
+  `normalizeBackup` - which runs BEFORE any store access (only the active-GM
+  check precedes it) - returning `{ status: 'error', error: 'invalid-backup' }`.
+- Reads the existing locations/shops, plans fresh collision-safe ids via
+  `planBackupImport`, and preflights every cross-reference (a planned shop must
+  reference a planned location, travel locationIds must resolve, NPC `shopId`
+  must resolve, and no planned id may collide with an existing record). The
+  active-GM predicate is re-checked before EVERY one of these store reads, so a
+  handover between the locations read and the shops read stops cleanly without
+  the second read and reports `not-active-gm` (nothing has been written). Any
+  failure at this stage returns `{ status: 'error', error:
+  'import-preflight-failed' }`. No raw exception string ever appears in a result.
+  For a DRY RUN this world read/plan/preflight happens separately, OUTSIDE the
+  serialized write queue; for a REAL import it happens INSIDE the queue (see
+  below) so a queued import can only ever plan against the world a prior import
+  already wrote.
+- With `dryRun: true` it returns `{ status: 'ok', dryRun: true, counts,
+  idMap, warnings }` and writes nothing. The reported `idMap` maps source ids to
+  the planned fresh ids and is built from null-prototype objects, so a source id
+  such as `__proto__` or `constructor` is a safe own key and survives JSON
+  serialization of the dry-run result.
+- Otherwise the import is queued on a module-scoped in-flight promise so two
+  concurrent imports run one at a time on the active-GM client. Inside that
+  serialized run the active-GM predicate is re-checked and the world read, id
+  planning and collision preflight run FRESH (never against a stale plan built
+  outside the queue), so two concurrent imports can never plan against the same
+  pre-write world state and generated ids never collide across them. It then
+  creates every location first (sequentially), then every shop (sequentially,
+  after all locations), re-checking `isActiveGM()` immediately before each
+  create. Each create must return a non-null record carrying the planned id; an
+  existing record is never overwritten because every planned id is fresh. A
+  create that returns null/mismatched or throws, or a GM handover after at least
+  one write, returns `{ status: 'partial', createdLocationIds,
+  createdShopIds, error: 'import-partial', warnings }` (with the created-id
+  lists bounded to the backup caps) - the records written so far REMAIN; there
+  is no automatic rollback. A create that throws/null AFTER persisting is
+  detected by re-reading the store (`findShop` for a shop, `listLocations` for a
+  location, since the store has no `findLocation`): the active GM is re-checked
+  before that recovery re-read, and if the planned id is present it is recorded
+  in the partial created-id list, so an outcome never hides a write that actually
+  landed. On a handover before that recovery re-read the re-read is skipped and
+  the partial result carries an `uncertain create` warning (`"the created record
+  may not be reported"`), because the import cannot prove whether the write
+  landed - it never falsely claims the record was (or was not) created. A
+  handover before any write returns `{ status: 'error', error: 'not-active-gm' }`.
+  A fully successful import returns `{ status: 'ok', createdLocationIds,
+  createdShopIds, warnings }`.
+
+**Constraints.** No record is ever deleted or dropped (import only ever creates
+fresh ids). There is **no complete cross-GM atomicity**: an import is not a
+transactional, all-or-nothing operation across GM clients. A mid-import
+interruption - a create failure or a GM handover after at least one write -
+leaves the partial results visible and reports `import-partial` with the bounded
+created-id lists; nothing is auto-rolled back, and a handover before any write
+returns `not-active-gm` with nothing written. `runShopExclusive` is accepted for
+interface parity but is not used - importing fresh ids never updates an existing
+shop, so one-shop locks are irrelevant here.
+
+**Tests.** `tests/backup.test.js` covers the GM gate (no store read when not the
+active GM), an export/import roundtrip into an empty world, dry-run planning
+with no writes, invalid-input rejection with zero writes (including an
+oversized payload), collision-safe remapping with preservation of inventory
+entry ids and NPC `shopId`/location remapping, the sequential
+createLocations-then-createShops ordering, partial-failure reporting after a
+store write with no rollback, GM-handover interruption (partial after a write,
+not-active-gm before any write), the GM-private export contract that never
+leaks ledger/reputation/advanced order records, and the reviewed import-integrity
+behaviors: two concurrent imports planned inside the serialized queue generate
+distinct ids (driven with a degenerate id generator), a location or shop create
+that persists then throws is reported as partial with the truthful persisted id
+(no write is hidden), a preflight store-read failure aborts before any write, a
+GM handover at every store-read boundary (after the export/import/dry-run
+locations read, no second read is made; before a location/shop recovery re-read,
+the re-read is skipped and the partial result carries the "the created record may
+not be reported" warning), and the dry-run id map safely handling `__proto__` and
+`constructor` source ids as null-prototype keys that survive JSON serialization.
+`tests/backup-format.test.js` additionally proves `planBackupImport` remaps
+`__proto__` and `constructor` source location/shop ids through safely.
+
 - `GenericAdapter` - configurable fallback. Requires GM-configured dot-paths
   (`walletPath`, `itemPricePath`, optional `itemPriceDenominationPath`,
   `quantityPath`) and a delivery mode (embedded Item creation, or appending to
   a configured array). It reports `supported === false` until configured. It
   rejects reserved path segments (`__proto__`, `constructor`, `prototype`),
   nonnumeric values, and unsafe/non-integer or negative values.
-- `DaggerheartAdapter`, `DC20Adapter`, `TwodsixAdapter` - explicitly
-  `supported === false` until the GM configures the generic paths. No system
-  paths are guessed.
+- `DC20Adapter` - full support, source-backed against dc20rpg 0.10.7.0
+  (`module/dataModel/actorData.mjs` + `module/dataModel/itemData.mjs`). The
+  actor wallet is `system.currency.{cp,sp,gp,pp}`, each a non-negative safe
+  integer, converted to integer copper (`cp`) minor units with factors 1/10/100/1000
+  (there is no `ep` in DC20). Item price is read from
+  `system.price.{value,currency}` (currency defaults to `gp`); the marketplace
+  ledger uses `cp` minor units and quantity is set on `system.quantity`.
+  `getBalance` totals the wallet as `cp`; `debit`/`credit` validate the amount
+  and, before `Actor.update`, re-read the wallet, guard safe-integer arithmetic,
+  and write back a greedy largest-factor-first denomination breakdown. A nonzero
+  unknown wallet denomination, a negative/fractional/overflow value, or an
+  unknown price denomination fails closed. Delivery is the generic embedded
+  path (`quantityPath: 'system.quantity'`, `deliveryMode: 'embedded'`).
+- `TwodsixAdapter` - full support, source-backed against Twodsix 7.7.0
+  (`src/module/data/actors/travellerData.js` + `src/module/data/items/gearData.js`).
+  The numeric cash balance is `system.financeValues.cash` ONLY - the
+  `system.finances.cash` display string is never read. It must be a non-negative
+  safe integer: an actor whose cash is missing, non-numeric, negative,
+  fractional or beyond a safe integer fails closed (`balance-read-failed`), with
+  no fallback to the display string. Item price is `system.price` (non-negative
+  safe integer), credits are the only currency unit with no conversion (price
+  maps 1:1 to minor units, denomination `credits`), and quantity is set on
+  `system.quantity`. `debit`/`credit` write `system.financeValues.cash` with
+  safe-integer guards before `Actor.update`. Delivery is the generic embedded
+  path (`quantityPath: 'system.quantity'`, `deliveryMode: 'embedded'`).
+- `DaggerheartAdapter` - explicitly `supported === false` until the GM
+  configures the generic paths. Daggerheart carries no native item price, so no
+  system-specific price path is invented. No paths are guessed.
 
 Item delivery always uses the full `item.toObject()` with `_id`, `ownership`,
 `folder`, and `sort` stripped, and never mutates the source item.
@@ -876,8 +1176,10 @@ The request/response ChatMessages are created with
 - The themes ship no bundled audio: the `defaultSound` of every registered theme
   is empty, so background music only plays if the GM sets an `appearance.music`
   path and the player toggles sound on.
-- `Daggerheart`/`DC20`/`Twodsix` need GM-configured generic paths before they
-  report support.
+- `Daggerheart` needs GM-configured generic paths before it reports support;
+  `DC20`/`Twodsix` are first-class and report support regardless of generic
+  path settings (opt into a custom generic configuration explicitly with
+  `getAdapter('generic', config)`).
 - Generic path updates assume object (not array-index) path segments for the
   wallet and price.
 - Compensation is best-effort; a `needsRecovery` ledger entry requires manual
@@ -1898,6 +2200,41 @@ exposed on the public API surface, active-GM gated before any store read, and
 returns only `{ status, valuationId, itemName, amount }` - the private fingerprint
 and the raw entry are never surfaced to the caller.
 
+#### M6 GM-only portable backup manager panel (`src/ui/manager.js`, `templates/manager.hbs`)
+
+The manager renders a GM-only backup panel (`.backup-panel`) with three actions
+(`export-backup`, `preview-backup`, `import-backup`) plus a file input
+(`name="backupFile"`) and a confirmation checkbox (`name="confirmImport"`), all
+DOM-scoped (`backup-panel` selectors only) and gated on the active GM - a
+non-active GM sees them disabled with a note. Each handler gate is defense in
+depth with the `api.backup.*` wrapper above.
+
+- `_onExportBackup` calls `_exportPortable()` (injected `deps.exportPortable`,
+  else `api.backup.exportPortable`), then `_downloadBackup(result.backup)`.
+  `_downloadBackup` serializes the backup in COMPACT form (no pretty-print),
+  measures its UTF-8 byte length against `MAX_BACKUP_BYTES` BEFORE any download,
+  and only then downloads the JSON locally via a Blob object URL + temporary
+  anchor + `URL.revokeObjectURL`. An export that exceeds the portable bound is
+  refused with `{ status: 'error', error: 'export-too-large' }` (no download) and
+  the manager surfaces it with a clear notice, so a saved backup is always
+  importable back. The backup is never routed through a player request or chat
+  message - the manager owns the export surface.
+- `_onPreviewBackup` reads the selected `File` only when `file.size <= 5 MiB`
+  (the size is checked BEFORE `file.text()`), parses the JSON, and runs
+  `importPortable(raw, { dryRun: true })`. It caches the raw backup and the File
+  object so a later import can reuse them exactly, and projects only bounded
+  counts and at most 20 warnings into `_data.backupPreview`.
+- `_onImportBackup` requires BOTH the confirmation checkbox and an existing
+  successful preview computed from the currently selected file (a file-change
+  handler plus a per-click comparison invalidate a stale preview), then runs
+  `importPortable(raw, { dryRun: false })`. On success/partial it reports the
+  outcome honestly (bounded created ids and the error code), clears the cached
+  raw/file and the confirmation checkbox, and refreshes locations/shops.
+
+`backupSummary`/`backupPreview` are sanitized plain objects - counts, at most 20
+warnings and bounded created-id lists - never the raw backup JSON. Export
+downloads a local file and never exposes the backup to chat.
+
 **Tests.** `tests/advanced-valuation.test.js` covers the pure `fingerprintItem`
 (determinism, key-order independence, full source fields, plain-JSON rejection,
 id-mismatch rejection, 64KB bound), the pure `getApprovedValuation` /
@@ -2733,3 +3070,146 @@ GM on an empty page with no controls.
   `shop.approvedItems` (showing the "Ask the GM to value an item before selling or
   bartering it." message when a character is selected and none is approved). None of
   this wiring has been run against a live Foundry VTT 14 install yet.
+
+### M6 concurrency / recovery validation (`tests/multiplayer.test.js`)
+
+The module deliberately does **not** claim distributed/transactional atomicity.
+The per-shop `runShopExclusive` lock and every read-then-create guard
+(`createLedger`, `createAdvancedOrder`) are **per-client**: a lock map lives on a
+client, so two GM clients never share one, and two clients resolving the same
+idempotency key can both observe "no record" before either persists one. The
+ledger/advanced-order idempotency is best-effort, the single cross-client guard,
+and it is keyed `userId:requestId` (never a server-side compare-and-swap). This
+slice exposes those boundaries as deterministic, Node-testable assertions rather
+than a flaky live-race probe.
+
+**Test harness.** `tests/multiplayer.test.js` drives the real market services
+(commerce purchase, cart checkout, selling, preorders, theft, automation) through
+a single unified fake store (`createUnifiedStore`) that supports shops, ledgers
+and advanced orders and exposes `listShops`/`listLocations`/
+`listAdvancedOrders`. It carries fault-injection flags (`fail`/`null`/
+applies-then-throws) and optional `hooks.beforeCreateLedger`/
+`hooks.beforeCreateOrder` gates used to force a read-then-create interleaving.
+A shared single `lockMap` is injected into commerce and wrapped for the
+cart/automation/adjudication services so every writer on one shop serializes;
+separate lock maps simulate two independent GM clients. The harness routes every
+writer through the same `runShopExclusive` (or a queued gate) and an
+authenticating `isActiveGM` predicate.
+
+**Single-shop oversell/debit invariants.** The per-shop lock only ever serializes
+concurrent writers; it cannot itself prevent oversell or double-debit on one
+client. Under the shared lock, 50 simultaneous purchases on a finite stock of 30
+commit exactly 30 and fail exactly 20 as `insufficient-stock`, with no negative
+stock and exactly 30 debits. A 50-op mix of 20 purchases, 20 cart checkouts and 10
+idle automation runs under the same lock charges exactly the sold units once,
+never double-debits or loses a stock update. Both are aggregate assertions - the
+exact subset that commits is scheduler-dependent, but the totals are
+deterministic - so the test is never flaky.
+
+**Two independent shops.** Separate shop ids get separate locks; interleaved
+purchases into shop1 and shop2 each see their own wall count and funds, never
+cross-contaminating the other shop's stock or revenue.
+
+**GM handoff at an await boundary.** The active-GM predicate is re-checked after
+every await boundary, not only before entry. An operation queued behind another
+writer (its `runShopExclusive` gate is still held) that then observes the GM
+handed off resolves cleanly with no stale write: a sell returns `not-active-gm`
+with no payout/listing, a cart checkout returns `not-active-gm` with no charge/
+order, and an automation run returns `idle` with no `updateShop`. No half-applied
+write is left behind.
+
+**Replay / pending / needsRecovery across request ids.** Re-issuing the same
+request cannot redo preorder or theft effects. A replayed preorder place and a
+replayed theft attempt resolve to `replay`/`needsRecovery` with no second debit
+and no second order; a persisted order mutated to `needsRecovery` (simulating an
+interrupted run) also resolves with no re-debit. A competing preorder fulfill/
+cancel issued under a distinct `requestId` while a pending fulfill action already
+exists for the same original surfaces `needsRecovery` and never runs, leaving the
+original `booked`. The idempotency key is not the only guard - the recorded
+status of the existing order is re-read and respected.
+
+**Applies-then-throws recovery.** An injected `updateShop` that applies its patch
+and then throws is recovered (recorded `failed`, the wallet refunded, the applied
+write restored) and is never reported as a clean success. An injected ledger
+commit that applies-then-throws is resolved as `committed` (the debit is kept,
+stock stays decremented), because the service re-reads the persisted terminal
+status rather than trust the throw. An injected advanced-order commit that
+applies-then-throws is likewise recovered via a re-read and reported `committed`,
+and a replay of that order never re-debits.
+
+**Multi-GM race boundaries.** Two independent commerce instances (separate lock
+maps) on the same fake store never double-charge: the fake store's read-then-
+create is atomic in JS (no `await` between the existence scan and the insert), so
+the losing client observes `created:false` and never charges - one side commits,
+the other surfaces `pending`/`replay`. Because the real JournalEntry store is not
+compare-and-swap, a `hooks.beforeCreateLedger` barrier forces BOTH
+`createLedger` calls to observe "no record" before either inserts; both return
+`created:true` and both charge, reproducing the documented multi-GM double-charge
+window deterministically (both `committed`, wallet debited twice for the same
+key).
+
+No distributed or transactional atomicity is claimed by any of this: the
+aggregate invariants hold because the per-shop lock serializes within a client,
+and the one cross-client guard (ledger/advanced-order idempotency) stays
+best-effort. The gated interleaving test is the only place the module admits the
+double-charge window, and it is reproduced on purpose, not hidden.
+
+## M6 accessibility (keyboard focus, contrast, reduced motion)
+
+The M6 slice hardens the module CSS (`styles/market.css`) for keyboard and
+low-vision users. There is no automated a11y test; the verification surface is
+the manual keyboard / screen-reader checklist in `docs/smoke-test.md` (M6
+section).
+
+- **Keyboard focus is always visible.** Every interactive element - the native
+  `button`/`input`/`select`/`textarea`/`a` and the catch-all `[tabindex]` - gets a
+  visible `:focus-visible` outline (3px solid, with an offset and a dark halo) on
+  both the light manager and the dark storefront, so a keyboard user can always
+  see where focus is. Custom controls that hide the native input (the
+  `.market-check` box, the `.weekday-option` and the product/entry card surfaces)
+  expose their own `:focus-visible` companion styles rather than relying on a
+  native outline.
+- **Contrast is checked.** The palette keeps text readable on both surfaces - the
+  high-contrast light manager (`--mk-ink #29251f` on `--mk-paper #f3eee2`) and
+  the dark storefront (`#f4eedf` on `#272821`) - and custom controls
+  (`.market-check`, `.weekday-option`) have explicit focus/checked states rather
+  than a native UI that can be indistinct. The `.backup-panel` controls get their
+  own readable focus outline.
+- **Reduced motion is honored.** Both the `.preview-panel` transition/animation
+  and the global `@media (prefers-reduced-motion: reduce)` rule disable
+  transitions/animations (and set `scroll-behavior: auto`), and the per-app
+  `.motion-off`/`.motion-subtle` variants let motion be turned down or off. A user
+  who prefers reduced motion therefore never sees the decorative hover/
+  animation effects.
+
+## M6 offline performance benchmark (example, machine-dependent)
+
+`scripts/benchmark.mjs` is an **optional, manual** performance report for the pure
+Foundry-free work at large inventory sizes: `normalizeShop`, `buildCatalog` and
+`planAutomation`. Run it with `npm run benchmark` or
+`node scripts/benchmark.mjs [entryCount]`. It warms up then runs 100 measured
+iterations per workload and prints a median / p95 (ms) report plus the entry
+count to stdout. It never writes files and never touches the store, runtime or
+UI.
+
+Two things are deliberately **not** promised:
+
+- The printed numbers are **example timings on the machine they were run on**.
+  They are wall-clock seconds measured under whatever CPU/load that machine had,
+  not a spec and not a CI gate - do not read a specific millisecond value as a
+  guarantee, and never gate CI on them.
+- There is **no live Foundry VTT 14 profile yet**. The benchmark exercises the pure
+  Node functions only - not the real `game`, `JournalEntry` store, application
+  renders (RAF), or the request channel - so it is not a measure of in-game
+  performance against a real Foundry install. Those numbers would come only from
+  profiling on a live runtime.
+
+What actually matters is the deterministic O(N) guarantee, which is asserted in
+`tests/performance.test.js`: at 1000 entries the normalized output is bounded and
+the public catalog is allowlisted and leak-free, and `planAutomation` scales
+linearly (array-read counts, not wall-clock). That test's only wall-clock
+assertion is a very generous 10 s catastrophic-regression guard, so a slow or
+loaded CI never flips a test that is merely measuring O(N) scaling.
+`package.json`'s `lint` runs `node --check` on `tests/performance.test.js` and
+`scripts/benchmark.mjs`, and `npm run benchmark` is the optional manual timing
+check.

@@ -6,7 +6,7 @@ by the active GM through an idempotent, compensating ledger; and requests flow
 over ChatMessage (no raw socket).
 
 This is a **prerelease developer preview** covering **Milestone 1 (M1)** through
-**Milestone 5 (M5)**, all **implemented locally and unit-tested in Node but not
+**Milestone 6 (M6)**, all **implemented locally and unit-tested in Node but not
 yet verified against a live Foundry VTT 14 install**. It delivers the functional
 core plus the M1 end-to-end UI wiring (market manager, player storefront, canvas
 shop markers), the M2 shop theming/appearance and storefront interactions, the M3
@@ -14,15 +14,18 @@ social/NPC/reputation engine and wiring (user-reported as tested successfully,
 though its deferred items remain), the M4 shop automation (scheduled business
 hours, finite periodic restock, travel rotation among locations, exact/low/hidden
 stock visibility, time-window display-only market events, GM automation
-diagnostics, and GM-only RollTable inventory generation), and the M5 advanced
+diagnostics, and GM-only RollTable inventory generation), the M5 advanced
 commerce configuration and GM-authoritative trade services - whole-item
 sell/buyback, manual service booking, single-payer multi-line carts with an
 optional whole embedded barter Item, finite merchant funds, backroom
 actor/reputation access, deposit-backed out-of-stock pre-orders, GM-adjudicated
-theft, and actor special offers. The runtime has **not** been executed against a
-live Foundry VTT 14 install yet - it is wired and unit-tested in Node only, and
-M5 is likewise Node-tested only (see "Risks" for what is still deferred and what
-a real v14 runtime must confirm).
+theft, and actor special offers - and the M6 dynamic dnd5e currency conversion,
+the DC20/Twodsix first-class system adapters, a portable GM-private backup and
+the deterministic concurrency/recovery + benchmark/accessibility review. The
+runtime has **not** been executed against a live Foundry VTT 14 install yet - it
+is wired and unit-tested in Node only, and M5/M6 are likewise Node-tested only
+(see "Risks" for what is still deferred and what a real v14 runtime must
+confirm).
 
 ## Requirements
 
@@ -47,22 +50,22 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.4`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.5`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.4/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.5/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
 
-> **The `0.1.4` `download` URL is live only once the `0.1.4` release has been
+> **The `0.1.5` `download` URL is live only once the `0.1.5` release has been
 > published** - the release action must upload `module.zip` and `module.json` to
-> the GitHub release for tag `0.1.4`. The `0.1.3` release is published and
-> installable; until the `0.1.4` release is published, install the module by
+> the GitHub release for tag `0.1.5`. The `0.1.4` release is published and
+> installable; until the `0.1.5` release is published, install the module by
 > pointing Foundry at this repository directory as a module source (the manifest
 > and `src/core/main.js` are unchanged), or download the zip from the published
-> release once it is available.
+> `0.1.5` release once it is available.
 
 ### Enable in a world
 
@@ -105,11 +108,35 @@ game.modules.get('market').api.openManager();
 
 **dnd5e** - the built-in adapter. Currency is integer copper and item prices are
 read from `system.price.value`/`denomination`, so no configuration is needed
-beyond Items whose price is set:
+beyond Items whose price is set. Since M6 the conversion is **data-driven**: the
+adapter reads the live `CONFIG.DND5E.currencies` (or an explicit
+`opts.currencyConfig`) and converts each denomination by its exact GP value per
+unit (e.g. `cp.conversion === 0.01`) using exact BigInt rationals - never binary
+float rounding - so a GM-configured exchange rate is honoured while every
+existing integer-copper record reads/writes unchanged. A config whose ratios do
+not resolve to whole copper pieces fails closed before any wallet write.
 
 ```js
 game.modules.get('market').api.getAdapter('dnd5e'); // supported
 ```
+
+**dc20rpg** and **twodsix** - first-class adapters selected automatically by
+system id. `dc20rpg` uses `system.currency.{cp,sp,gp,pp}` and
+`system.price.value/currency` (default `gp`); `twodsix` (Traveller) uses the
+numeric `system.financeValues.cash` and item `system.price` in credits. Neither
+needs configuration, and they ignore the generic path settings. Each is written
+against the documented system schema and validated with **offline fixtures** (a
+source-backed adapter for dc20rpg 0.10.7.0 and Twodsix 7.7.0); the live runtime
+field access is **not yet verified against a real system install**.
+
+```js
+game.modules.get('market').api.getAdapter('dc20rpg'); // supported
+game.modules.get('market').api.getAdapter('twodsix');  // supported
+```
+
+If you need custom (non-first-class) behavior for one of these systems, opt into
+the configurable fallback explicitly with `getAdapter('generic', config)`; the
+generic paths are never applied to a first-class system adapter.
 
 **generic** - the configurable fallback. Configure the world-scoped settings
 under `market` before use (wallet/price dot-paths, delivery mode):
@@ -120,19 +147,29 @@ game.settings.set('market', 'genericPrice', 'system.price.value');
 game.settings.set('market', 'genericDeliveryMode', 'embedded');
 ```
 
+**daggerheart** - Daggerheart carries **no native item price**, so the module
+never guesses a price path. The `daggerheart` adapter is an explicitly
+unsupported generic subclass and reports `supported === false` until you
+configure the generic wallet/price/delivery paths (above). Once configured it
+reports support and the storefront can transact, using only the GM-configured
+generic path - never an invented one.
+
 ### Risks
 
-- **Live Foundry VTT 14 runtime is not yet tested.** M1/M2/M3/M4/M5 are wired and
-  unit-tested in Node only (the mocks install `game`/`Hooks`/`CONST`,
+- **Live Foundry VTT 14 runtime is not yet tested.** M1/M2/M3/M4/M5/M6 are wired
+  and unit-tested in Node only (the mocks install `game`/`Hooks`/`CONST`,
   `JournalEntry` and the actor document API), so the exact
   `ApplicationV2`/`HandlebarsApplicationMixin` UI, the `dropCanvasData` hook
   shapes, the v14 `FilePicker` constructor, the
   `foundry.audio.AudioHelper.play` call, the `updateWorldTime` automation sweep,
-  the RollTable `drawMany` call and the M5 advanced-order request/response flow
-  should be re-checked against a real v14 install. Run `docs/smoke-test.md`
-  before trusting a live economy. The M2 CSS themes and interactions are
-  Node-tested only, and the themes ship no bundled audio. **No live M5
-  verification has been done yet** - the M5 services and UI are Node-tested only.
+  the RollTable `drawMany` call, the M5 advanced-order request/response flow, the
+  live DC20/Twodsix/Daggerheart adapter field access and the backup import
+  store writes should be re-checked against a real v14 install. Run
+  `docs/smoke-test.md` before trusting a live economy. The M2 CSS themes and
+  interactions are Node-tested only, and the themes ship no bundled audio.
+  **No live M5/M6 verification has been done yet** - the M5 services/UI and the
+  M6 dynamic conversion, the DC20/Twodsix adapters, the M6 key/focus/reduced-motion
+  accessibility CSS and the M6 portable backup manager panel are Node-tested only.
 - **Concurrency across GMs is best-effort.** The per-shop lock serializes
   purchases within one client only; across multiple GM clients the ledger is the
   only cross-client guard and it is a read-then-create, not a server-side CAS.
@@ -160,12 +197,25 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
   cart barter tender both delete an embedded `Item`, so a GenericAdapter
   configured for non-embedded path delivery is refused
   (`delivery-mode-unsupported`).
-- **No live M5 verification.** See the first Risks bullet.
+- **No live M5/M6 verification.** See the first Risks bullet.
 - **The local shop lock is not cross-GM atomic.** Cross-GM atomicity is
-  best-effort; verifying and hardening it against two live GM clients is deferred
-  to M6.
+  best-effort; the deterministic Node concurrency/recovery suite reproduces the
+  documented double-charge race on purpose, but it is **not** a distributed
+  guarantee - verifying and hardening it against two live GM clients is still open.
+- **Daggerheart requires explicit generic config.** Daggerheart has no native
+  item price, so the `daggerheart` adapter stays `supported === false` until you
+  configure the generic wallet/price/delivery paths; no price path is guessed.
+- **DC20/Twodsix live field access is unverified.** The DC20/Twodsix adapters and
+  the generic-fallback paths are validated against **offline fixtures**; the real
+  system install field access has not been exercised on a live Foundry VTT 14
+  runtime yet.
+- **Schema-v0 Journal data is not auto-migrated.** The M6 portable backup
+  migration rewrites only the backup file's own `version: 0` payload to v1
+  (`BACKUP FORMAT` migration). A pre-existing market JournalEntry carrying the
+  older `schemaVersion: 0` is not rewritten in place - it is simply not
+  enumerated, so any such journal is not auto-migrated.
 
-## What works (M1/M2/M3/M4/M5)
+## What works (M1/M2/M3/M4/M5/M6)
 
 - **UI (wired, not system-tested)**:
   - **Market Manager** (`MarketManager`, GM-only): create/select locations and
@@ -254,11 +304,20 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 - **Adapters** (`api.getAdapter(systemId, opts)`):
   - `dnd5e` - supported. Currency is converted to integer copper
     (`cp/sp/ep/gp/pp`); item price comes from `system.price.value/denomination`.
+  - `dc20rpg` - supported, source-backed against dc20rpg 0.10.7.0. The wallet is
+    `system.currency.{cp,sp,gp,pp}` in integer copper factors 1/10/100/1000 (no
+    `ep`), item price comes from `system.price.value/currency` (default `gp`),
+    and quantity is read/written on `system.quantity`.
+  - `twodsix` - supported, source-backed against Twodsix 7.7.0 (Traveller). The
+    numeric cash balance is `system.financeValues.cash` ONLY (never the
+    `system.finances.cash` display string), item price is `system.price`, and
+    credits are the single currency unit with no conversion.
   - `generic` - configurable fallback. You (GM) configure dot-paths for the
     wallet and item price plus a delivery mode. Until configured it reports
     `supported === false`.
-  - `daggerheart`, `dc20`, `twodsix` - explicitly report **unsupported** until
-    you configure the generic adapter paths. No paths are guessed.
+  - `daggerheart` - explicitly reports **unsupported** until you configure the
+    generic adapter paths. Daggerheart has no native item price, so no system-
+    specific price path is guessed.
   - Item delivery preserves the full `item.toObject()` minus `_id`,
     `ownership`, `folder`, `sort`, and never mutates the source item.
 - **Requests** (`api.request(payload)`): send a `catalog` or `purchase` request
@@ -364,6 +423,74 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
   request types and projects each through a bounded public sanitizer - never the
   raw advanced-order record, the idempotency carrybacks, or the private
   `details`/`compensation`/`outcome`.
+- **M6 dynamic dnd5e currency conversion** (`src/adapters/index.js`): the
+  `Dnd5eAdapter` no longer hardcodes copper factors. It reads the live
+  `CONFIG.DND5E.currencies` (or an explicit `opts.currencyConfig`) and converts
+  each denomination by its exact GP-per-unit `conversion` using BigInt rationals
+  and exact decimal parsing (including scientific notation) - never binary float
+  rounding - with safe-integer overflow detection and fail-closed normalization
+  (a missing `cp`/`gp`, a non-finite/non-positive or fractional-copper factor
+  throws before any wallet write). The legacy `DENOMINATIONS`/
+  `DENOMINATION_FACTOR` exports and the canonical default that reproduces the
+  legacy factors are preserved, and `dndCurrencyFactors`/`formatCopperAsGP` are
+  exported for callers.
+- **M6 first-class system adapters (offline fixtures, runtime unverified)**:
+  `DC20Adapter` (dc20rpg 0.10.7.0: `system.currency.{cp,sp,gp,pp}` in cp factors
+  1/10/100/1000, item `system.price.{value,currency}` default `gp`,
+  `system.quantity`) and `TwodsixAdapter` (Twodsix 7.7.0: numeric
+  `system.financeValues.cash` credits ONLY, item `system.price`, no conversion)
+  are selected by system id, need no configuration, and ignore the generic path
+  settings. Their schema access is validated against offline fixtures; the real
+  system runtime field access is not yet verified. `DaggerheartAdapter` stays an
+  explicitly unsupported generic subclass until the GM configures the generic
+  paths (no guessed price path).
+- **M6 GM-private portable backup + v0->v1 BACKUP FORMAT migration**
+  (`src/storage/backup-format.js`, `src/storage/backup.js`): a self-contained,
+  plain-JSON `foundry-market-portable` v1 backup of every location and shop in
+  fully normalized GM-private form (item snapshots, access gates, valuations,
+  commerce funds and the whole automation config - never a `publicShop`
+  projection). `normalizeBackup` validates/normalizes and rejects an unknown/
+  future format, the 1000/1000 caps, >5 MiB, duplicate ids and any non-plain
+  JSON; it also accepts a v0 `{ version: 0, locations, shops }` payload and
+  migrates it to v1 - but **only when every source object normalizes**, and that
+  migration is strictly **backup-format only** (a pre-existing market JournalEntry
+  carrying an older `schemaVersion` is not rewritten in place). `planBackupImport`
+  gives every imported record a fresh collision-safe id, remaps
+  `locationId`/travel/NPC `shopId` references and resets stale automation clock
+  state. The GM-only `createBackupService` (active-GM gated at every store read,
+  serialized on one in-flight import, no record ever deleted, no complete
+  cross-GM atomicity claimed) exposes `exportPortable`/`importPortable` and is
+  surfaced only through the active-GM-gated `api.backup` wrappers and the manager
+  backup panel.
+- **M6 deterministic concurrency/recovery tests, not cross-GM atomic**
+  (`tests/multiplayer.test.js`): a pure Node suite drives the real services
+  through a fake store and asserts the exact boundaries of the no-distributed-
+  atomicity claim - 50 concurrent purchases on a finite stock of 30 commit
+  exactly 30 and fail 20 `insufficient-stock` (no oversell/double-debit), a 50-op
+  mixed purchase/cart/automation run charges sold units once, two independent
+  shops never contaminate, GM-handoff refusal at an await boundary leaves no stale
+  write, applies-then-throws recovery is recoverable, and the gated
+  `beforeCreateLedger` barrier reproduces the documented multi-GM double-charge
+  window deterministically (the per-shop lock and every read-then-create guard
+  are per-client; the ledger is the only best-effort cross-client guard).
+- **M6 benchmark / accessibility review** (`scripts/benchmark.mjs`,
+  `tests/performance.test.js`, `styles/market.css`): `npm run benchmark` prints a
+  median/p95 wall-clock report for normalization, public-catalog build and
+  automation policy (example timings on the run machine - not a CI gate; no live
+  Foundry profile yet), while `tests/performance.test.js` asserts the deterministic
+  O(N) guarantee via Proxy array-read counting plus a very generous 10 s
+  catastrophic-regression-only wall-clock guard. `styles/market.css` ships the M6
+  keyboard focus (`:focus-visible` outline on both surfaces, explicit
+  focus/checked states for the custom controls), a `--mk-*` contrast palette and
+  reduced-motion handling (`@media (prefers-reduced-motion: reduce)` + the
+  `.motion-off` override) - there is no automated axe/screen-reader run; the
+  manual keyboard/screen-reader check is `docs/smoke-test.md` section 23.
+- **M1-M5 preserved.** The dynamic conversion, the DC20/Twodsix adapters, the
+  portable backup manager panel and the concurrency/recovery/benchmark/
+  accessibility work are additive: the M1 purchase flow, the M2 themes/
+  interactions, the M3 social/reputation engine, the M4 automation and the M5
+  advanced commerce remain intact and Node-tested, with `SCHEMA_VERSION` still
+  `1`.
 
 ## Extending themes
 
@@ -404,8 +531,13 @@ shop for the storefront to use it.
 ## Adapter setup
 
 The Marketplace is currency-agnostic: prices are stored as integer **minor
-units** (the smallest currency unit). For dnd5e the minor unit is copper. For
-generic systems you choose the integer scale and configure the paths.
+units** (the smallest currency unit). For dnd5e the minor unit is copper, and
+since M6 the copper factors are read dynamically from the live
+`CONFIG.DND5E.currencies` (or `opts.currencyConfig`) using exact GP-per-unit
+conversion - never a hardcoded table, never float rounding - so a GM-configured
+exchange rate is honoured while existing integer-copper records read/write
+unchanged. For generic systems you choose the integer scale and configure the
+paths.
 
 Settings (world-scoped, under `market`):
 
@@ -431,14 +563,16 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 ## Developing / testing
 
 ```sh
-npm test      # node --test tests/
-npm run lint  # node --check on every JS source file
-npm run build # sh scripts/package.sh -> dist/module.zip + dist/module.json (requires zip)
+npm test        # node --test tests/
+npm run lint    # node --check on every JS source file
+npm run build   # sh scripts/package.sh -> dist/module.zip + dist/module.json (requires zip)
+npm run benchmark # node scripts/benchmark.mjs -> optional M6 median/p95 wall-clock report
 ```
 
-The module itself has no build step: `npm test` and `npm run lint` are
-intentionally dependency-free. `npm run build` only packages the release zip
-(release workflow asset); it does not transform the runtime source.
+The module itself has no build step: `npm test`, `npm run lint` and
+`npm run benchmark` are intentionally dependency-free. `npm run build` only
+packages the release zip (release workflow asset); it does not transform the
+runtime source.
 
 ## Documentation
 

@@ -25,6 +25,7 @@ import {
 } from '../services/model.js';
 import { getTheme, THEME_IDS, normalizeTheme, normalizeAppearance, sanitizeMediaPath } from '../themes/registry.js';
 import { PERSONALITY_IDS, getPersonality } from '../social/personalities.js';
+import { MAX_BACKUP_BYTES } from '../storage/backup-format.js';
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 
@@ -46,6 +47,23 @@ const WEEKDAY_LABELS = [
 // GM (the automation runner and table generator gate on `isActiveGM`). This is
 // the notice shown when a non-active GM presses them.
 const ACTIVE_GM_MESSAGE = 'Only the active Game Master can run automation.';
+
+// The backup status/preview warning lists are bounded to this many entries so a
+// backup with many warnings can never flood the manager template context.
+const BACKUP_WARNING_LIMIT = 20;
+
+// The preview/import file may be at most 5 MiB (matching the portable format
+// bound in `backup-format.js`). An oversized file is refused BEFORE it is read
+// into memory.
+const BACKUP_MAX_BYTES = MAX_BACKUP_BYTES;
+
+const BACKUP_GM_MESSAGE = 'Only the active Game Master can export or import backups.';
+
+// Measure the UTF-8 byte length of a string (used to bound a portable backup
+// export to the same MAX_BACKUP_BYTES the format module enforces on import).
+function utf8ByteLength(str) {
+  return new TextEncoder().encode(str).length;
+}
 
 // The shop-details/appearance form fields whose edits must be captured into the
 // unsaved draft as the GM types. Inventory row fields (price, quantity, stock
@@ -144,6 +162,12 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       'prev-orders': this._action('_onPrevOrders'),
       // M6: GM-only per-Item valuation approval for sell/barter.
       'approve-valuation': this._action('_onApproveValuation'),
+      // M6: GM-only portable backup export/preview/import. The manager owns the
+      // export/preview/import UI entirely; backup state never routes through a
+      // player request or chat message.
+      'export-backup': this._action('_onExportBackup'),
+      'preview-backup': this._action('_onPreviewBackup'),
+      'import-backup': this._action('_onImportBackup'),
     },
   };
 
@@ -202,8 +226,17 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       approvedValuations: [],
       valuationActorId: null,
       valuationActorName: '',
+      // M6 GM-only portable backup context. `backupSummary`/`backupPreview` are
+      // SANITIZED plain objects (counts, bounded warnings, bounded created-id
+      // lists) - never the raw backup JSON, which stays in `_backupRaw`. The
+      // `_backupFile`/`_backupRaw` instance fields hold the last previewed File
+      // object and its parsed raw backup so an import can reuse them exactly.
+      backupSummary: null,
+      backupPreview: null,
       notice: '',
     };
+    this._backupFile = null;
+    this._backupRaw = null;
   }
 
   // ---- lazy dependency accessors (fall back to live globals) -----------------
@@ -378,6 +411,35 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       return this._deps.generateInventory(params);
     }
     return this._api()?.generateInventory?.(params);
+  }
+
+  // ---- M6 backup lazy accessors ----------------------------------------------
+
+  /**
+   * Export a portable backup. Prefers the injected `deps.exportPortable` (tests)
+   * and otherwise defers to the GM-only `api.backup.exportPortable` wrapper, which
+   * re-checks the active GM before touching the store. The result is the bounded
+   * `{status, backup, warnings}` export outcome - never a raw store projection.
+   */
+  _exportPortable() {
+    if (typeof this._deps.exportPortable === 'function') {
+      return this._deps.exportPortable();
+    }
+    return this._api()?.backup?.exportPortable?.();
+  }
+
+  /**
+   * Import a portable backup (or preview it with `{dryRun:true}`). Prefers the
+   * injected `deps.importPortable` (tests) and otherwise defers to the GM-only
+   * `api.backup.importPortable` wrapper, which re-checks the active GM before any
+   * store read/write. The result is the bounded dry-run preview or the
+   * `{status, createdLocationIds, createdShopIds, warnings}` import outcome.
+   */
+  _importPortable(raw, opts) {
+    if (typeof this._deps.importPortable === 'function') {
+      return this._deps.importPortable(raw, opts);
+    }
+    return this._api()?.backup?.importPortable?.(raw, opts);
   }
 
   // ---- M3 social / reputation lazy accessors ---------------------------------
@@ -694,6 +756,7 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     this._bindDnd();
     this._bindShopForm();
     this._bindReputationActor();
+    this._bindBackupPanel();
     this._applyPreviewStyles();
   }
 
@@ -2929,6 +2992,405 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     } else {
       this._data.notice = `Valuation result: ${status || 'unknown'}.`;
     }
+  }
+
+  // ---- M6 backup export / preview / import -----------------------------------
+
+  /**
+   * Read the currently selected backup file from the panel's `<input type="file">`.
+   * Returns the `File` object, or undefined when no file is selected (an absent
+   * file input also yields undefined, never a throw).
+   */
+  _readBackupFile() {
+    const input = this.element?.querySelector?.(`[name="backupFile"]`);
+    if (!input) return undefined;
+    const files = input.files || [];
+    return files.length > 0 ? files[0] : undefined;
+  }
+
+  /**
+   * Whether the file the last preview was computed from is still the current
+   * selection. After a re-render the file input's own selection is lost, but the
+   * stored `_backupFile` reference is still the one the preview was built from;
+   * only a genuine new selection (a different File object present in the DOM)
+   * invalidates it.
+   */
+  _backupFileCurrent() {
+    const file = this._readBackupFile();
+    if (!file) return !!this._backupFile;
+    return file === this._backupFile;
+  }
+
+  /**
+   * Bind the backup-file input's `change` listener so a new selection invalidates
+   * a stale preview and cached raw backup immediately. A stable marker prevents a
+   * duplicate listener from stacking when the same DOM node survives a re-render.
+   */
+  _bindBackupPanel() {
+    const root = this.element;
+    if (!root || typeof root.querySelector !== 'function') return;
+    const input = root.querySelector('[name="backupFile"]');
+    if (input && typeof input.addEventListener === 'function' && !input.__marketBackupBound) {
+      input.__marketBackupBound = true;
+      input.addEventListener('change', () => this._onBackupFileChange());
+    }
+  }
+
+  /**
+   * A new file selection invalidates the stale preview and cached raw backup so
+   * an import can never use a preview computed from a different file. The newly
+   * selected file is recorded, but not read, until the GM clicks preview.
+   */
+  _onBackupFileChange() {
+    this._data.backupPreview = null;
+    this._backupRaw = null;
+    this._backupFile = this._readBackupFile() || null;
+  }
+
+  /**
+   * Bound the warnings list to at most BACKUP_WARNING_LIMIT trimmed non-empty
+   * strings. The raw backup JSON is never projected here - only bounded warning
+   * text reaches the template context.
+   */
+  _sanitizeBackupWarnings(warnings) {
+    if (!Array.isArray(warnings)) return [];
+    const out = [];
+    for (const w of warnings) {
+      if (typeof w !== 'string') continue;
+      const trimmed = w.trim();
+      if (trimmed === '') continue;
+      out.push(trimmed);
+      if (out.length >= BACKUP_WARNING_LIMIT) break;
+    }
+    return out;
+  }
+
+  _boundedBackupIds(ids) {
+    if (!Array.isArray(ids)) return [];
+    return ids.slice(0, BACKUP_WARNING_LIMIT).map((id) => String(id));
+  }
+
+  _backupSummaryFromExport(result) {
+    const backup = result && result.backup ? result.backup : {};
+    const locations = Array.isArray(backup.locations) ? backup.locations.length : 0;
+    const shops = Array.isArray(backup.shops) ? backup.shops.length : 0;
+    return {
+      status: 'exported',
+      error: '',
+      kind: 'export',
+      locations,
+      shops,
+      createdLocations: 0,
+      createdShops: 0,
+      createdLocationIds: [],
+      createdShopIds: [],
+      partial: false,
+      warnings: this._sanitizeBackupWarnings(result && result.warnings),
+    };
+  }
+
+  _backupSummaryError(result, kind) {
+    return {
+      status: 'error',
+      error: (result && result.error) || 'unknown',
+      kind: kind || 'export',
+      locations: 0,
+      shops: 0,
+      createdLocations: 0,
+      createdShops: 0,
+      createdLocationIds: [],
+      createdShopIds: [],
+      partial: false,
+      warnings: this._sanitizeBackupWarnings(result && result.warnings),
+    };
+  }
+
+  _backupSummaryFromImport(result) {
+    const locations = Array.isArray(result && result.createdLocationIds)
+      ? result.createdLocationIds.length
+      : 0;
+    const shops = Array.isArray(result && result.createdShopIds)
+      ? result.createdShopIds.length
+      : 0;
+    const partial = !!(result && result.status === 'partial');
+    return {
+      status: partial ? 'partial' : 'imported',
+      error: (result && result.error) || '',
+      kind: 'import',
+      locations,
+      shops,
+      createdLocations: locations,
+      createdShops: shops,
+      createdLocationIds: this._boundedBackupIds(result && result.createdLocationIds),
+      createdShopIds: this._boundedBackupIds(result && result.createdShopIds),
+      partial,
+      warnings: this._sanitizeBackupWarnings(result && result.warnings),
+    };
+  }
+
+  _backupPreviewFromDryRun(result) {
+    const counts = (result && result.counts) || {};
+    return {
+      locations: Number.isFinite(Number(counts.locations)) ? Number(counts.locations) : 0,
+      shops: Number.isFinite(Number(counts.shops)) ? Number(counts.shops) : 0,
+      warnings: this._sanitizeBackupWarnings(result && result.warnings),
+    };
+  }
+
+  /**
+   * Download the exported backup as a local JSON file via a Blob object URL and a
+   * temporary anchor, then revoke the object URL. The backup is serialized in
+   * COMPACT form (no pretty-print) and its UTF-8 byte length is checked against
+   * MAX_BACKUP_BYTES BEFORE any download, so an export that cannot be imported
+   * back (because it exceeds the portable bound) is refused with an error result
+   * rather than silently saved. Returns `{ status: 'ok', blob }` on success and
+   * `{ status: 'error', error: 'export-too-large' }` when the serialized bytes
+   * exceed the bound. Guarded so a runtime without a DOM (or
+   * `URL.createObjectURL`) still returns `{ status: 'ok' }` without throwing -
+   * the backup is already captured in `_data.backupSummary` regardless.
+   */
+  _downloadBackup(backup) {
+    const json = JSON.stringify(backup);
+    const bytes = utf8ByteLength(json);
+    if (bytes > BACKUP_MAX_BYTES) {
+      return { status: 'error', error: 'export-too-large' };
+    }
+    if (typeof document === 'undefined') return { status: 'ok' };
+    if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+      return { status: 'ok' };
+    }
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `foundry-market-backup-${Date.now()}.json`;
+    a.style.display = 'none';
+    if (document.body && typeof document.body.appendChild === 'function') {
+      document.body.appendChild(a);
+    }
+    if (typeof a.click === 'function') a.click();
+    if (document.body && typeof document.body.removeChild === 'function') {
+      document.body.removeChild(a);
+    }
+    if (typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url);
+    return { status: 'ok', blob };
+  }
+
+  _setBackupConfirm(checked) {
+    const input = this.element?.querySelector?.(`[name="confirmImport"]`);
+    if (input) input.checked = checked;
+  }
+
+  _importNotice(result, summary) {
+    if (summary.partial || (result && result.status === 'partial')) {
+      return `Import partially completed.${this._partialImportDetail(result)}`;
+    }
+    return `Imported ${summary.createdLocations} locations and ${summary.createdShops} shops.`;
+  }
+
+  _partialImportDetail(result) {
+    const ids = [
+      ...(Array.isArray(result && result.createdLocationIds) ? result.createdLocationIds : []),
+      ...(Array.isArray(result && result.createdShopIds) ? result.createdShopIds : []),
+    ];
+    let out = '';
+    if (ids.length) {
+      const shown = ids.slice(0, 8).map((id) => String(id)).join(', ');
+      const more = ids.length > 8 ? ` and ${ids.length - 8} more` : '';
+      out += ` Created: ${shown}${more}.`;
+    }
+    if (result && result.error) out += ` (${result.error})`;
+    return out;
+  }
+
+  /**
+   * `export-backup`. Guarded on the active GM, invokes the GM-only portable export
+   * and downloads the resulting JSON locally. Backup state never routes through a
+   * player request or chat message - the manager owns the export surface.
+   */
+  async _onExportBackup(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = BACKUP_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    let result;
+    try {
+      result = await this._exportPortable();
+    } catch (err) {
+      this._data.backupSummary = this._backupSummaryError({ error: 'export-failed' }, 'export');
+      this._data.backupPreview = null;
+      this._data.notice = `Export failed: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    if (!result || result.status !== 'ok') {
+      this._data.backupSummary = this._backupSummaryError(result, 'export');
+      this._data.backupPreview = null;
+      this._data.notice = `Export failed: ${(result && result.error) || 'unknown'}.`;
+      this.render({ force: true });
+      return;
+    }
+    // Compact serialization with a size check before download: an export that
+    // exceeds the portable bound cannot be imported back, so refuse it (no
+    // download) with a clear notice instead of saving an unusable file.
+    const download = this._downloadBackup(result.backup);
+    if (download.status === 'error') {
+      this._data.backupSummary = this._backupSummaryError(
+        { error: 'export-too-large' },
+        'export'
+      );
+      this._data.backupPreview = null;
+      this._data.notice = 'The backup exceeds 5 MB and cannot be exported.';
+      this.render({ force: true });
+      return;
+    }
+    this._data.backupSummary = this._backupSummaryFromExport(result);
+    this._data.backupPreview = null;
+    this._data.notice = 'Backup exported.';
+    this.render({ force: true });
+  }
+
+  /**
+   * `preview-backup`. Guarded on the active GM. Reads the selected File only when
+   * it is at most 5 MiB (the `size` is checked BEFORE `text()` so an oversized
+   * file is never read into memory), parses the JSON, and runs a dry-run import
+   * (`importPortable(raw, { dryRun: true })`). The raw backup and the File object
+   * are cached on the instance so import can reuse them exactly; the preview
+   * context carries only counts and bounded warnings - never the raw JSON.
+   */
+  async _onPreviewBackup(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = BACKUP_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const file = this._readBackupFile();
+    if (!file) {
+      this._data.backupPreview = null;
+      this._data.notice = 'Choose a backup JSON file to preview.';
+      this.render({ force: true });
+      return;
+    }
+    if (file.size > BACKUP_MAX_BYTES) {
+      this._data.backupPreview = null;
+      this._backupRaw = null;
+      this._backupFile = file;
+      this._data.notice = 'The backup is larger than 5 MB and cannot be imported.';
+      this.render({ force: true });
+      return;
+    }
+    let text;
+    try {
+      text = await file.text();
+    } catch (err) {
+      this._data.backupPreview = null;
+      this._backupRaw = null;
+      this._backupFile = file;
+      this._data.notice = `Could not read the backup file: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    let raw;
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      this._data.backupPreview = null;
+      this._backupRaw = null;
+      this._backupFile = file;
+      this._data.notice = `The backup file is not valid JSON: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    let result;
+    try {
+      result = await this._importPortable(raw, { dryRun: true });
+    } catch (err) {
+      this._data.backupPreview = null;
+      this._backupRaw = null;
+      this._backupFile = file;
+      this._data.notice = `Preview failed: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    if (!result || result.status !== 'ok') {
+      this._data.backupPreview = null;
+      this._backupRaw = null;
+      this._backupFile = file;
+      this._data.notice = `Preview failed: ${(result && result.error) || 'unknown'}.`;
+      this.render({ force: true });
+      return;
+    }
+    this._backupFile = file;
+    this._backupRaw = raw;
+    this._data.backupPreview = this._backupPreviewFromDryRun(result);
+    this._data.notice = '';
+    this.render({ force: true });
+  }
+
+  /**
+   * `import-backup`. Guarded on the active GM, requires BOTH the confirmation
+   * checkbox and an existing successful preview computed from the currently
+   * selected file, then runs the real (non-dry) import. The success/partial
+   * outcome is reported honestly (including the bounded created ids), the cached
+   * raw/file are cleared, the confirmation checkbox is reset, and the locations/
+   * shops are refreshed. A stale preview from a different file is never reused.
+   */
+  async _onImportBackup(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = BACKUP_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    if (!this._readChecked(this.element, 'confirmImport')) {
+      this._data.notice = 'Check the confirmation box to import.';
+      this.render({ force: true });
+      return;
+    }
+    if (!this._data.backupPreview) {
+      this._data.notice = 'Preview the backup before importing.';
+      this.render({ force: true });
+      return;
+    }
+    if (!this._backupFileCurrent()) {
+      this._data.backupPreview = null;
+      this._backupRaw = null;
+      this._data.notice = 'The selected file changed; preview it again before importing.';
+      this.render({ force: true });
+      return;
+    }
+    if (this._backupRaw == null) {
+      this._data.backupPreview = null;
+      this._data.notice = 'Preview the backup before importing.';
+      this.render({ force: true });
+      return;
+    }
+    let result;
+    try {
+      result = await this._importPortable(this._backupRaw, { dryRun: false });
+    } catch (err) {
+      this._data.notice = `Import failed: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    if (!result || result.status === 'error') {
+      this._data.backupSummary = this._backupSummaryError(result, 'import');
+      this._data.backupPreview = null;
+      this._backupRaw = null;
+      this._backupFile = null;
+      this._data.notice = `Import failed: ${(result && result.error) || 'unknown'}.`;
+      this.render({ force: true });
+      return;
+    }
+    const summary = this._backupSummaryFromImport(result);
+    this._data.backupSummary = summary;
+    this._data.backupPreview = null;
+    this._backupRaw = null;
+    this._backupFile = null;
+    await this._refreshData();
+    this._data.notice = this._importNotice(result, summary);
+    this._setBackupConfirm(false);
+    this.render({ force: true });
   }
 
   // ---- drag / drop wiring -----------------------------------------------------

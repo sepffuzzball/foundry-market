@@ -147,4 +147,19 @@
       {{/if}}
     </main>
   </div>
+  <section class="editor-panel backup-panel" aria-labelledby="backup-heading">
+    <div class="section-heading"><div><span class="section-number">09</span><div><p class="market-eyebrow">Portable world data</p><h2 id="backup-heading">GM backup &amp; restore</h2></div></div></div>
+    <p class="market-muted backup-intro">Create a private JSON backup of locations and shops, or add records from a compatible backup.</p>
+    <div class="backup-warning" role="note"><strong>Before you continue</strong><ul><li>Backups are private and include snapshots and item valuations. Store exported files securely.</li><li>Order, ledger, and reputation-event histories are not included.</li><li>Imports only add new locations and shops; they do not overwrite existing records. A partial import cannot be automatically rolled back.</li></ul></div>
+    <div class="backup-actions" aria-label="Backup actions">
+      <button type="button" class="market-button market-button-outline" data-action="export-backup" {{#unless isActiveGM}}disabled{{/unless}}>Export backup</button>
+      <label class="market-field backup-file-field"><span>Choose backup JSON (up to 5 MB)</span><input type="file" name="backupFile" accept=".json,application/json" {{#unless isActiveGM}}disabled{{/unless}}></label>
+      <button type="button" class="market-button market-button-quiet" data-action="preview-backup" {{#unless isActiveGM}}disabled{{/unless}}>Preview import</button>
+      <label class="market-check backup-confirm"><input type="checkbox" name="confirmImport" {{#unless isActiveGM}}disabled{{/unless}}><span class="check-art" aria-hidden="true"></span><span><strong>I understand this adds records and may partially complete.</strong></span></label>
+      <button type="button" class="market-button market-button-dark" data-action="import-backup" {{#unless isActiveGM}}disabled{{/unless}}>Import backup</button>
+    </div>
+    {{#if backupSummary}}<div class="backup-summary" role="status" aria-live="polite"><h3>Backup status</h3><p><strong>{{backupSummary.status}}</strong>{{#if backupSummary.error}} — {{backupSummary.error}}{{/if}}</p>{{#if (eq backupSummary.kind "export")}}<p>{{backupSummary.locations}} locations · {{backupSummary.shops}} shops in the exported backup.</p>{{else}}<p>Added {{backupSummary.createdLocations}} locations and {{backupSummary.createdShops}} shops.</p>{{#if backupSummary.partial}}<p class="backup-partial">The import partially completed; the listed records were added.</p>{{#if backupSummary.createdLocationIds.length}}<p>Locations: {{#each backupSummary.createdLocationIds as |id|}}{{#unless @first}}, {{/unless}}{{id}}{{/each}}</p>{{/if}}{{#if backupSummary.createdShopIds.length}}<p>Shops: {{#each backupSummary.createdShopIds as |id|}}{{#unless @first}}, {{/unless}}{{id}}{{/each}}</p>{{/if}}{{/if}}{{/if}}{{#if backupSummary.warnings.length}}<ul class="backup-warning-list">{{#each backupSummary.warnings as |warning|}}<li>{{warning}}</li>{{/each}}</ul>{{/if}}</div>{{/if}}
+    {{#if backupPreview}}<div class="backup-summary" role="status" aria-live="polite"><h3>Import preview</h3><p>{{backupPreview.locations}} locations · {{backupPreview.shops}} shops will be added.</p>{{#if backupPreview.warnings.length}}<ul class="backup-warning-list">{{#each backupPreview.warnings as |warning|}}<li>{{warning}}</li>{{/each}}</ul>{{else}}<p>No preview warnings.</p>{{/if}}</div>{{/if}}
+    {{#unless isActiveGM}}<p class="market-muted backup-gm-note">Only the active GM can export or import backups.</p>{{/unless}}
+  </section>
 </section>
