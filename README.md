@@ -6,12 +6,16 @@ by the active GM through an idempotent, compensating ledger; and requests flow
 over ChatMessage (no raw socket).
 
 This is a **prerelease developer preview** covering **Milestone 1 (M1)** through
-**Milestone 2 (M2)**, with **Milestone 3 (M3, social data & reputation/pricing)**
-**in progress**: the functional core plus the M1 end-to-end UI wiring (market
-manager, player storefront, canvas shop markers), the M2 shop theming/appearance
-and storefront interactions, and the in-progress M3 social/NPC/reputation engine
-and wiring. The runtime has **not** been executed against a live Foundry VTT 14
-install yet - it is wired and unit-tested in Node only.
+**Milestone 4 (M4)**, with **Milestone 3 (M3, social data & reputation/pricing)**
+still **in progress**: the functional core plus the M1 end-to-end UI wiring
+(market manager, player storefront, canvas shop markers), the M2 shop
+theming/appearance and storefront interactions, the in-progress M3
+social/NPC/reputation engine and wiring, and the M4 shop automation - scheduled
+business hours, finite periodic restock, travel rotation among locations,
+exact/low/hidden stock visibility, time-window display-only market events, GM
+automation diagnostics, and GM-only RollTable inventory generation. The runtime
+has **not** been executed against a live Foundry VTT 14 install yet - it is wired
+and unit-tested in Node only, and M4 is likewise Node-tested only.
 
 ## Requirements
 
@@ -36,18 +40,18 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.2`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.3`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.2/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.3/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
 
-> **The `0.1.2` `download` URL is live only once the `0.1.2` release has been
+> **The `0.1.3` `download` URL is live only once the `0.1.3` release has been
 > published** - the release action must upload `module.zip` and `module.json` to
-> the GitHub release for tag `0.1.2`. Until that release is published, install
+> the GitHub release for tag `0.1.3`. Until that release is published, install
 > the module by pointing Foundry at this repository directory as a module source
 > (the manifest and `src/core/main.js` are unchanged), or download the zip from
 > the published release once it is available.
@@ -110,12 +114,13 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 
 ### Risks
 
-- **Live Foundry VTT 14 runtime is not yet tested.** M1/M2 are wired and
+- **Live Foundry VTT 14 runtime is not yet tested.** M1/M2/M3/M4 are wired and
   unit-tested in Node only (the mocks install `game`/`Hooks`/`CONST`,
   `JournalEntry` and the actor document API), so the exact
   `ApplicationV2`/`HandlebarsApplicationMixin` UI, the `dropCanvasData` hook
-  shapes, the v14 `FilePicker` constructor and the
-  `foundry.audio.AudioHelper.play` call should be re-checked against a real v14
+  shapes, the v14 `FilePicker` constructor, the
+  `foundry.audio.AudioHelper.play` call, the `updateWorldTime` automation sweep
+  and the RollTable `drawMany` call should be re-checked against a real v14
   install. Run `docs/smoke-test.md` before trusting a live economy. The M2 CSS
   themes and interactions are Node-tested only, and the themes ship no bundled
   audio.
@@ -126,7 +131,7 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 - **No live use yet.** The module has been exercised in tests only; the smoke
   checklist is the intended first real-runtime check.
 
-## What works (M1/M2/M3)
+## What works (M1/M2/M3/M4)
 
 - **UI (wired, not system-tested)**:
   - **Market Manager** (`MarketManager`, GM-only): create/select locations and
@@ -228,6 +233,55 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
   response back to the requester and all GMs. Responses expose only allowlisted
   public shop fields and visible inventory fields - no item `system` data and no
   `itemUuid`.
+- **M4 shop automation** (GM-only, opt-in; `api.automation` plus the manager
+  automation editor and the active-GM runtime tick):
+  - **Business hours** (`automation.hours`): an `enabled` flag plus at most 7
+    unique weekdays (day index 0..6, day 0 = Monday) and
+    `openMinute`/`closeMinute` (0..1439). Equal open/close means a full-day
+    opening and overnight windows are controlled by the opening day. The
+    storefront and purchase path project `open`/`closedReason` from the
+    weekday/minute grid; a purchase outside the declared hours fails closed as
+    `shop-closed`.
+  - **Finite scheduled restock** (per-entry `restock`): only a `finite` entry can
+    carry a restock `{ enabled, target, intervalSeconds, anchorTime, lastCycle }`.
+    The runner applies a single set-to-target (`quantity = max(current, target)`)
+    that never reduces stock, advances `lastCycle` by exactly one due cycle, and
+    performs no catch-up loop.
+  - **Travel rotation among locations** (`automation.travel`): an `enabled` flag
+    with 2..10 destination `locationIds`, an `anchorTime`, an `intervalSeconds`
+    (3600..31536000) and a `lastCycle`. When a cycle is due the runner rotates the
+    shop's `locationId` to the scheduled destination and advances `lastCycle`, so
+    the shop trades from the rotated location. **The canvas marker is not
+    automatically relocated** - only the shop's logical `locationId` changes; the
+    Scene Note stays where the GM placed it. Once the merchant has arrived the
+    projected `locationId`/`open` report the rotated destination (never the base
+    place) for every outcome.
+  - **Exact / low / hidden stock visibility** (`stockVisibility`): a per-entry
+    `'exact' | 'low' | 'hidden'` mode. The public projection never leaks a true
+    count in `low`/`hidden` mode (`quantity: null` plus `stockLabel`/`available`
+    instead); `exact` keeps the true quantity.
+  - **Time-window display-only market events** (`automation.events`): at most
+    `MAX_AUTOMATION_EVENTS` (10) plain-text events with a title, description, a
+    safe-integer start/end window and a `visible` flag. The public storefront
+    projects only the visible **active** events as display-only
+    `{id, title, description}`; they never alter pricing or the purchase gate.
+  - **GM automation diagnostics** (`automation.diagnostics`): the runner records
+    bounded per-shop diagnostics (`lastRunAt`, `lastStatus`, `lastError` capped at
+    200 chars, `lastRestocked`, `lastLocationId`) read by
+    `api.automation.getDiagnostics`; the raw shop record is never exposed.
+  - **GM-only RollTable inventory generation** (`api.generateInventory`): draws
+    Items from a world/compendium RollTable (`table.drawMany`) and appends them as
+    finite, visible inventory entries via one atomic `store.updateShop`, capping
+    the result, deduping against the live inventory, and reporting bounded
+    add/skip/invalid/duplicate counters. Active-GM gated: a non-active-GM caller
+    gets `not-active-gm` before any read/draw/write.
+  - **GM-world clock semantics**: all M4 trading/automation decisions read the
+    Foundry **world clock** server-side (`game.time.worldTime`), never a client or
+    caller-supplied time. The relative clock is **not** the Unix epoch: day `0` is
+    Monday 00:00, and a world time is floored to a safe integer second only when
+    it is finite. An invalid clock (NaN/Infinity/non-safe) fails closed as
+    `invalid-world-time` rather than collapsing to week zero, and no schedule
+    executes.
 
 ## Extending themes
 

@@ -51,6 +51,28 @@ export const SOCIAL_BPS_MAX = 50000;
 export const SOCIAL_COMBINED_BPS_MIN = -36000;
 export const SOCIAL_COMBINED_BPS_MAX = 200000;
 
+// ---- M4 shop automation constants ----------------------------------------
+// The shop `automation` object carries declared business hours, a travelling
+// merchant schedule, plain-text market events and GM-run diagnostics. It is
+// purely declarative data validated below; the deterministic decisions derived
+// from it live in `src/automation/policy.js` (no runtime/UI here).
+export const MAX_AUTOMATION_EVENTS = 10;
+export const AUTOMATION_EVENT_TITLE_MAX = 100;
+export const AUTOMATION_EVENT_DESCRIPTION_MAX = 400;
+export const TRAVEL_LOCATION_MIN = 2;
+export const TRAVEL_LOCATION_MAX = 10;
+export const AUTOMATION_INTERVAL_MIN = 3600;
+export const AUTOMATION_INTERVAL_MAX = 31536000;
+export const STOCK_VISIBILITIES = ['exact', 'low', 'hidden'];
+export const HOURS_DAY_MIN = 0;
+export const HOURS_DAY_MAX = 6;
+export const HOURS_MINUTE_MIN = 0;
+export const HOURS_MINUTE_MAX = 1439;
+// Restock/stock-visibility metadata lives on each inventory entry, never on the
+// shop, so it rides the existing per-entry schema without a version bump.
+export const LOW_STOCK_THRESHOLD = 3;
+export const RESTOCK_TARGET_MIN = 1;
+
 export const ACCENT_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 // Only local asset paths under the Foundry asset roots are allowed. The path
@@ -228,6 +250,11 @@ export function normalizeInventoryEntry(raw = {}) {
   const price = assertInteger(raw.price ?? 0, 'entry.price');
   const quantity = assertInteger(raw.quantity ?? 0, 'entry.quantity');
   const stockMode = assertStockMode(raw.stockMode || 'finite');
+  const stockVisibility =
+    raw.stockVisibility && STOCK_VISIBILITIES.includes(raw.stockVisibility)
+      ? raw.stockVisibility
+      : 'exact';
+  const restock = normalizeRestock(raw.restock, { quantity, stockMode });
   const itemUuid = String(raw.itemUuid ?? '').trim();
   const snapshot = assertString(raw.snapshot ?? '', 'entry.snapshot', {
     allowEmpty: true,
@@ -245,6 +272,8 @@ export function normalizeInventoryEntry(raw = {}) {
     img: assertString(raw.img ?? '', 'entry.img', { allowEmpty: true }),
     quantity,
     stockMode,
+    stockVisibility,
+    restock,
     price,
     visible: raw.visible === false ? false : true,
     publicDescription: assertString(raw.publicDescription ?? '', 'entry.publicDescription', {
@@ -419,6 +448,203 @@ function resolveNpcs(raw, owner, social, shopId) {
   return { npcs: [], owner: owner };
 }
 
+// ---- M4 shop automation normalization --------------------------------------
+// The shop `automation` object and per-entry restock/stock-visibility fields are
+// validated strictly and fail closed at GM save (a malformed nested field throws
+// rather than dropping data). A shop/entry with no automation fields normalizes
+// to the documented defaults, so existing records load unchanged.
+
+function assertDayIndex(value, label) {
+  return intInRange(value, HOURS_DAY_MIN, HOURS_DAY_MAX, label);
+}
+
+function assertMinuteOfDay(value, label) {
+  return intInRange(value, HOURS_MINUTE_MIN, HOURS_MINUTE_MAX, label);
+}
+
+function assertIntervalSeconds(value, label) {
+  return intInRange(value, AUTOMATION_INTERVAL_MIN, AUTOMATION_INTERVAL_MAX, label);
+}
+
+// A cycle marker is the index of the last cycle a policy has already applied. It
+// may be -1 (nothing applied yet) up to the safe integer ceiling.
+function assertCycleMarker(value, label) {
+  return intInRange(value, -1, Number.MAX_SAFE_INTEGER, label);
+}
+
+function assertAutomationTime(value, label) {
+  if (value == null) return 0;
+  return assertSignedInteger(value, label);
+}
+
+// A travel/restock schedule anchor is a signed world-time second; it may sit in
+// the past so a schedule can start mid-stream without a backward clock.
+function assertAnchorTime(value, label) {
+  if (value == null) return 0;
+  return assertSignedInteger(value, label);
+}
+
+// Local location ids are non-empty, at most REPUTATION_ID_MAX (120) chars, and
+// free of control characters - the same id rule the rest of the schema uses. We
+// de-duplicate while preserving order and cap at TRAVEL_LOCATION_MAX. When travel
+// is enabled, 2..10 unique ids are required; when disabled an empty list is fine.
+function normalizeLocationIds(rawIds, enabled, label) {
+  if (!Array.isArray(rawIds)) rawIds = [];
+  const ids = [];
+  const seen = new Set();
+  for (const id of rawIds) {
+    const v = assertMarketId(id, label);
+    if (seen.has(v)) continue;
+    seen.add(v);
+    ids.push(v);
+    if (ids.length >= TRAVEL_LOCATION_MAX) break;
+  }
+  if (enabled && (ids.length < TRAVEL_LOCATION_MIN || ids.length > TRAVEL_LOCATION_MAX)) {
+    throw new Error(
+      `[market] '${label}' must contain ${TRAVEL_LOCATION_MIN}..${TRAVEL_LOCATION_MAX} unique ids when enabled, got ${ids.length}`
+    );
+  }
+  return ids;
+}
+
+function normalizeHours(raw = {}) {
+  let days;
+  if (Array.isArray(raw.days)) {
+    const seen = new Set();
+    const out = [];
+    for (const d of raw.days) {
+      const v = assertDayIndex(d, 'automation.hours.days[]');
+      if (!seen.has(v)) {
+        seen.add(v);
+        out.push(v);
+      }
+    }
+    days = out;
+  } else {
+    days = [0, 1, 2, 3, 4, 5, 6];
+  }
+  return {
+    enabled: raw.enabled === true ? true : false,
+    days,
+    openMinute: assertMinuteOfDay(raw.openMinute ?? 0, 'automation.hours.openMinute'),
+    closeMinute: assertMinuteOfDay(raw.closeMinute ?? 0, 'automation.hours.closeMinute'),
+  };
+}
+
+function normalizeTravel(raw = {}) {
+  const enabled = raw.enabled === true ? true : false;
+  return {
+    enabled,
+    locationIds: normalizeLocationIds(
+      raw.locationIds,
+      enabled,
+      'automation.travel.locationIds[]'
+    ),
+    anchorTime: assertAnchorTime(raw.anchorTime, 'automation.travel.anchorTime'),
+    intervalSeconds: assertIntervalSeconds(
+      raw.intervalSeconds ?? 86400,
+      'automation.travel.intervalSeconds'
+    ),
+    lastCycle: assertCycleMarker(raw.lastCycle ?? -1, 'automation.travel.lastCycle'),
+  };
+}
+
+function normalizeAutomationEvent(raw = {}) {
+  const startAt = assertAutomationTime(raw.startAt, 'automation.events[].startAt');
+  const endAt = assertAutomationTime(raw.endAt ?? startAt + 1, 'automation.events[].endAt');
+  if (endAt <= startAt) {
+    throw new Error(
+      `[market] 'automation.events[]' endAt must be > startAt, got ${endAt} <= ${startAt}`
+    );
+  }
+  // The event id is validated with the same market-id rule the rest of the
+  // schema uses: a non-empty string, at most REPUTATION_ID_MAX (120) chars, and
+  // free of control characters. An absent/empty id generates a stable new one; an
+  // object or an oversized/control-bearing id fails closed at GM save.
+  const rawId = raw.id;
+  const id =
+    rawId == null || rawId === ''
+      ? makeId()
+      : assertMarketId(rawId, 'automation.events[].id');
+  return {
+    id,
+    title: assertString(raw.title ?? '', 'automation.events[].title', { allowEmpty: true }).slice(
+      0,
+      AUTOMATION_EVENT_TITLE_MAX
+    ),
+    description: assertString(raw.description ?? '', 'automation.events[].description', {
+      allowEmpty: true,
+    }).slice(0, AUTOMATION_EVENT_DESCRIPTION_MAX),
+    startAt,
+    endAt,
+    visible: raw.visible === false ? false : true,
+  };
+}
+
+function normalizeDiagnostics(raw = {}) {
+  const lastRunAt = raw.lastRunAt == null ? null : assertSignedInteger(raw.lastRunAt);
+  return {
+    lastRunAt,
+    lastStatus: assertString(raw.lastStatus ?? 'never', 'automation.diagnostics.lastStatus', {
+      allowEmpty: true,
+    }),
+    lastError: assertString(raw.lastError ?? '', 'automation.diagnostics.lastError', {
+      allowEmpty: true,
+    }),
+    lastRestocked: assertInteger(raw.lastRestocked ?? 0, 'automation.diagnostics.lastRestocked'),
+    lastLocationId: assertString(raw.lastLocationId ?? '', 'automation.diagnostics.lastLocationId', {
+      allowEmpty: true,
+    }),
+  };
+}
+
+/**
+ * Normalize a shop's `automation` object. Every nested block falls back to a
+ * documented default, but a malformed value inside an explicitly supplied block
+ * (an out-of-range day/minute/interval, a non-positive event window, an invalid
+ * location id, an inconsistent interval) throws so a bad GM save fails closed.
+ * Existing records that carry no `automation` field normalize to harmless
+ * defaults (hours/travel disabled, no events).
+ */
+export function normalizeAutomation(raw = {}) {
+  return {
+    hours: normalizeHours(raw.hours),
+    travel: normalizeTravel(raw.travel),
+    events: (Array.isArray(raw.events) ? raw.events : [])
+      .slice(0, MAX_AUTOMATION_EVENTS)
+      .map(normalizeAutomationEvent),
+    diagnostics: normalizeDiagnostics(raw.diagnostics),
+  };
+}
+
+/**
+ * Normalize the per-entry `restock` schedule. A restock is only meaningful for a
+ * finite-stock entry; if the entry is not finite the schedule is disabled even
+ * when the GM toggled it on (the schedule simply never fires). `target` may be
+ * any positive safe integer up to Number.MAX_SAFE_INTEGER and is never forced to
+ * match the current quantity - a GM-edited quantity above the target is left
+ * alone and a scheduled restock never reduces stock.
+ */
+function normalizeRestock(raw = {}, { quantity, stockMode }) {
+  const enabled = raw.enabled === true && stockMode === 'finite' ? true : false;
+  const target = intInRange(
+    raw.target ?? Math.max(RESTOCK_TARGET_MIN, quantity),
+    RESTOCK_TARGET_MIN,
+    Number.MAX_SAFE_INTEGER,
+    'entry.restock.target'
+  );
+  return {
+    enabled,
+    target,
+    intervalSeconds: assertIntervalSeconds(
+      raw.intervalSeconds ?? 86400,
+      'entry.restock.intervalSeconds'
+    ),
+    anchorTime: assertAnchorTime(raw.anchorTime, 'entry.restock.anchorTime'),
+    lastCycle: assertCycleMarker(raw.lastCycle ?? -1, 'entry.restock.lastCycle'),
+  };
+}
+
 export function normalizeShop(raw = {}) {
   const name = assertString(raw.name, 'shop.name');
   const open = raw.open === false ? false : true;
@@ -451,6 +677,7 @@ export function normalizeShop(raw = {}) {
     inventory,
     npcs: resolved.npcs,
     social,
+    automation: normalizeAutomation(raw.automation),
     createdAt,
   };
 }

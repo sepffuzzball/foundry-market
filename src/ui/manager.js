@@ -12,8 +12,11 @@
 import { shopDragData } from '../canvas/placements.js';
 import {
   ACCENT_COLOR_RE,
+  MAX_AUTOMATION_EVENTS,
   MAX_SHOP_NPCS,
   makeId,
+  normalizeAutomation,
+  normalizeInventoryEntry,
   normalizeNpc,
   normalizeShopSocial,
 } from '../services/model.js';
@@ -23,6 +26,23 @@ import { PERSONALITY_IDS, getPersonality } from '../social/personalities.js';
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 
 const CURRENCY_LABELS = { dnd5e: 'cp' };
+
+// M4 weekday labels, indexed by the schema's day index (0 = Monday .. 6 =
+// Sunday). Used only to render the GM's weekly-hours checkerboard.
+const WEEKDAY_LABELS = [
+  'Monday',
+  'Tuesday',
+  'Wednesday',
+  'Thursday',
+  'Friday',
+  'Saturday',
+  'Sunday',
+];
+
+// The `Run now` / `Generate inventory` buttons are only actionable for the active
+// GM (the automation runner and table generator gate on `isActiveGM`). This is
+// the notice shown when a non-active GM presses them.
+const ACTIVE_GM_MESSAGE = 'Only the active Game Master can run automation.';
 
 // The shop-details/appearance form fields whose edits must be captured into the
 // unsaved draft as the GM types. Inventory row fields (price, quantity, stock
@@ -95,6 +115,14 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       'remove-npc': this._action('_onRemoveNpc'),
       'select-reputation-actor': this._action('_onSelectReputationActor'),
       'adjust-reputation': this._action('_onAdjustReputation'),
+      // M4: shop automation editor actions.
+      'save-hours': this._action('_onSaveHours'),
+      'save-travel': this._action('_onSaveTravel'),
+      'add-event': this._action('_onAddEvent'),
+      'remove-event': this._action('_onRemoveEvent'),
+      'save-events': this._action('_onSaveEvents'),
+      'run-automation': this._action('_onRunAutomation'),
+      'generate-inventory': this._action('_onGenerateInventory'),
     },
   };
 
@@ -129,6 +157,12 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       selectedReputationActorId: null,
       selectedReputation: null,
       reputationHistory: [],
+      // M4 GM-only automation editor context. `drawTables` is populated on each
+      // data refresh from `deps.listTables` (or the live game tables/compendium
+      // fallback) so the RollTable generator pull-down never trusts an arbitrary
+      // raw path; the remaining automation context (weekdays, travel options,
+      // event rows, diagnostics) is derived fresh in `_prepareContext`.
+      drawTables: [],
       notice: '',
     };
   }
@@ -216,6 +250,97 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     return fn();
   }
 
+  // ---- M4 automation lazy accessors -----------------------------------------
+
+  /**
+   * Whether the current user is the active GM. The automation runner and the
+   * RollTable generator are wired to gate on the ACTIVE GM (not any GM), so the
+   * manager must reflect the same guard. Tests inject `deps.isActiveGM`; the
+   * runtime falls back to the same predicate main.js uses (this user is the
+   * active GM and a GM).
+   */
+  _isActiveGM() {
+    if (this._deps.isActiveGM) return !!this._deps.isActiveGM();
+    if (!game?.user?.isGM) return false;
+    const active = game?.users?.activeGM;
+    return !!active && game.user.id === active.id;
+  }
+
+  /**
+   * Resolve the current game-world time as a whole second, or 0 when it cannot be
+   * read (an invalid server clock collapses to the documented 0 so a new event
+   * never gets a bogus timestamp). Used only to seed the default event window.
+   */
+  _worldTimeNow() {
+    if (typeof this._deps.now === 'function') {
+      const raw = this._deps.now();
+      if (Number.isFinite(raw)) {
+        const floored = Math.floor(raw);
+        return Number.isSafeInteger(floored) ? floored : 0;
+      }
+      return 0;
+    }
+    const t = game?.time?.worldTime;
+    if (Number.isFinite(t)) {
+      const floored = Math.floor(t);
+      return Number.isSafeInteger(floored) ? floored : 0;
+    }
+    return 0;
+  }
+
+  /**
+   * List the GM-visible RollTables for the inventory generator as plain
+   * `{ uuid, name }` pairs, never a raw document. Tests inject `deps.listTables`;
+   * the runtime fallback reads only the world RollTables (`game.tables`) and
+   * RollTable compendium packs (`game.packs`), each exposed by its stable UUID.
+   */
+  async _listTables() {
+    if (typeof this._deps.listTables === 'function') return this._deps.listTables();
+    const out = [];
+    const seen = new Set();
+    for (const table of game?.tables ?? []) {
+      if (table.uuid && !seen.has(table.uuid)) {
+        seen.add(table.uuid);
+        out.push({ uuid: table.uuid, name: table.name });
+      }
+    }
+    for (const pack of game?.packs ?? []) {
+      if (pack.documentName !== 'RollTable') continue;
+      const docs = await pack.getDocuments();
+      for (const table of docs) {
+        const uuid = table.uuid || `${pack.collection}.${table.id}`;
+        if (seen.has(uuid)) continue;
+        seen.add(uuid);
+        out.push({ uuid, name: table.name });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Run the automation runner for the selected shop. Prefers the injected
+   * `deps.runAutomation` (tests) and otherwise defers to the GM-only API wrapper
+   * `api.automation.runShop`, which in turn re-checks the active GM before any
+   * store read/write.
+   */
+  _runAutomation(shopId) {
+    if (typeof this._deps.runAutomation === 'function') return this._deps.runAutomation(shopId);
+    return this._api()?.automation?.runShop?.(shopId);
+  }
+
+  /**
+   * Generate inventory from a RollTable. Prefers the injected
+   * `deps.generateInventory` (tests) and otherwise defers to the GM-only
+   * `api.generateInventory`, which re-checks the active GM and never trusts
+   * caller-supplied Item data (only the bounded result counters are returned).
+   */
+  _generateInventory(params) {
+    if (typeof this._deps.generateInventory === 'function') {
+      return this._deps.generateInventory(params);
+    }
+    return this._api()?.generateInventory?.(params);
+  }
+
   // ---- M3 social / reputation lazy accessors ---------------------------------
 
   _listActors() {
@@ -282,6 +407,17 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     // captured unsaved draft when one exists so a re-render never resets the GM's
     // in-progress edits. Inventory rows stay bound to the persisted `selectedShop`.
     this._data.editingShop = this._buildEditingShop();
+    // M4: derive the automation editor context fresh from the selected shop so a
+    // re-render never carries a stale weekday/travel/event/diagnostic view. The
+    // weekdays checkerboard, the travel destination options, the event rows and
+    // the sanitized diagnostics are all derived here; `drawTables` is populated
+    // asynchronously on each refresh and only defaulted to [] for safety.
+    this._data.weekdays = this._buildWeekdays();
+    this._data.travelLocationOptions = this._buildTravelLocationOptions();
+    this._data.eventRows = this._buildEventRows();
+    this._data.automationDiagnostics = this._sanitizeDiagnostics();
+    this._data.isActiveGM = this._isActiveGM();
+    if (!Array.isArray(this._data.drawTables)) this._data.drawTables = [];
     return this._data;
   }
 
@@ -324,6 +460,89 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       blurb: meta.blurb,
       cssClass: meta.cssClass,
     };
+  }
+
+  // ---- M4 automation editor context derivation ------------------------------
+
+  /**
+   * Build the weekly-hours checkerboard from the selected shop's declared open
+   * days. Each entry carries the schema day index (0..6), a display label and the
+   * `selected` flag; the template only ever reads these bounded fields.
+   */
+  _buildWeekdays() {
+    const days = Array.isArray(this._data.selectedShop?.automation?.hours?.days)
+      ? this._data.selectedShop.automation.hours.days
+      : [];
+    return WEEKDAY_LABELS.map((label, id) => ({
+      id,
+      label,
+      selected: days.includes(id),
+    }));
+  }
+
+  /**
+   * Build the travel destination options from the current locations list. Each
+   * option carries the location id/name plus a `selected` flag against the
+   * shop's configured travel location ids. Only the plain location fields are
+   * projected - no internal record leaks into the template.
+   */
+  _buildTravelLocationOptions() {
+    const travel = this._data.selectedShop?.automation?.travel || {};
+    const ids = Array.isArray(travel.locationIds) ? travel.locationIds : [];
+    return (this._data.locations || []).map((loc) => ({
+      id: loc.id,
+      name: loc.name,
+      selected: ids.includes(loc.id),
+    }));
+  }
+
+  /**
+   * Build the event editor rows from the selected shop's automation events. Each
+   * row is a plain copy of the persisted event with its numeric world-time
+   * window, so the number inputs bind to the stored seconds rather than any
+   * locale date string.
+   */
+  _buildEventRows() {
+    const events = Array.isArray(this._data.selectedShop?.automation?.events)
+      ? this._data.selectedShop.automation.events
+      : [];
+    return events.map((e) => ({
+      id: e.id,
+      title: e.title,
+      description: e.description,
+      startAt: e.startAt,
+      endAt: e.endAt,
+      visible: e.visible !== false,
+    }));
+  }
+
+  /**
+   * Sanitize the persisted automation diagnostics for the template. Only the
+   * documented fields are projected and each is defensively coerced to its type;
+   * a malformed persisted value can never crash the render or leak a raw record.
+   */
+  _sanitizeDiagnostics() {
+    const d = this._data.selectedShop?.automation?.diagnostics || {};
+    return {
+      lastRunAt: this._formatDateTime(d.lastRunAt),
+      lastStatus: typeof d.lastStatus === 'string' && d.lastStatus !== '' ? d.lastStatus : 'never',
+      lastRestocked: Number.isSafeInteger(d.lastRestocked) ? d.lastRestocked : 0,
+      lastLocationId: typeof d.lastLocationId === 'string' ? d.lastLocationId : '',
+      lastError: typeof d.lastError === 'string' && d.lastError !== '' ? d.lastError : '',
+    };
+  }
+
+  /**
+   * Format a world-time whole-second value as `YYYY-MM-DD HH:mm`, or '' when the
+   * value is null/absent (no run yet) or not a valid timestamp.
+   */
+  _formatDateTime(ts) {
+    if (ts == null) return '';
+    const n = Number(ts);
+    if (!Number.isFinite(n)) return '';
+    const d = new Date(n * 1000);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toISOString().slice(0, 16).replace('T', ' ');
   }
 
   async _onRender(event) {
@@ -391,6 +610,14 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       previewShop: null,
       notice: '',
     };
+    // M4: refresh the GM-visible RollTable list for the inventory generator. This
+    // is a best-effort read that never blocks the manager; a failure simply leaves
+    // the pull-down empty rather than surfacing a hard error.
+    try {
+      this._data.drawTables = await this._listTables();
+    } catch (err) {
+      this._data.drawTables = [];
+    }
     // M3: refresh the reputation-actor selector and, when a character is still
     // selected, re-read their (GM-only) effective reputation and recent history
     // so the editor never shows a stale record for a different actor/shop.
@@ -530,31 +757,87 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     if (price == null || quantity == null || !stockMode) return;
     const shopId = this._data.selectedShopId;
     if (!shopId) return;
+    let failed = false;
+    let message = '';
     // Re-read the shop inside the shared per-shop lock and alter only the
     // target entry, so a concurrent purchase's stock decrement is never lost.
     await this._withShopLock(shopId, async () => {
       const shop = await this._store.findShop(shopId);
       if (!shop) {
-        this._data.notice = 'Shop not found when saving.';
+        message = 'Shop not found when saving.';
         return;
       }
-      const inventory = shop.inventory.map((e) =>
-        e.id === entryId
-          ? {
-              ...e,
-              price,
-              quantity,
-              stockMode,
-              visible: visible !== false,
-              publicDescription,
-              category,
-              rarity,
-            }
-          : e
-      );
+      const existing = shop.inventory.find((e) => e.id === entryId);
+      if (!existing) {
+        message = 'Item not found when saving.';
+        return;
+      }
+      const nextEntry = {
+        ...existing,
+        price,
+        quantity,
+        stockMode,
+        visible: visible !== false,
+        publicDescription,
+        category,
+        rarity,
+      };
+      // M4 per-entry stock visibility + restock are captured ONLY when the row
+      // actually carries the controls. Older tests/fixtures omit them, so the
+      // persisted value is preserved rather than reset to a default.
+      const stockVisibility = this._readFieldIn(tr, 'stockVisibility');
+      if (stockVisibility != null && stockVisibility !== '') {
+        nextEntry.stockVisibility = stockVisibility;
+      }
+      let hasRestockControls = false;
+      let identityChanged = false;
+      const restock = {
+        ...(existing.restock || {}),
+        lastCycle: existing.restock?.lastCycle ?? -1,
+      };
+      if (this._hasField(tr, 'restockEnabled')) {
+        hasRestockControls = true;
+        const v = this._readChecked(tr, 'restockEnabled');
+        if (v !== (restock.enabled || false)) identityChanged = true;
+        restock.enabled = v;
+      }
+      const restockTarget = this._readNumber(tr, 'restockTarget');
+      if (restockTarget != null) {
+        hasRestockControls = true;
+        if (restockTarget !== restock.target) identityChanged = true;
+        restock.target = restockTarget;
+      }
+      const restockAnchorTime = this._readNumber(tr, 'restockAnchorTime');
+      if (restockAnchorTime != null) {
+        hasRestockControls = true;
+        if (restockAnchorTime !== (restock.anchorTime ?? 0)) identityChanged = true;
+        restock.anchorTime = restockAnchorTime;
+      }
+      const restockIntervalSeconds = this._readNumber(tr, 'restockIntervalSeconds');
+      if (restockIntervalSeconds != null) {
+        hasRestockControls = true;
+        if (restockIntervalSeconds !== (restock.intervalSeconds ?? 86400)) identityChanged = true;
+        restock.intervalSeconds = restockIntervalSeconds;
+      }
+      if (identityChanged) restock.lastCycle = -1;
+      if (hasRestockControls) nextEntry.restock = restock;
+      let normalized;
+      try {
+        normalized = normalizeInventoryEntry(nextEntry);
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Invalid inventory entry.';
+        this.render({ force: true });
+        return;
+      }
+      const inventory = shop.inventory.map((e) => (e.id === entryId ? normalized : e));
       await this._store.updateShop(shopId, { inventory });
     });
+    if (failed) return;
     await this._refreshData();
+    this._data.notice = message;
     this.render({ force: true });
   }
 
@@ -573,6 +856,432 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     });
     await this._refreshData();
     this.render({ force: true });
+  }
+
+  // ---- M4 shop automation editor handlers --------------------------------------
+
+  /**
+   * Resolve the automation editor card (hours/travel) from the live element,
+   * falling back to the event target's closest card when the element is not yet
+   * attached (e.g. in a unit test). This keeps every read scoped to exactly the
+   * hours or travel card, so a same-named input elsewhere can never contaminate
+   * the save.
+   */
+  _automationCard(target, className) {
+    const fromElement = this.element?.querySelector?.(className);
+    if (fromElement) return fromElement;
+    return target?.closest?.(className) || null;
+  }
+
+  /**
+   * Read every checked value of `name` within `scope`. Returns the raw values in
+   * DOM order so a weekday/travel checkerboard can be captured as authored.
+   */
+  _readCheckedValues(scope, name) {
+    if (!scope || typeof scope.querySelectorAll !== 'function') return [];
+    const out = [];
+    scope.querySelectorAll(`[name="${name}"]`).forEach((el) => {
+      if (el.checked) out.push(el.value);
+    });
+    return out;
+  }
+
+  /**
+   * Save the weekly-hours card. Reads ONLY the `.automation-hours` card (the
+   * enabled checkbox, the checked weekday day indices, and the open/close
+   * minutes), then re-reads the shop inside the shared per-shop lock and patches
+   * `automation.hours` only - never travel/events/diagnostics. The hour values
+   * are strict safe integers validated by `normalizeAutomation`; an invalid value
+   * surfaces a notice and leaves the form (and the shop) untouched.
+   */
+  async _onSaveHours(event, target, data) {
+    const card = this._automationCard(target, '.automation-hours');
+    if (!card) return;
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    const enabled = this._readChecked(card, 'hoursEnabled');
+    const days = this._readCheckedValues(card, 'hoursDay').map((v) => Number(v));
+    const openMinute = this._readNumber(card, 'openMinute');
+    const closeMinute = this._readNumber(card, 'closeMinute');
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when saving hours.';
+        return;
+      }
+      let nextAutomation;
+      try {
+        nextAutomation = normalizeAutomation({
+          ...shop.automation,
+          hours: { enabled, days, openMinute, closeMinute },
+        });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Invalid opening hours.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { automation: nextAutomation });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Save the travel card. Reads ONLY the `.automation-travel` card (enabled,
+   * selected destination location ids, anchor time and interval), validates the
+   * selected ids against a FRESH `store.listLocations()` before any write, then
+   * re-reads and patches `automation.travel` only - the shop's own `locationId`
+   * is left untouched so a travel shop keeps trading at its base location until
+   * the runner moves it. When the schedule identity (enabled/ids/anchor/interval)
+   * changes the cycle marker is reset to -1 (the schedule restarts), otherwise the
+   * preserved `lastCycle` is kept so a running schedule is never rewound.
+   */
+  async _onSaveTravel(event, target, data) {
+    const card = this._automationCard(target, '.automation-travel');
+    if (!card) return;
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    const enabled = this._readChecked(card, 'travelEnabled');
+    const selectedIds = this._readCheckedValues(card, 'travelLocationId');
+    const anchorTime = this._readNumber(card, 'travelAnchorTime');
+    const intervalSeconds = this._readNumber(card, 'travelIntervalSeconds');
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when saving travel.';
+        return;
+      }
+      // Validate the selected destinations against the CURRENT location list, not
+      // a cached one, so a deleted/renamed location can never be written.
+      let locations;
+      try {
+        locations = await this._store.listLocations();
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Could not read locations for travel.';
+        this.render({ force: true });
+        return;
+      }
+      const validIds = new Set((locations || []).map((loc) => loc.id));
+      const unknown = selectedIds.filter((id) => !validIds.has(id));
+      if (unknown.length) {
+        failed = true;
+        this._data.notice = `Unknown travel destination: ${unknown.join(', ')}`;
+        this.render({ force: true });
+        return;
+      }
+      const existingTravel = shop.automation?.travel || {};
+      const existingIds = Array.isArray(existingTravel.locationIds) ? existingTravel.locationIds : [];
+      const identityChanged =
+        enabled !== (existingTravel.enabled || false) ||
+        JSON.stringify(selectedIds) !== JSON.stringify(existingIds) ||
+        anchorTime !== (existingTravel.anchorTime ?? 0) ||
+        intervalSeconds !== (existingTravel.intervalSeconds ?? 86400);
+      const rawTravel = {
+        enabled,
+        locationIds: selectedIds,
+        anchorTime,
+        intervalSeconds,
+        lastCycle: identityChanged ? -1 : (existingTravel.lastCycle ?? -1),
+      };
+      let nextAutomation;
+      try {
+        nextAutomation = normalizeAutomation({ ...shop.automation, travel: rawTravel });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Invalid travel schedule.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { automation: nextAutomation });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Add a new market event. Under the shared per-shop lock the event is appended
+   * to the shop's automation events (capped at MAX_AUTOMATION_EVENTS), seeded with
+   * a fresh id, a "New event" placard and a 24h window starting at the current
+   * valid world time (or 0 when the clock is unreadable). Visibility defaults to
+   * false so a just-added event never appears on the storefront until the GM
+   * saves it visible.
+   */
+  async _onAddEvent(event, target, data) {
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when adding an event.';
+        return;
+      }
+      const events = Array.isArray(shop.automation?.events) ? shop.automation.events : [];
+      if (events.length >= MAX_AUTOMATION_EVENTS) {
+        message = 'A shop can have at most ten events.';
+        return;
+      }
+      const startAt = this._worldTimeNow();
+      const defaultEvent = {
+        id: makeId(),
+        title: 'New event',
+        description: '',
+        startAt,
+        endAt: startAt + 86400,
+        visible: false,
+      };
+      let nextAutomation;
+      try {
+        nextAutomation = normalizeAutomation({
+          ...shop.automation,
+          events: [...events, defaultEvent],
+        });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Could not add the event.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { automation: nextAutomation });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Remove a single market event by id, under the shared per-shop lock. Only the
+   * matching event is dropped; other events, diagnostics, travel and hours are
+   * carried through unchanged.
+   */
+  async _onRemoveEvent(event, target, data) {
+    const eventId = target?.dataset?.eventId || data?.dataset?.eventId;
+    if (!eventId) return;
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when removing an event.';
+        return;
+      }
+      const events = Array.isArray(shop.automation?.events) ? shop.automation.events : [];
+      let nextAutomation;
+      try {
+        nextAutomation = normalizeAutomation({
+          ...shop.automation,
+          events: events.filter((e) => e.id !== eventId),
+        });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Could not remove the event.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { automation: nextAutomation });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Save every event editor row. Each `[data-event-id]` fieldset is read for its
+   * title, description, numeric world-time start/end and visibility, validated via
+   * `normalizeAutomation`, then patched as `automation.events` only - diagnostics,
+   * travel and hours are preserved. Edits are merged by id into the freshly
+   * re-read persisted event list, so an event added concurrently (or otherwise
+   * absent from the DOM) is never dropped. A DOM row whose id is not in the
+   * persisted list fails closed (an error notice, no write) rather than creating
+   * or overwriting a record; on a validation error the notice is shown and the
+   * unsaved form is left intact (no data refresh, no write).
+   */
+  async _onSaveEvents(event, target, data) {
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    const root = this.element;
+    const editors =
+      root && typeof root.querySelectorAll === 'function'
+        ? Array.from(root.querySelectorAll('.event-editor-list [data-event-id]'))
+        : [];
+    const rawEvents = editors.map((ed) => ({
+      id: ed.dataset.eventId,
+      title: ed.querySelector('[name="eventTitle"]')?.value ?? '',
+      description: ed.querySelector('[name="eventDescription"]')?.value ?? '',
+      startAt: this._readNumber(ed, 'eventStartAt'),
+      endAt: this._readNumber(ed, 'eventEndAt'),
+      visible: !!ed.querySelector('[name="eventVisible"]')?.checked,
+    }));
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when saving events.';
+        return;
+      }
+      const persisted = Array.isArray(shop.automation?.events) ? shop.automation.events : [];
+      const persistedIds = new Set(persisted.map((e) => e.id));
+      // Fail closed on a DOM row whose id is not in the freshly re-read persisted
+      // list: never create (or overwrite) from a forged id. Nothing is written.
+      const unknown = rawEvents.find((e) => !persistedIds.has(e.id));
+      if (unknown) {
+        failed = true;
+        this._data.notice =
+          'One of the event rows no longer matches a saved event, so nothing was saved.';
+        this.render({ force: true });
+        return;
+      }
+      // Merge edits by id into the freshly re-read persisted list, so an event
+      // added concurrently (or otherwise absent from the DOM) is never dropped.
+      const editsById = new Map(rawEvents.map((e) => [e.id, e]));
+      const merged = persisted.map((e) =>
+        editsById.has(e.id) ? { ...e, ...editsById.get(e.id) } : { ...e }
+      );
+      let nextAutomation;
+      try {
+        nextAutomation = normalizeAutomation({ ...shop.automation, events: merged });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Invalid event data.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { automation: nextAutomation });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Run the shop automation on demand. Guarded on the active GM (the runner is
+   * wired to gate on it, so a non-active GM pressing the button gets a notice and
+   * no store read), then delegates to the injected `deps.runAutomation` or the
+   * `api.automation.runShop` wrapper. A summary/error is shown in the notice and
+   * the data is refreshed so the diagnostics panel reflects the fresh run.
+   */
+  async _onRunAutomation(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let result;
+    try {
+      result = await this._runAutomation(shopId);
+    } catch (err) {
+      this._data.notice = `Automation run failed: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    this._noticeForAutomation(result);
+    await this._refreshData();
+    this.render({ force: true });
+  }
+
+  /**
+   * Generate inventory from a RollTable on demand. Guarded on the active GM (the
+   * generator is wired to gate on it), reads `tableUuid`/`drawCount` from the
+   * `.table-generation` form, validates the count is 1..20, then delegates to the
+   * injected `deps.generateInventory` or the `api.generateInventory` wrapper. The
+   * result summary (added/skipped/invalid/duplicate) is shown and never trusts
+   * client Item data - only the bounded counters the service returns.
+   */
+  async _onGenerateInventory(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    const form = this.element?.querySelector?.('.table-generation');
+    if (!form) return;
+    const tableUuid = this._readFieldIn(form, 'rollTableUuid');
+    const drawCount = this._readNumber(form, 'drawCount');
+    if (drawCount == null || drawCount < 1 || drawCount > 20) {
+      this._data.notice = 'Draw count must be between 1 and 20.';
+      this.render({ force: true });
+      return;
+    }
+    if (!tableUuid) {
+      this._data.notice = 'Choose a roll table to generate from.';
+      this.render({ force: true });
+      return;
+    }
+    let result;
+    try {
+      result = await this._generateInventory({ shopId, tableUuid, count: drawCount });
+    } catch (err) {
+      this._data.notice = `Inventory generation failed: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    this._noticeForGeneration(result);
+    await this._refreshData();
+    this.render({ force: true });
+  }
+
+  _noticeForAutomation(result) {
+    if (!result) {
+      this._data.notice = 'Automation run returned no result.';
+    } else if (result.status === 'ok') {
+      this._data.notice = `Automation ran: ${result.restocked || 0} restocked.`;
+    } else if (result.status === 'error') {
+      this._data.notice = `Automation failed: ${result.error || 'unknown'}.`;
+    } else if (result.status === 'idle') {
+      this._data.notice = 'Automation is idle.';
+    } else {
+      this._data.notice = `Automation result: ${result.status || 'unknown'}.`;
+    }
+  }
+
+  _noticeForGeneration(result) {
+    if (!result) {
+      this._data.notice = 'Inventory generation returned no result.';
+    } else if (result.status === 'ok') {
+      this._data.notice =
+        `Generated: ${result.added || 0} added, ` +
+        `${result.skipped || 0} skipped, ${result.invalid || 0} invalid, ` +
+        `${result.duplicate || 0} duplicate.`;
+    } else if (result.status === 'error') {
+      this._data.notice = `Inventory generation failed: ${result.error || 'unknown'}.`;
+    } else if (result.status === 'idle') {
+      this._data.notice = 'Inventory generation is idle.';
+    } else {
+      this._data.notice = `Inventory generation result: ${result.status || 'unknown'}.`;
+    }
   }
 
   async _onPlaceShop(event, target, data) {
@@ -782,6 +1491,10 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
 
   _readChecked(scope, name) {
     return !!scope?.querySelector?.(`[name="${name}"]`)?.checked;
+  }
+
+  _hasField(scope, name) {
+    return !!scope?.querySelector?.(`[name="${name}"]`);
   }
 
   /**

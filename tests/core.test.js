@@ -1829,3 +1829,492 @@ test('a legacy commerce (no getSocial) keeps the original integer quote and a nu
   assert.equal(ledger.totalPrice, 200);
   assert.equal(ledger.priceBreakdown, null);
 });
+
+// -------------------------------------------------------- M4 trading/presence
+
+test('a shop outside its declared hours rejects the sale before any charge', async () => {
+  const store = createMockStore();
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    automation: {
+      hours: { enabled: true, days: [0, 1, 2, 3, 4, 5, 6], openMinute: 540, closeMinute: 1020 },
+    },
+    inventory: [
+      normalizeInventoryEntry({
+        id: 'entry1',
+        itemUuid: 'u1',
+        name: 'Potion',
+        price: 100,
+        quantity: 10,
+      }),
+    ],
+  });
+  store._shops.set('shop1', shop);
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    getWorldTime: () => 64800, // Mon 18:00, past the 17:00 close
+  });
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error, 'shop-closed');
+  assert.equal(actor.system.currency.gp, 5, 'no debit before close');
+  assert.equal(actor.items.length, 0, 'no delivery before close');
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'failed');
+  assert.equal(ledger.error, 'shop-closed');
+});
+
+test('a manually open shop whose travelling merchant has not arrived rejects before charge', async () => {
+  const store = createMockStore();
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'Traveller',
+    locationId: 'base',
+    open: true,
+    automation: {
+      travel: {
+        enabled: true,
+        locationIds: ['a', 'b'],
+        anchorTime: 1000,
+        intervalSeconds: 3600,
+        lastCycle: -1,
+      },
+    },
+    inventory: [
+      normalizeInventoryEntry({
+        id: 'entry1',
+        itemUuid: 'u1',
+        name: 'Potion',
+        price: 100,
+        quantity: 10,
+      }),
+    ],
+  });
+  store._shops.set('shop1', shop);
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    getWorldTime: () => 500, // before the travel anchor => not arrived
+  });
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error, 'shop-closed');
+  assert.equal(actor.system.currency.gp, 5, 'no debit before arrival');
+  assert.equal(actor.items.length, 0, 'no delivery before arrival');
+});
+
+test('a shop trading normally at world time still commits (getWorldTime path is not over-restrictive)', async () => {
+  const store = createMockStore();
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    automation: {
+      hours: { enabled: true, days: [0, 1, 2, 3, 4, 5, 6], openMinute: 540, closeMinute: 1020 },
+    },
+    inventory: [
+      normalizeInventoryEntry({
+        id: 'entry1',
+        itemUuid: 'u1',
+        name: 'Potion',
+        price: 100,
+        quantity: 10,
+      }),
+    ],
+  });
+  store._shops.set('shop1', shop);
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    getWorldTime: () => 36000, // Mon 10:00, inside the 09:00-17:00 window
+  });
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+  assert.equal(result.total, 100);
+});
+
+test('an invalid getWorldTime fails the purchase closed before any debit', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const badTimes = [
+    Number.NaN,
+    undefined,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ];
+  for (const bad of badTimes) {
+    const commerce = createCommerce({
+      ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+      getWorldTime: () => bad,
+    });
+    const result = await commerce.purchase(
+      { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+      'gm1'
+    );
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error, 'invalid-world-time');
+    assert.equal(actor.system.currency.gp, 5, 'no debit for an invalid world time');
+    assert.equal(actor.items.length, 0, 'no delivery for an invalid world time');
+    const shop = store._shops.get('shop1');
+    assert.equal(shop.inventory[0].quantity, 10, 'stock unchanged for an invalid world time');
+  }
+});
+
+// ---------------------------------------------- M4 public catalog + stockView
+
+test('base catalog projects a non-exact entry without leaking the true count', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Low', price: 10, quantity: 3, stockVisibility: 'low' }),
+      normalizeInventoryEntry({ id: 'e2', itemUuid: 'u2', name: 'Hidden', price: 20, quantity: 0, stockVisibility: 'hidden' }),
+      normalizeInventoryEntry({ id: 'e3', itemUuid: 'u3', name: 'Exact', price: 30, quantity: 5, stockVisibility: 'exact' }),
+    ],
+  });
+  const catalog = buildCatalog(shop, { worldTime: 3600 });
+  const byId = Object.fromEntries(catalog.inventory.map((e) => [e.id, e]));
+  const low = byId.e1;
+  assert.equal(low.quantity, null, 'low entry hides the exact count');
+  assert.equal(low.stockLabel, 'Low stock');
+  assert.equal(low.available, true);
+  assert.ok(!('stockVisibility' in low), 'stockVisibility not leaked');
+  assert.ok(!('restock' in low), 'restock not leaked');
+  const hidden = byId.e2;
+  assert.equal(hidden.quantity, null, 'hidden entry hides the count at zero stock');
+  assert.equal(hidden.stockLabel, 'Out of stock');
+  assert.equal(hidden.available, false);
+  const exact = byId.e3;
+  assert.equal(exact.quantity, 5, 'exact entry keeps the true count');
+  assert.equal(exact.available, true);
+});
+
+test('personalized catalog projects non-exact stock without leaking the count and refuses zero stock', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Low', price: 10, quantity: 3, stockVisibility: 'low', visible: true }),
+      normalizeInventoryEntry({ id: 'e2', itemUuid: 'u2', name: 'Hidden', price: 20, quantity: 0, stockVisibility: 'hidden', visible: true }),
+      normalizeInventoryEntry({ id: 'e3', itemUuid: 'u3', name: 'Exact', price: 30, quantity: 5, stockVisibility: 'exact', visible: true }),
+    ],
+  });
+  const store = { findShop: async () => shop };
+  const ctx = {
+    ...makeSocialCatalogCtx({
+      store,
+      getActor: async () => ({ uuid: 'Actor.a1' }),
+      getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+    }),
+    worldTime: () => 3600,
+  };
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-m4' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'catalog');
+  const byId = Object.fromEntries(data.inventory.map((e) => [e.id, e]));
+  const low = byId.e1;
+  assert.equal(low.quantity, null, 'low entry hides the count');
+  assert.equal(low.available, true);
+  assert.equal(low.canBuy, true, 'in-stock low entry is buyable');
+  const hidden = byId.e2;
+  assert.equal(hidden.quantity, null, 'hidden entry hides the count at zero stock');
+  assert.equal(hidden.available, false);
+  assert.equal(hidden.canBuy, false, 'zero-stock entry is not buyable');
+  const exact = byId.e3;
+  assert.equal(exact.quantity, 5, 'exact entry keeps the true count');
+  assert.ok(!('stockVisibility' in low), 'stockVisibility not leaked');
+  assert.ok(!('restock' in low), 'restock not leaked');
+});
+
+test('catalog only exposes visible active market events, sanitized', () => {
+  const worldTime = 5000;
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    automation: {
+      events: [
+        { id: 'ev1', title: 'Sale', description: '20% off', startAt: 4000, endAt: 6000, visible: true },
+        { id: 'ev2', title: 'Hidden event', description: 'secret', startAt: 4500, endAt: 5500, visible: false },
+        { id: 'ev3', title: 'Future', description: 'later', startAt: 8000, endAt: 9000, visible: true },
+      ],
+    },
+    inventory: [],
+  });
+  const catalog = buildCatalog(shop, { worldTime });
+  assert.deepEqual(catalog.shop.marketEvents, [
+    { id: 'ev1', title: 'Sale', description: '20% off' },
+  ]);
+});
+
+test('catalog without a world time keeps legacy open/location and an empty marketEvents', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    automation: {
+      hours: { enabled: true, days: [0, 1, 2, 3, 4, 5, 6], openMinute: 540, closeMinute: 1020 },
+      events: [{ id: 'ev1', title: 'Sale', description: 'x', startAt: 0, endAt: 1000, visible: true }],
+    },
+    inventory: [],
+  });
+  const catalog = buildCatalog(shop);
+  assert.equal(catalog.shop.open, true, 'legacy open preserved without a time');
+  assert.equal(catalog.shop.locationId, 'loc1', 'legacy location preserved without a time');
+  assert.deepEqual(catalog.shop.marketEvents, [], 'no time => no market events');
+  assert.ok(!('closedReason' in catalog.shop), 'no closedReason without a time');
+});
+
+test('catalog with a present-but-invalid ctx.worldTime fails closed as a correlated server-error', async () => {
+  const shop = normalizeShop({ id: 'shop1', name: 'S', locationId: 'loc1', open: true, inventory: [] });
+  const store = { findShop: async () => shop };
+  const badTimes = [
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+    undefined,
+  ];
+  for (const bad of badTimes) {
+    const ctx = makeSocialCatalogCtx({ store });
+    ctx.worldTime = () => bad;
+    const data = await handleMarketChatMessage(
+      makeCatalogMessage({ shopId: 'shop1', requestId: 'cat-bad-time' }),
+      'user1',
+      ctx
+    );
+    assert.equal(data.type, 'error');
+    assert.equal(data.error, 'server-error');
+    assert.equal(data.requestId, 'cat-bad-time', 'correlation echoes the request id');
+    assert.equal(data.shopId, 'shop1', 'correlation echoes the shop id');
+    assert.ok(!('inventory' in data), 'no catalog is projected on an invalid time');
+    assert.ok(!('shop' in data), 'no shop projection is sent on an invalid time');
+  }
+});
+
+test('public market events project only a validated scalar string id', () => {
+  // An unnormalized fixture whose event ids include an object and a control char
+  // must project a safe scalar id, never `[object Object]`.
+  const raw = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    automation: {
+      events: [
+        { id: { nested: 'bad' }, title: 'A', description: 'x', startAt: 0, endAt: 100, visible: true },
+        { id: 'bad\nid', title: 'C', description: 'z', startAt: 0, endAt: 100, visible: true },
+        { id: 'ev-good', title: 'B', description: 'y', startAt: 0, endAt: 100, visible: true },
+      ],
+    },
+    inventory: [],
+  };
+  const catalog = buildCatalog(raw, { worldTime: 50 });
+  assert.deepEqual(catalog.shop.marketEvents, [
+    { id: '', title: 'A', description: 'x' },
+    { id: '', title: 'C', description: 'z' },
+    { id: 'ev-good', title: 'B', description: 'y' },
+  ]);
+});
+
+// ---------------------------------------------- M4 public catalog location name
+
+test('catalog resolves a travel-active shop locationName from the projected locationId', () => {
+  const worldTime = 5000;
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'base',
+    open: true,
+    inventory: [],
+    automation: {
+      travel: { enabled: true, locationIds: ['a', 'b'], anchorTime: 0, intervalSeconds: 3600, lastCycle: 0 },
+    },
+  });
+  const locations = [
+    { id: 'a', name: 'Alpha' },
+    { id: 'b', name: 'Beta' },
+  ];
+  const catalog = buildCatalog(shop, { worldTime, locations });
+  assert.equal(catalog.shop.locationId, 'b', 'travel rotation is projected');
+  assert.equal(catalog.shop.locationName, 'Beta', 'safe name resolved for the projected location');
+  // Only the single resolved string is exposed, never the location list or the
+  // private travel config.
+  assert.ok(!('locations' in catalog.shop), 'the location list is never exposed');
+  assert.ok(!('travel' in catalog.shop), 'travel config is never exposed');
+});
+
+test('catalog bounds locationName to 100 characters', () => {
+  const worldTime = 5000;
+  const long = 'x'.repeat(250);
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'base',
+    open: true,
+    inventory: [],
+    automation: {
+      travel: { enabled: true, locationIds: ['a', 'b'], anchorTime: 0, intervalSeconds: 3600, lastCycle: 0 },
+    },
+  });
+  // At worldTime 5000 with a 3600 interval the projected cycle is 1, which rotates
+  // to 'b'. Bound its name to 100 chars.
+  const catalog = buildCatalog(shop, { worldTime, locations: [{ id: 'b', name: long }] });
+  assert.equal(catalog.shop.locationId, 'b');
+  assert.equal(catalog.shop.locationName.length, 100);
+  assert.equal(catalog.shop.locationName, long.slice(0, 100));
+});
+
+test('catalog uses an empty locationName when the projected location is not in the list', () => {
+  const worldTime = 5000;
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'base',
+    open: true,
+    inventory: [],
+    automation: {
+      travel: { enabled: true, locationIds: ['a', 'b'], anchorTime: 0, intervalSeconds: 3600, lastCycle: 0 },
+    },
+  });
+  // 'b' is projected but absent from the location list.
+  const catalog = buildCatalog(shop, { worldTime, locations: [{ id: 'a', name: 'Alpha' }] });
+  assert.equal(catalog.shop.locationId, 'b');
+  assert.equal(catalog.shop.locationName, '', 'no stale base name when the rotate target is unknown');
+});
+
+test('a failed listLocations read fails the catalog closed as a correlated server-error', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'base',
+    open: true,
+    inventory: [],
+    automation: {
+      travel: { enabled: true, locationIds: ['a', 'b'], anchorTime: 0, intervalSeconds: 3600, lastCycle: 0 },
+    },
+  });
+  const store = {
+    findShop: async () => shop,
+    async listLocations() {
+      throw new Error('locations read failed');
+    },
+  };
+  const ctx = makeSocialCatalogCtx({ store });
+  ctx.worldTime = () => 5000;
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', requestId: 'cat-loc-err' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'error');
+  assert.equal(data.error, 'server-error');
+  assert.equal(data.shopId, 'shop1', 'correlation echoes the shop id');
+  assert.ok(!('shop' in data), 'no catalog is projected on a failed location read');
+});
+
+test('catalog sets an empty locationName in a legacy context without listLocations (base and personalized)', async () => {
+  const shop = normalizeShop({ id: 'shop1', name: 'S', locationId: 'loc1', open: true, inventory: [] });
+  const store = { findShop: async () => shop };
+
+  // Base path (no actor).
+  const baseCtx = makeSocialCatalogCtx({ store });
+  baseCtx.worldTime = () => 5000;
+  const baseData = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', requestId: 'base-no-loc' }),
+    'user1',
+    baseCtx
+  );
+  assert.equal(baseData.type, 'catalog');
+  assert.equal(baseData.shop.locationName, '');
+
+  // Personalized path (with an owned actor).
+  const persCtx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  persCtx.worldTime = () => 5000;
+  const persData = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'pers-no-loc' }),
+    'user1',
+    persCtx
+  );
+  assert.equal(persData.type, 'catalog');
+  assert.equal(persData.shop.locationName, '');
+});
+
+test('allowlist includes locationName and both catalog variants stay allowlisted', async () => {
+  assert.ok(PUBLIC_SHOP_FIELDS.includes('locationName'));
+
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'base',
+    open: true,
+    inventory: [],
+    automation: {
+      travel: { enabled: true, locationIds: ['a', 'b'], anchorTime: 0, intervalSeconds: 3600, lastCycle: 0 },
+    },
+  });
+  const store = {
+    findShop: async () => shop,
+    async listLocations() {
+      return [{ id: 'b', name: 'Alpha' }];
+    },
+  };
+
+  // Base variant.
+  const baseCtx = makeSocialCatalogCtx({ store });
+  baseCtx.worldTime = () => 5000;
+  const baseData = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', requestId: 'allow-base' }),
+    'user1',
+    baseCtx
+  );
+  assert.equal(baseData.type, 'catalog');
+  assert.equal(baseData.shop.locationId, 'b');
+  assert.equal(baseData.shop.locationName, 'Alpha');
+  assert.ok(Object.keys(baseData.shop).every((k) => PUBLIC_SHOP_FIELDS.includes(k)));
+
+  // Personalized variant.
+  const persCtx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  persCtx.worldTime = () => 5000;
+  const persData = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'allow-pers' }),
+    'user1',
+    persCtx
+  );
+  assert.equal(persData.type, 'catalog');
+  assert.equal(persData.shop.locationName, 'Alpha');
+  assert.ok(Object.keys(persData.shop).every((k) => PUBLIC_SHOP_FIELDS.includes(k)));
+});

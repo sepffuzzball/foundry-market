@@ -2,7 +2,7 @@
   "id": "market",
   "title": "Foundry Market",
   "description": "A market core for Foundry VTT v14: locations, shops and inventory persisted in GM-only JournalEntry flags, GM-executed purchase transactions with a per-shop queue and idempotent ledger, and system adapters for wallet and item price reading/writing.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "compatibility": {
     "minimum": "14",
     "verified": "14",
@@ -17,7 +17,7 @@
   },
   "manifest": "https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json",
   "url": "https://github.com/sepffuzzball/foundry-market",
-  "download": "https://github.com/sepffuzzball/foundry-market/releases/download/0.1.2/module.zip",
+  "download": "https://github.com/sepffuzzball/foundry-market/releases/download/0.1.3/module.zip",
   "authors": [
     {
       "name": "Foundry Market"

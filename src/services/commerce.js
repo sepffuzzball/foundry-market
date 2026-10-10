@@ -18,6 +18,7 @@ import {
 } from './model.js';
 import { quote } from './pricing.js';
 import { quoteSocial as defaultQuoteSocial } from '../social/pricing.js';
+import { isShopTrading } from '../automation/policy.js';
 
 export function fnv1a(str) {
   let hash = 0x811c9dc5;
@@ -84,6 +85,22 @@ function shopLockKey(shopId) {
 }
 
 /**
+ * Resolve a `getWorldTime()` result to a safe integer second, or null when the
+ * clock value is invalid (NaN/undefined/Infinity/non-safe). The runtime never
+ * trusts a client clock; an invalid server time must fail the purchase closed as
+ * `invalid-world-time` before any debit rather than collapse to 0 (Monday 00:00)
+ * and silently trade. Only used on the opt-in `getWorldTime` path; the legacy
+ * path never reads this.
+ */
+function safeWorldTime(value) {
+  if (Number.isFinite(value)) {
+    const floored = Math.floor(value);
+    if (Number.isSafeInteger(floored)) return floored;
+  }
+  return null;
+}
+
+/**
  * Resolve a resolved idempotency outcome into a safe purchase response. Returns
  * undefined for a `create` decision (caller proceeds).
  *   - replay of a `pending` record => surfaced as `pending` (manual recovery).
@@ -132,6 +149,7 @@ export function createCommerce(deps) {
     lockMap = defaultLockMap,
     getSocial,
     quoteSocial = defaultQuoteSocial,
+    getWorldTime,
   } = deps;
 
   /**
@@ -253,7 +271,28 @@ export function createCommerce(deps) {
     if (!entry) {
       return recordFailure({ key, userId, payload: requestPayload, error: 'entry-not-found' });
     }
-    if (!shop.open) {
+    if (getWorldTime) {
+      // Opt-in M4 trading/hours/presence gate. Runs inside the existing per-shop
+      // lock (purchaseLocked is invoked under runShopExclusive) and NEVER trusts a
+      // client clock: the world time is read server-side via `getWorldTime()`.
+      // An invalid (NaN/undefined/Infinity/unsafe) server time fails the purchase
+      // closed as `invalid-world-time` BEFORE any debit, rather than collapsing to
+      // week zero and silently trading. False = shop-closed, exactly as a legacy
+      // manually-closed toggle.
+      const worldTime = safeWorldTime(getWorldTime());
+      if (worldTime == null) {
+        return recordFailure({
+          key,
+          userId,
+          payload: requestPayload,
+          error: 'invalid-world-time',
+        });
+      }
+      const trading = isShopTrading(shop, worldTime);
+      if (!trading.open) {
+        return recordFailure({ key, userId, payload: requestPayload, error: 'shop-closed' });
+      }
+    } else if (!shop.open) {
       return recordFailure({ key, userId, payload: requestPayload, error: 'shop-closed' });
     }
     if (!entry.visible) {

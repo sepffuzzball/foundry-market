@@ -593,12 +593,13 @@ test('application action maps are callable static wrappers bound to the instance
 
 // ---- concurrent manager stock editing under the shared shop lock ------------
 
-function makePersistentShopStore(shops) {
+function makePersistentShopStore(shops, locations = []) {
   const map = new Map();
   for (const s of shops) map.set(s.id, structuredClone(s));
   return {
     _shops: map,
-    listLocations: async () => [],
+    _locations: locations,
+    listLocations: async () => structuredClone(locations),
     listShops: async () => Array.from(map.values()),
     findShop: async (id) => {
       const s = map.get(id);
@@ -629,6 +630,110 @@ function fakeTr(entryId, values = {}) {
     querySelector: (sel) => fields[sel] || null,
   };
   return { closest: () => tr, dataset: tr.dataset };
+}
+
+// A fake inventory row that additionally carries the M4 per-entry stock
+// visibility and restock controls. The manager only reads these when the row
+// actually exposes them, so this helper is used only by the M4 entry tests.
+function fakeTrM4(entryId, values = {}) {
+  const base = fakeTr(entryId, values);
+  const tr = base.closest();
+  const origQ = tr.querySelector;
+  const m4 = {
+    '[name="stockVisibility"]': { value: values.stockVisibility ?? 'exact' },
+    '[name="restockEnabled"]': {
+      type: 'checkbox',
+      checked: values.restockEnabled ?? false,
+    },
+    '[name="restockTarget"]': {
+      type: 'number',
+      value: String(values.restockTarget ?? 1),
+    },
+    '[name="restockAnchorTime"]': {
+      type: 'number',
+      value: String(values.restockAnchorTime ?? 0),
+    },
+    '[name="restockIntervalSeconds"]': {
+      type: 'number',
+      value: String(values.restockIntervalSeconds ?? 86400),
+    },
+  };
+  tr.querySelector = (sel) => m4[sel] || origQ(sel);
+  return base;
+}
+
+// ---- M4 automation editor form fakes --------------------------------------------
+
+// A minimal fake DOM element whose `querySelector`/`querySelectorAll` resolve
+// only the named selectors a test wires. `querySelectorAll` returns the value
+// for a selector only when the test stored an array there.
+function fakeElement(selectors = {}) {
+  return {
+    querySelector: (sel) => selectors[sel] || null,
+    querySelectorAll: (sel) => (Array.isArray(selectors[sel]) ? selectors[sel] : []),
+  };
+}
+
+function fakeCheckbox({ checked = false, value = '' } = {}) {
+  return { type: 'checkbox', checked, value };
+}
+
+function fakeNumber(value) {
+  return { type: 'number', value: String(value ?? '') };
+}
+
+function fakeTextField(value) {
+  return { type: 'text', value: String(value ?? '') };
+}
+
+function fakeSelect(value) {
+  return { type: 'select', value: String(value ?? '') };
+}
+
+function fakeTextarea(value) {
+  return { type: 'textarea', value: String(value ?? '') };
+}
+
+function fakeHoursCard(values = {}) {
+  const dayFields = (values.days || []).map(([value, checked]) =>
+    fakeCheckbox({ checked, value: String(value) })
+  );
+  return fakeElement({
+    '[name="hoursEnabled"]': fakeCheckbox({ checked: values.enabled !== false }),
+    '[name="hoursDay"]': dayFields,
+    '[name="openMinute"]': fakeNumber(values.openMinute ?? 0),
+    '[name="closeMinute"]': fakeNumber(values.closeMinute ?? 0),
+  });
+}
+
+function fakeTravelCard(values = {}) {
+  const locFields = (values.locationIds || []).map((id) =>
+    fakeCheckbox({ checked: true, value: String(id) })
+  );
+  return fakeElement({
+    '[name="travelEnabled"]': fakeCheckbox({ checked: values.enabled !== false }),
+    '[name="travelLocationId"]': locFields,
+    '[name="travelAnchorTime"]': fakeNumber(values.anchorTime ?? 0),
+    '[name="travelIntervalSeconds"]': fakeNumber(values.intervalSeconds ?? 86400),
+  });
+}
+
+function fakeEventEditor(event) {
+  const el = fakeElement({
+    '[name="eventTitle"]': fakeTextField(event.title ?? ''),
+    '[name="eventDescription"]': fakeTextarea(event.description ?? ''),
+    '[name="eventStartAt"]': fakeNumber(event.startAt ?? 0),
+    '[name="eventEndAt"]': fakeNumber(event.endAt ?? 1),
+    '[name="eventVisible"]': fakeCheckbox({ checked: event.visible === true }),
+  });
+  el.dataset = { eventId: String(event.id) };
+  return el;
+}
+
+function fakeEventList(editors) {
+  return fakeElement({
+    '.event-editor-list [data-event-id]': editors,
+  });
 }
 
 // A fake shop details form (+ appearance) element. The manager reads these via
@@ -669,8 +774,8 @@ test('manager concurrent stock editing does not lose updates under the shared lo
       locationId: 'loc1',
       open: true,
       inventory: [
-        { id: 'e1', name: 'A', price: 10, quantity: 10, stockMode: 'finite' },
-        { id: 'e2', name: 'B', price: 20, quantity: 20, stockMode: 'finite' },
+        { id: 'e1', name: 'A', itemUuid: 'Item.a1', price: 10, quantity: 10, stockMode: 'finite' },
+        { id: 'e2', name: 'B', itemUuid: 'Item.a2', price: 20, quantity: 20, stockMode: 'finite' },
       ],
     },
   ]);
@@ -1050,7 +1155,7 @@ test('manager valid picker selection preserves media across an inventory action 
         name: 'Store',
         locationId: 'loc1',
         open: true,
-        inventory: [{ id: 'e1', name: 'Potion', price: 10, quantity: 1, stockMode: 'finite' }],
+        inventory: [{ id: 'e1', name: 'Potion', itemUuid: 'Item.p1', price: 10, quantity: 1, stockMode: 'finite' }],
       },
     ],
   });
@@ -1168,8 +1273,8 @@ test('manager inventory edit persists public description, category and rarity', 
       locationId: 'loc1',
       open: true,
       inventory: [
-        { id: 'e1', name: 'Potion', price: 10, quantity: 10, stockMode: 'finite' },
-        { id: 'e2', name: 'Bread', price: 20, quantity: 20, stockMode: 'finite' },
+        { id: 'e1', name: 'Potion', itemUuid: 'Item.p1', price: 10, quantity: 10, stockMode: 'finite' },
+        { id: 'e2', name: 'Bread', itemUuid: 'Item.p2', price: 20, quantity: 20, stockMode: 'finite' },
       ],
     },
   ]);
@@ -1596,7 +1701,7 @@ test('manager unsaved metadata draft survives an inventory action refresh until 
         name: 'Store',
         locationId: 'loc1',
         open: true,
-        inventory: [{ id: 'e1', name: 'Potion', price: 10, quantity: 1, stockMode: 'finite' }],
+        inventory: [{ id: 'e1', name: 'Potion', itemUuid: 'Item.p1', price: 10, quantity: 1, stockMode: 'finite' }],
       },
     ],
   });
@@ -1788,8 +1893,8 @@ test('shop template disables the detail Buy button on pending / no GM / out of s
   const attrs = detailButton[0];
   assert.match(attrs, /pending/, 'detail button disables while a request is pending');
   assert.match(attrs, /hasGM/, 'detail button disables with no active GM');
-  assert.match(attrs, /stockMode/, 'detail button disables for out-of-stock entries');
-  assert.match(attrs, /quantity/, 'detail button disables for out-of-stock entries');
+  assert.match(attrs, /available/, 'detail button disables for out-of-stock entries');
+  assert.match(attrs, /canBuy/, 'detail button disables for a Hated/unavailable entry');
 });
 
 test('storefront categories exclude categories that only appear on hidden entries', () => {
@@ -2757,4 +2862,885 @@ test('manager reputation actor change event loads the actor score and history', 
   assert.equal(app._data.reputationHistory.length, 1, 'committed history loaded');
   assert.equal(app._data.reputationHistory[0].reason, 'Great customer');
   assert.equal(rendered, true, 'selection re-rendered with the actor record');
+});
+
+// ---- M4: GM automation editor (hours / travel / events / diagnostics) ----------
+
+test('manager derives the M4 automation editor context from the selected shop', async () => {
+  const store = makePersistentShopStore(
+    [
+      {
+        id: 'shop1',
+        name: 'S',
+        locationId: 'loc1',
+        open: true,
+        inventory: [],
+        automation: {
+          hours: { enabled: true, days: [0, 2], openMinute: 480, closeMinute: 960 },
+          travel: { enabled: true, locationIds: ['loc1', 'loc2'], anchorTime: 100, intervalSeconds: 86400, lastCycle: 5 },
+          events: [
+            { id: 'ev1', title: 'Bazaar', description: 'Big sale', startAt: 100, endAt: 200, visible: true },
+            { id: 'ev2', title: 'Hidden', description: '', startAt: 300, endAt: 400, visible: false },
+          ],
+          diagnostics: { lastRunAt: 1700000000, lastStatus: 'ok', lastError: '', lastRestocked: 3, lastLocationId: 'loc1' },
+        },
+      },
+    ],
+    [
+      { id: 'loc1', name: 'Town' },
+      { id: 'loc2', name: 'Road' },
+    ]
+  );
+  const app = new MarketManager({
+    deps: {
+      store,
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      listTables: async () => [
+        { uuid: 'Table.loot', name: 'Loot' },
+        { uuid: 'Table.trash', name: 'Trash' },
+      ],
+      listActors: () => [],
+    },
+  });
+  await app._refreshData();
+  const ctx = app._prepareContext();
+  // weekday checkerboard reflects the declared open days
+  assert.equal(ctx.weekdays.length, 7, 'seven weekday rows');
+  assert.equal(ctx.weekdays[0].selected, true, 'Monday selected');
+  assert.equal(ctx.weekdays[1].selected, false, 'Tuesday not selected');
+  assert.equal(ctx.weekdays[2].selected, true, 'Wednesday selected');
+  assert.deepEqual(
+    ctx.weekdays.map((d) => ({ id: d.id, label: d.label })),
+    [
+      { id: 0, label: 'Monday' },
+      { id: 1, label: 'Tuesday' },
+      { id: 2, label: 'Wednesday' },
+      { id: 3, label: 'Thursday' },
+      { id: 4, label: 'Friday' },
+      { id: 5, label: 'Saturday' },
+      { id: 6, label: 'Sunday' },
+    ],
+    'weekday ids/labels in canonical order'
+  );
+  // travel options are projected from the live location list
+  assert.equal(ctx.travelLocationOptions.length, 2);
+  assert.equal(ctx.travelLocationOptions[0].id, 'loc1');
+  assert.equal(ctx.travelLocationOptions[0].selected, true);
+  assert.equal(ctx.travelLocationOptions[1].id, 'loc2');
+  assert.equal(ctx.travelLocationOptions[1].selected, true);
+  // event rows carry the world-time window as numbers
+  assert.equal(ctx.eventRows.length, 2);
+  assert.equal(ctx.eventRows[0].id, 'ev1');
+  assert.equal(ctx.eventRows[0].startAt, 100);
+  assert.equal(ctx.eventRows[0].endAt, 200);
+  assert.equal(ctx.eventRows[0].visible, true);
+  assert.equal(ctx.eventRows[1].visible, false);
+  // draw tables are the injected list, never a raw document
+  assert.equal(ctx.drawTables.length, 2);
+  assert.equal(ctx.drawTables[0].uuid, 'Table.loot');
+  assert.equal(ctx.drawTables[1].name, 'Trash');
+  // diagnostics are sanitized (formatted date + status, no raw record)
+  assert.equal(ctx.automationDiagnostics.lastStatus, 'ok');
+  assert.equal(ctx.automationDiagnostics.lastRestocked, 3);
+  assert.equal(ctx.automationDiagnostics.lastLocationId, 'loc1');
+  assert.equal(ctx.automationDiagnostics.lastRunAt, '2023-11-14 22:13');
+  assert.equal(ctx.automationDiagnostics.lastError, '');
+  assert.equal(ctx.isActiveGM, true, 'active-GM flag derived from deps');
+});
+
+test('manager save-hours patches only automation.hours with normalized values', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    automation: {
+      hours: { enabled: false, days: [1, 3], openMinute: 0, closeMinute: 0 },
+      travel: { enabled: true, locationIds: ['loc1', 'loc2'], anchorTime: 10, intervalSeconds: 86400, lastCycle: 2 },
+      events: [{ id: 'ev1', title: 'T', description: '', startAt: 1, endAt: 2, visible: true }],
+      diagnostics: { lastRunAt: 1, lastStatus: 'ok', lastError: '', lastRestocked: 5, lastLocationId: 'loc1' },
+    },
+  };
+  const { app, store } = (() => {
+    const s = makePersistentShopStore([shop]);
+    const a = new MarketManager({ deps: { store: s, systemId: () => 'dnd5e', isGM: () => true } });
+    a._data.selectedShopId = 'shop1';
+    a._refreshData = async () => {};
+    a.render = async () => {};
+    a.element = { querySelector: (sel) => (sel === '.automation-hours' ? fakeHoursCard({ enabled: true, days: [[0, true], [2, true]], openMinute: 600, closeMinute: 1020 }) : null) };
+    return { app: a, store: s };
+  })();
+  await app._onSaveHours({}, {}, {});
+  const saved = store._shops.get('shop1');
+  assert.equal(saved.automation.hours.enabled, true);
+  assert.deepEqual(saved.automation.hours.days, [0, 2], 'checked weekdays in DOM order');
+  assert.equal(saved.automation.hours.openMinute, 600);
+  assert.equal(saved.automation.hours.closeMinute, 1020);
+  // travel/events/diagnostics preserved
+  assert.equal(saved.automation.travel.locationIds[0], 'loc1');
+  assert.equal(saved.automation.travel.lastCycle, 2);
+  assert.equal(saved.automation.events[0].id, 'ev1');
+  assert.equal(saved.automation.diagnostics.lastRestocked, 5);
+});
+
+test('manager save-hours surfaces an invalid minute without writing', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    automation: { hours: { enabled: false, days: [], openMinute: 0, closeMinute: 0 } },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  let rendered = 0;
+  app.render = async () => {
+    rendered += 1;
+  };
+  app._refreshData = async () => {};
+  app.element = {
+    querySelector: (sel) =>
+      sel === '.automation-hours' ? fakeHoursCard({ enabled: true, days: [[0, true]], openMinute: 2000, closeMinute: 0 }) : null,
+  };
+  await app._onSaveHours({}, {}, {});
+  assert.match(app._data.notice, /between 0 and 1439/, 'invalid minute surfaced in the notice');
+  assert.equal(store._shops.get('shop1').automation.hours.openMinute, 0, 'no write on invalid hours');
+  assert.ok(rendered > 0, 'error path re-renders to keep the unsaved form');
+});
+
+test('manager save-travel patches only automation.travel and preserves the shop location', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    automation: {
+      hours: { enabled: false, days: [], openMinute: 0, closeMinute: 0 },
+      travel: { enabled: false, locationIds: [], anchorTime: 0, intervalSeconds: 86400, lastCycle: -1 },
+    },
+  };
+  const store = makePersistentShopStore(
+    [shop],
+    [
+      { id: 'loc1', name: 'Town' },
+      { id: 'loc2', name: 'Road' },
+      { id: 'loc3', name: 'Camp' },
+    ]
+  );
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) =>
+      sel === '.automation-travel'
+        ? fakeTravelCard({ enabled: true, locationIds: ['loc1', 'loc3'], anchorTime: 42, intervalSeconds: 7200 })
+        : null,
+  };
+  await app._onSaveTravel({}, {}, {});
+  const saved = store._shops.get('shop1');
+  assert.equal(saved.automation.travel.enabled, true);
+  assert.deepEqual(saved.automation.travel.locationIds, ['loc1', 'loc3']);
+  assert.equal(saved.automation.travel.anchorTime, 42);
+  assert.equal(saved.automation.travel.intervalSeconds, 7200);
+  assert.equal(saved.automation.travel.lastCycle, -1, 'identity changed -> lastCycle reset');
+  assert.equal(saved.locationId, 'loc1', 'shop base location untouched until the runner moves it');
+});
+
+test('manager save-travel preserves lastCycle when the schedule identity is unchanged', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    automation: {
+      hours: { enabled: false, days: [], openMinute: 0, closeMinute: 0 },
+      travel: {
+        enabled: true,
+        locationIds: ['loc1', 'loc2'],
+        anchorTime: 42,
+        intervalSeconds: 7200,
+        lastCycle: 3,
+      },
+    },
+  };
+  const store = makePersistentShopStore(
+    [shop],
+    [
+      { id: 'loc1', name: 'Town' },
+      { id: 'loc2', name: 'Road' },
+    ]
+  );
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) =>
+      sel === '.automation-travel'
+        ? fakeTravelCard({ enabled: true, locationIds: ['loc1', 'loc2'], anchorTime: 42, intervalSeconds: 7200 })
+        : null,
+  };
+  await app._onSaveTravel({}, {}, {});
+  assert.equal(store._shops.get('shop1').automation.travel.lastCycle, 3, 'unchanged schedule keeps lastCycle');
+});
+
+test('manager save-travel rejects an unknown destination without writing', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+  };
+  const store = makePersistentShopStore(
+    [shop],
+    [
+      { id: 'loc1', name: 'Town' },
+      { id: 'loc2', name: 'Road' },
+    ]
+  );
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) =>
+      sel === '.automation-travel'
+        ? fakeTravelCard({ enabled: true, locationIds: ['loc1', 'locX'], anchorTime: 10, intervalSeconds: 7200 })
+        : null,
+  };
+  await app._onSaveTravel({}, {}, {});
+  assert.match(app._data.notice, /Unknown travel destination: locX/);
+  assert.equal(store._shops.get('shop1').automation, undefined, 'no shop write on an unknown destination');
+});
+
+test('manager add-event appends a default event and enforces the ten-event cap', async () => {
+  const events = Array.from({ length: 9 }, (_, i) => ({
+    id: `ev${i}`,
+    title: `E${i}`,
+    description: '',
+    startAt: i,
+    endAt: i + 1,
+    visible: true,
+  }));
+  const shop = { id: 'shop1', name: 'S', locationId: 'loc1', open: true, inventory: [], automation: { events } };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, now: () => 1000 } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onAddEvent({}, {}, {});
+  let saved = store._shops.get('shop1');
+  assert.equal(saved.automation.events.length, 10, 'a 10th event appended');
+  const added = saved.automation.events[9];
+  assert.equal(added.title, 'New event');
+  assert.equal(added.description, '');
+  assert.equal(added.startAt, 1000, 'default start at current world time');
+  assert.equal(added.endAt, 87400, 'default end is start + a day');
+  assert.equal(added.visible, false, 'a new event is hidden until saved visible');
+  assert.ok(added.id, 'a fresh id is generated');
+  await app._onAddEvent({}, {}, {});
+  saved = store._shops.get('shop1');
+  assert.equal(saved.automation.events.length, 10, 'still at most ten events');
+  assert.equal(app._data.notice, 'A shop can have at most ten events.');
+});
+
+test('manager remove-event removes only the target event', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    automation: {
+      hours: { enabled: false, days: [], openMinute: 0, closeMinute: 0 },
+      events: [
+        { id: 'ev1', title: 'Keep', description: '', startAt: 1, endAt: 2, visible: true },
+        { id: 'ev2', title: 'Drop', description: '', startAt: 3, endAt: 4, visible: true },
+      ],
+    },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onRemoveEvent({}, { dataset: { eventId: 'ev2' } }, {});
+  const saved = store._shops.get('shop1');
+  assert.deepEqual(saved.automation.events.map((e) => e.id), ['ev1']);
+  assert.equal(saved.automation.events[0].title, 'Keep');
+});
+
+test('manager save-events fails closed on a row id not in the persisted list and never deletes missing events', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    automation: {
+      hours: { enabled: true, days: [0], openMinute: 60, closeMinute: 120 },
+      travel: { enabled: true, locationIds: ['loc1', 'loc2'], anchorTime: 10, intervalSeconds: 86400, lastCycle: 0 },
+      diagnostics: { lastRunAt: 1, lastStatus: 'ok', lastError: '', lastRestocked: 2, lastLocationId: 'loc1' },
+      events: [
+        { id: 'ev1', title: 'Old1', description: 'd1', startAt: 100, endAt: 200, visible: true },
+        { id: 'ev2', title: 'Old2', description: 'd2', startAt: 300, endAt: 400, visible: false },
+      ],
+    },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  let refreshed = 0;
+  app._refreshData = async () => {
+    refreshed += 1;
+  };
+  app.render = async () => {};
+  const editors = [
+    fakeEventEditor({ id: 'ev1', title: 'New1', description: 'nd1', startAt: 111, endAt: 222, visible: true }),
+    // forged id: not in the persisted event id set -> fail closed, no write
+    fakeEventEditor({ id: 'forged', title: 'Ghost', description: '', startAt: 5, endAt: 6, visible: true }),
+  ];
+  app.element = { querySelectorAll: () => [], querySelector: () => null };
+  app.element.querySelectorAll = (sel) => (sel === '.event-editor-list [data-event-id]' ? editors : []);
+  await app._onSaveEvents({}, {}, {});
+  const saved = store._shops.get('shop1');
+  assert.equal(saved.automation.events.length, 2, 'forged id failed closed; neither event was written');
+  assert.equal(saved.automation.events.find((e) => e.id === 'ev1').title, 'Old1', 'ev1 is unchanged (no write)');
+  assert.equal(saved.automation.events.find((e) => e.id === 'ev2').title, 'Old2', 'ev2 not in the DOM is preserved, not deleted');
+  assert.match(app._data.notice, /no longer matches a saved event/, 'fail-closed notice surfaced');
+  assert.equal(refreshed, 0, 'no data refresh after a fail-closed (form preserved)');
+  // diagnostics/travel/hours preserved
+  assert.equal(saved.automation.diagnostics.lastStatus, 'ok');
+  assert.equal(saved.automation.travel.enabled, true);
+  assert.equal(saved.automation.hours.enabled, true);
+});
+
+test('manager save-events merges edits by id and preserves a concurrently added event', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    automation: {
+      events: [
+        { id: 'ev1', title: 'Old1', description: 'd1', startAt: 100, endAt: 200, visible: true },
+        { id: 'ev2', title: 'Old2', description: 'd2', startAt: 300, endAt: 400, visible: false },
+        // Added by another source between the DOM read and the persisted write; not
+        // in the DOM rows and must be retained.
+        { id: 'ev3', title: 'Concurrent', description: 'added elsewhere', startAt: 500, endAt: 600, visible: true },
+      ],
+    },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  const editors = [
+    fakeEventEditor({ id: 'ev1', title: 'New1', description: 'nd1', startAt: 111, endAt: 222, visible: true }),
+    fakeEventEditor({ id: 'ev2', title: 'New2', description: 'nd2', startAt: 333, endAt: 444, visible: true }),
+  ];
+  app.element = { querySelector: () => null, querySelectorAll: () => [] };
+  app.element.querySelectorAll = (sel) => (sel === '.event-editor-list [data-event-id]' ? editors : []);
+  await app._onSaveEvents({}, {}, {});
+  const saved = store._shops.get('shop1');
+  const byId = Object.fromEntries(saved.automation.events.map((e) => [e.id, e]));
+  assert.equal(saved.automation.events.length, 3, 'no event is deleted by a save');
+  assert.equal(byId.ev1.title, 'New1', 'edit applied to ev1');
+  assert.equal(byId.ev1.description, 'nd1');
+  assert.equal(byId.ev1.startAt, 111);
+  assert.equal(byId.ev1.endAt, 222);
+  assert.equal(byId.ev2.title, 'New2', 'edit applied to ev2');
+  assert.ok(byId.ev3, 'concurrently added ev3 is retained');
+  assert.equal(byId.ev3.title, 'Concurrent', 'ev3 is unchanged');
+  assert.equal(byId.ev3.startAt, 500);
+  assert.equal(app._data.notice, '', 'no fail-closed notice on a valid merge');
+});
+
+test('manager save-events preserves the unsaved form when a window is invalid', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    automation: { events: [{ id: 'ev1', title: 'T', description: '', startAt: 100, endAt: 200, visible: true }] },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  let refreshed = 0;
+  app._refreshData = async () => {
+    refreshed += 1;
+  };
+  app.render = async () => {};
+  // endAt <= startAt -> normalizeAutomationEvent throws
+  const editors = [fakeEventEditor({ id: 'ev1', title: 'T', description: '', startAt: 100, endAt: 50, visible: true })];
+  app.element = { querySelector: () => null, querySelectorAll: () => [] };
+  app.element.querySelectorAll = (sel) => (sel === '.event-editor-list [data-event-id]' ? editors : []);
+  await app._onSaveEvents({}, {}, {});
+  assert.match(app._data.notice, /endAt must be > startAt/, 'invalid event window surfaced');
+  assert.equal(refreshed, 0, 'no data refresh on a validation error (form preserved)');
+  assert.equal(store._shops.get('shop1').automation.events[0].endAt, 200, 'no write on invalid events');
+});
+
+test('manager save-entry persists stock visibility and restock and resets lastCycle on identity change', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      {
+        id: 'e1',
+        name: 'Potion',
+        itemUuid: 'Item.p1',
+        price: 10,
+        quantity: 5,
+        stockMode: 'finite',
+        stockVisibility: 'exact',
+        restock: { enabled: false, target: 5, anchorTime: 0, intervalSeconds: 86400, lastCycle: 4 },
+      },
+    ],
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, runShopExclusive: (_id, fn) => fn(), systemId: () => 'dnd5e' } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onSaveEntry(
+    {},
+    fakeTrM4('e1', {
+      price: 12,
+      quantity: 6,
+      stockVisibility: 'low',
+      restockEnabled: true,
+      restockTarget: 8,
+      restockAnchorTime: 60,
+      restockIntervalSeconds: 7200,
+    }),
+    {}
+  );
+  const saved = store._shops.get('shop1').inventory[0];
+  assert.equal(saved.price, 12);
+  assert.equal(saved.quantity, 6);
+  assert.equal(saved.stockVisibility, 'low', 'stock visibility persisted');
+  assert.equal(saved.restock.enabled, true, 'restock enabled persisted');
+  assert.equal(saved.restock.target, 8);
+  assert.equal(saved.restock.anchorTime, 60);
+  assert.equal(saved.restock.intervalSeconds, 7200);
+  assert.equal(saved.restock.lastCycle, -1, 'identity changed -> lastCycle reset');
+  assert.equal(store._shops.get('shop1').inventory.length, 1, 'only the target entry edited');
+});
+
+test('manager save-entry preserves restock lastCycle when the schedule identity is unchanged', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      {
+        id: 'e1',
+        name: 'Potion',
+        itemUuid: 'Item.p1',
+        price: 10,
+        quantity: 5,
+        stockMode: 'finite',
+        restock: { enabled: true, target: 5, anchorTime: 60, intervalSeconds: 7200, lastCycle: 4 },
+      },
+    ],
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, runShopExclusive: (_id, fn) => fn(), systemId: () => 'dnd5e' } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onSaveEntry(
+    {},
+    fakeTrM4('e1', {
+      price: 10,
+      quantity: 5,
+      restockEnabled: true,
+      restockTarget: 5,
+      restockAnchorTime: 60,
+      restockIntervalSeconds: 7200,
+    }),
+    {}
+  );
+  assert.equal(store._shops.get('shop1').inventory[0].restock.lastCycle, 4, 'same schedule keeps lastCycle');
+});
+
+test('manager save-entry normalizes an invalid restock without writing', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      {
+        id: 'e1',
+        name: 'Potion',
+        itemUuid: 'Item.p1',
+        price: 10,
+        quantity: 5,
+        stockMode: 'finite',
+        restock: { enabled: false, target: 5, anchorTime: 0, intervalSeconds: 86400, lastCycle: 1 },
+      },
+    ],
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, runShopExclusive: (_id, fn) => fn(), systemId: () => 'dnd5e' } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onSaveEntry(
+    {},
+    fakeTrM4('e1', {
+      price: 10,
+      quantity: 5,
+      restockEnabled: true,
+      restockTarget: 5,
+      restockAnchorTime: 0,
+      restockIntervalSeconds: 100,
+    }),
+    {}
+  );
+  assert.match(app._data.notice, /between 3600/, 'invalid interval surfaced');
+  assert.equal(store._shops.get('shop1').inventory[0].restock.intervalSeconds, 86400, 'no write on invalid restock');
+});
+
+test('manager run-automation is active-GM gated and surfaces the run summary', async () => {
+  let calls = 0;
+  const app = new MarketManager({
+    deps: { systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => false },
+  });
+  app._data.selectedShopId = 'shop1';
+  app.render = async () => {};
+  app._refreshData = async () => {};
+  await app._onRunAutomation({}, {}, {});
+  assert.equal(calls, 0, 'no runner call for a non-active GM');
+  assert.match(app._data.notice, /active Game Master/);
+
+  const app2 = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      runAutomation: async (shopId) => {
+        calls += 1;
+        assert.equal(shopId, 'shop1', 'runner called with the selected shop');
+        return { status: 'ok', shopId, restocked: 3, locationId: 'loc2' };
+      },
+    },
+  });
+  app2._data.selectedShopId = 'shop1';
+  app2.render = async () => {};
+  app2._refreshData = async () => {};
+  await app2._onRunAutomation({}, {}, {});
+  assert.equal(calls, 1, 'runner called for the active GM');
+  assert.equal(app2._data.notice, 'Automation ran: 3 restocked.');
+});
+
+test('manager run-automation surfaces a runner error without refreshing', async () => {
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      runAutomation: async () => ({ status: 'error', shopId: 'shop1', error: 'travel-location-missing' }),
+    },
+  });
+  app._data.selectedShopId = 'shop1';
+  let refreshed = 0;
+  app._refreshData = async () => {
+    refreshed += 1;
+  };
+  app.render = async () => {};
+  await app._onRunAutomation({}, {}, {});
+  assert.match(app._data.notice, /travel-location-missing/);
+  assert.ok(refreshed >= 1, 'an error summary still refreshes diagnostics');
+});
+
+test('manager generate-inventory is active-GM gated and displays the result counters', async () => {
+  const app = new MarketManager({
+    deps: { systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => false },
+  });
+  app._data.selectedShopId = 'shop1';
+  app.render = async () => {};
+  app._refreshData = async () => {};
+  await app._onGenerateInventory({}, {}, {});
+  assert.match(app._data.notice, /active Game Master/);
+
+  let params = null;
+  const app2 = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      generateInventory: async (p) => {
+        params = p;
+        return { status: 'ok', added: 4, skipped: 1, invalid: 2, duplicate: 0 };
+      },
+    },
+  });
+  app2._data.selectedShopId = 'shop1';
+  app2._refreshData = async () => {};
+  app2.render = async () => {};
+  app2.element = {
+    querySelector: (sel) =>
+      sel === '.table-generation'
+        ? fakeElement({ '[name="rollTableUuid"]': fakeSelect('Table.loot'), '[name="drawCount"]': fakeNumber(3) })
+        : null,
+  };
+  await app2._onGenerateInventory({}, {}, {});
+  assert.deepEqual(params, { shopId: 'shop1', tableUuid: 'Table.loot', count: 3 });
+  assert.equal(app2._data.notice, 'Generated: 4 added, 1 skipped, 2 invalid, 0 duplicate.');
+});
+
+test('manager generate-inventory validates the draw count before calling the service', async () => {
+  let calls = 0;
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      generateInventory: async () => {
+        calls += 1;
+        return { status: 'ok', added: 0, skipped: 0, invalid: 0, duplicate: 0 };
+      },
+    },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) =>
+      sel === '.table-generation'
+        ? fakeElement({ '[name="rollTableUuid"]': fakeSelect('Table.loot'), '[name="drawCount"]': fakeNumber(21) })
+        : null,
+  };
+  await app._onGenerateInventory({}, {}, {});
+  assert.equal(calls, 0, 'no service call for an out-of-range count');
+  assert.match(app._data.notice, /between 1 and 20/);
+});
+
+test('manager automation buttons are disabled when not the active GM', () => {
+  const template = readFileSync(new URL('../templates/manager.hbs', import.meta.url), 'utf8');
+  assert.match(template, /data-action="run-automation"[^>]*\{\{#unless isActiveGM\}\}disabled/, 'Run now disabled for a non-active GM');
+  assert.match(template, /data-action="generate-inventory"[^>]*\{\{#unless isActiveGM\}\}disabled/, 'Generate inventory disabled for a non-active GM');
+});
+
+// ---- M4: runtime automation hook only sweeps for the active GM ---------------
+
+test('runtime automation updateWorldTime sweep only runs for the active GM', async () => {
+  // Wire enough of the Foundry boundary that main.js can run: module registration
+  // for the api attachment, the settings registry, an empty journal for the
+  // default store reads, and a world-time clock.
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {} };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+  globalThis.game.time = { worldTime: 1000 };
+
+  // Run ready as the active GM so the runtime wires the automation sweep.
+  const prevUser = globalThis.game.user;
+  const prevUsers = globalThis.game.users;
+  globalThis.game.user = { id: 'gm1', isGM: true };
+  globalThis.game.users = Object.assign({}, prevUsers, {
+    activeGM: { id: 'gm1' },
+    filter: () => [],
+  });
+
+  try {
+    await import('../src/core/main.js');
+    fireHook('init');
+    fireHook('ready');
+    // Let the startup sweep settle.
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { store } = await import('../src/storage/store.js');
+    const origListShops = store.listShops;
+    let listShopsCalls = 0;
+    store.listShops = async (...args) => {
+      listShopsCalls += 1;
+      return origListShops(...args);
+    };
+
+    // A non-active GM tick must not read the store.
+    globalThis.game.user = { id: 'player1', isGM: false };
+    const before = listShopsCalls;
+    fireHook('updateWorldTime');
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(listShopsCalls, before, 'a non-active GM tick does not sweep');
+
+    // An active GM tick must sweep.
+    globalThis.game.user = { id: 'gm1', isGM: true };
+    fireHook('updateWorldTime');
+    await new Promise((r) => setTimeout(r, 10));
+    assert.ok(listShopsCalls > before, 'an active GM tick sweeps shops');
+
+    store.listShops = origListShops;
+  } finally {
+    globalThis.game.user = prevUser;
+    globalThis.game.users = prevUsers;
+  }
+});
+
+// ---- M4: runtime GM RollTable inventory generation --------------------------
+
+test('runtime api.generateInventory draws a world Item and a compendium pack Item and skips a non-Item result', async () => {
+  // Wire enough of the Foundry boundary that main.js `init` can run, then mock the
+  // live game API surface the service reads: a RollTable resolved via `fromUuid`,
+  // world Items via `game.items.get`, and a compendium pack via `game.packs.get`.
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {}, get: () => '' };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+  globalThis.game.time = { worldTime: 1000 };
+
+  let drawCalls = 0;
+  const table = {
+    documentName: 'RollTable',
+    async drawMany(count, opts) {
+      drawCalls += 1;
+      return {
+        results: [
+          { type: 'document', documentCollection: 'Item', documentId: 'w-1' },
+          { type: 'document', documentCollection: 'Pack1', documentId: 'p-1' },
+          { type: 'document', documentCollection: 'Pack1', documentId: 'p-2' },
+          { type: 'text', text: 'flavor text' },
+        ],
+      };
+    },
+  };
+  globalThis.fromUuid = async (uuid) => (uuid === 'Table.loot' ? table : null);
+
+  const worldItem = {
+    documentName: 'Item',
+    uuid: 'Item.w-1',
+    name: 'World Potion',
+    img: 'icons/potion.png',
+    system: { price: { value: 2, denomination: 'gp' } },
+    toObject() {
+      return { name: this.name, img: this.img, system: this.system };
+    },
+  };
+  const packItem = {
+    documentName: 'Item',
+    uuid: 'Item.p-1',
+    name: 'Pack Axe',
+    img: 'icons/axe.png',
+    system: { price: { value: 5, denomination: 'gp' } },
+    toObject() {
+      return { name: this.name, img: this.img, system: this.system };
+    },
+  };
+  globalThis.game.items = { get: (id) => (id === 'w-1' ? worldItem : null) };
+  globalThis.game.packs = {
+    get: (coll) =>
+      coll === 'Pack1'
+        ? {
+            documentName: 'Item',
+            async getDocument(id) {
+              if (id === 'p-1') return packItem;
+              // A non-Item document resolved from an Item pack must be rejected.
+              return { documentName: 'Actor', uuid: 'Actor.p-2', name: 'Npc' };
+            },
+          }
+        : null,
+  };
+
+  const prevUser = globalThis.game.user;
+  const prevUsers = globalThis.game.users;
+  const origItems = globalThis.game.items;
+  const origPacks = globalThis.game.packs;
+  const origFromUuid = globalThis.fromUuid;
+  globalThis.game.user = { id: 'gm1', isGM: true };
+  globalThis.game.users = Object.assign({}, prevUsers, {
+    activeGM: { id: 'gm1' },
+    filter: () => [],
+  });
+
+  // Stub the market store on the live singleton; the service reads/writes through
+  // it (a real shop persisted in a journal would be overkill for this test).
+  const { store } = await import('../src/storage/store.js');
+  const origFindShop = store.findShop;
+  const origUpdateShop = store.updateShop;
+  let findShopCalls = 0;
+  const writes = [];
+  store.findShop = async (id) => {
+    findShopCalls += 1;
+    return { id, name: 'Store', locationId: 'loc1', open: true, inventory: [] };
+  };
+  store.updateShop = async (id, patch) => {
+    writes.push({ id, patch });
+    return { id, ...patch };
+  };
+
+  try {
+    await import('../src/core/main.js');
+    fireHook('init');
+
+    const api = globalThis.game.modules.get('market').api;
+    assert.ok(api, 'module api attached');
+    assert.equal(typeof api.generateInventory, 'function', 'generateInventory surface exposed');
+
+    // A non-active GM is rejected before drawing, reading or writing anything.
+    globalThis.game.user = { id: 'player1', isGM: false };
+    const idle = await api.generateInventory({ shopId: 'shop1', tableUuid: 'Table.loot', count: 3 });
+    assert.equal(idle.status, 'error');
+    assert.equal(idle.error, 'not-active-gm');
+    assert.equal(findShopCalls, 0, 'non-active GM does not read the store');
+    assert.equal(drawCalls, 0, 'non-active GM does not draw from the table');
+    assert.equal(writes.length, 0, 'non-active GM does not write');
+
+    // The active GM draws, resolves a world Item and a pack Item, and skips the
+    // non-Item pack row plus the text row.
+    globalThis.game.user = { id: 'gm1', isGM: true };
+    const res = await api.generateInventory({ shopId: 'shop1', tableUuid: 'Table.loot', count: 3 });
+    assert.equal(res.status, 'ok');
+    assert.equal(res.added, 2, 'world Item and pack Item added');
+    assert.equal(res.skipped, 1, 'the non-Item pack result is skipped');
+    assert.equal(res.invalid, 1, 'the text row is invalid');
+    assert.equal(res.duplicate, 0);
+    assert.equal(writes.length, 1, 'exactly one atomic write');
+    assert.equal(findShopCalls, 1, 'one store read for the active GM');
+    assert.equal(drawCalls, 1, 'one table draw for the active GM');
+
+    const inventory = writes[0].patch.inventory;
+    assert.equal(inventory.length, 2, 'two entries persisted');
+    const uuids = inventory.map((e) => e.itemUuid).sort();
+    assert.deepEqual(uuids, ['Item.p-1', 'Item.w-1']);
+    const worldEntry = inventory.find((e) => e.itemUuid === 'Item.w-1');
+    const packEntry = inventory.find((e) => e.itemUuid === 'Item.p-1');
+    assert.equal(worldEntry.price, 200, 'world Item price read (2 gp -> 200 cp)');
+    assert.equal(packEntry.price, 500, 'pack Item price read (5 gp -> 500 cp)');
+    assert.equal(worldEntry.stockMode, 'finite');
+    assert.equal(packEntry.visible, true);
+
+    store.findShop = origFindShop;
+    store.updateShop = origUpdateShop;
+  } finally {
+    store.findShop = origFindShop;
+    store.updateShop = origUpdateShop;
+    globalThis.game.user = prevUser;
+    globalThis.game.users = prevUsers;
+    if (origFromUuid === undefined) delete globalThis.fromUuid;
+    else globalThis.fromUuid = origFromUuid;
+    if (origItems === undefined) delete globalThis.game.items;
+    else globalThis.game.items = origItems;
+    if (origPacks === undefined) delete globalThis.game.packs;
+    else globalThis.game.packs = origPacks;
+  }
 });

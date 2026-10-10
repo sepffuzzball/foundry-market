@@ -17,20 +17,25 @@ import {
   MAX_SHOP_NPCS,
   normalizePriceBreakdown,
   sanitizeMediaPath,
+  assertMarketId,
 } from '../services/model.js';
 import { normalizeTheme } from '../themes/registry.js';
 import { quoteSocial } from '../social/pricing.js';
 import { getPersonality } from '../social/personalities.js';
+import { isShopTrading, stockView, activeMarketEvents } from '../automation/policy.js';
 
 export const PUBLIC_SHOP_FIELDS = [
   'id',
   'name',
   'locationId',
+  'locationName',
   'description',
   'theme',
   'owner',
   'appearance',
   'open',
+  'closedReason',
+  'marketEvents',
 ];
 export const PUBLIC_ENTRY_FIELDS = [
   'id',
@@ -43,6 +48,8 @@ export const PUBLIC_ENTRY_FIELDS = [
   'publicDescription',
   'category',
   'rarity',
+  'stockLabel',
+  'available',
 ];
 
 export function pickFields(obj, fields) {
@@ -101,8 +108,93 @@ function sanitizeAppearance(appearance = {}) {
   };
 }
 
+/**
+ * Sanitized `closedReason` enum admitted by M4 trading. `isShopTrading` only
+ * ever reports one of these (plus `'open'`); anything else collapses to null so
+ * an unknown future reason never leaks to a player.
+ */
+const CLOSED_REASONS = new Set(['manually-closed', 'outside-hours', 'not-arrived']);
+
+function sanitizeClosedReason(reason) {
+  if (reason === 'open') return null;
+  return CLOSED_REASONS.has(reason) ? reason : null;
+}
+
+/**
+ * Non-throwing sanitizer for a projected market event id. The event list may
+ * arrive from an unnormalized fixture whose id is an object, an empty string, an
+ * oversized string, or a control-bearing string; a public projection must never
+ * leak a non-scalar id. A valid market id (non-empty string, at most
+ * REPUTATION_ID_MAX, no control chars) is returned; anything else collapses to ''
+ * so the event stays visible with a safe empty id.
+ */
+function sanitizeEventId(value) {
+  if (typeof value !== 'string') return '';
+  try {
+    return assertMarketId(value, 'marketEvents[].id');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Project the visible active market events at `worldTime` to the safe public
+ * shape `{id, title, description}`. Never leaks `startAt`/`endAt`/`visible` or
+ * the raw event config; event text is plain (the UI escapes it). The projected
+ * `id` is always a validated scalar string (an invalid raw id collapses to ''),
+ * even when the shop is an unnormalized fixture.
+ */
+function projectMarketEvents(shop, worldTime) {
+  return activeMarketEvents(shop, worldTime).map((e) => ({
+    id: sanitizeEventId(e.id),
+    title: String(e.title ?? ''),
+    description: String(e.description ?? ''),
+  }));
+}
+
+/**
+ * Resolve the request-context world time. `ctx.worldTime` is a getter (the
+ * runtime supplies the same `() => Math.floor(game.time.worldTime)` used by
+ * commerce); a numeric value is also accepted for direct injection. Returns:
+ *   - a safe integer second when the source is valid;
+ *   - null when the source is PRESENT but invalid (NaN/undefined/Infinity/
+ *     unsafe), so the catalog fails closed as a correlated server-error;
+ *   - undefined when no time source is present, preserving the legacy no-time
+ *     behavior.
+ */
+function resolveWorldTime(ctx) {
+  const wt = ctx?.worldTime;
+  if (wt == null) return undefined;
+  let value;
+  if (typeof wt === 'function') {
+    value = wt();
+  } else {
+    value = wt;
+  }
+  if (typeof value !== 'number') return null;
+  if (!Number.isFinite(value)) return null;
+  if (Number.isSafeInteger(value)) return value;
+  const floored = Math.floor(value);
+  return Number.isSafeInteger(floored) ? floored : null;
+}
+
+/**
+ * Resolve a safe, player-facing location name for a projected `locationId`.
+ * Only a single string is ever exposed - never the full location list nor the
+ * private `travel.locationIds` config. A non-array location list, a missing
+ * location, or a legacy context with no location list all collapse to '' (never
+ * a stale base name), and the name is bounded to 100 characters. The value is
+ * rendered through Handlebars `{{ }}` in the storefront template, which escapes
+ * it, so it is never Html-injected.
+ */
+function resolveLocationName(locations, locationId) {
+  if (!locationId || !Array.isArray(locations)) return '';
+  const match = locations.find((loc) => loc && loc.id === locationId);
+  return String((match && match.name) || '').slice(0, 100);
+}
+
 /** Allowlisted public shop view. Never includes raw flags or hidden columns. */
-export function publicShop(shop) {
+export function publicShop(shop, opts = {}) {
   const out = pickFields(shop, PUBLIC_SHOP_FIELDS);
   // Never supply unvalidated raw input: normalize the theme (fails closed to
   // general-store), keep owner a plain string, and sanitize the appearance.
@@ -118,6 +210,45 @@ export function publicShop(shop) {
   const appearance = sanitizeAppearance(shop?.appearance);
   if (primaryHidden) appearance.ownerPortrait = '';
   out.appearance = appearance;
+  // M4 trading/presence projection. With a valid world time the authoritative
+  // `open`/`locationId` come from `isShopTrading` (which folds in manual close,
+  // hours and travel), plus a sanitized `closedReason` and the visible active
+  // events. Without a time the legacy `shop.open`/`shop.locationId` behavior is
+  // preserved and `marketEvents` is an empty array - never leaking the days/hours
+  // config or the private event list.
+  const worldTime = opts?.worldTime;
+  const hasTime = typeof worldTime === 'number' && Number.isFinite(worldTime);
+  if (hasTime) {
+    const trading = isShopTrading(shop, worldTime);
+    out.open = trading.open;
+    out.locationId = trading.locationId || '';
+    out.closedReason = sanitizeClosedReason(trading.reason);
+    out.marketEvents = projectMarketEvents(shop, worldTime);
+  } else {
+    out.marketEvents = [];
+  }
+  // Resolve the safe current location name for the projected locationId (the one
+  // `isShopTrading` may have rotated for a travel-enabled shop). Only this single
+  // string is exposed; the full location list and `travel.locationIds` stay
+  // private. A missing/unknown location or a legacy context without a location
+  // list collapses to ''.
+  out.locationName = resolveLocationName(opts?.locations, out.locationId);
+  return out;
+}
+
+/**
+ * Project a single visible inventory entry with only allowlisted public fields.
+ * `itemUuid`, snapshot, `stockVisibility`, `restock` and any item `system` data
+ * are deliberately excluded. The `quantity`/`stockLabel`/`available` come from
+ * `stockView`, so a non-exact entry never leaks a real count; an exact entry
+ * keeps its true `quantity`.
+ */
+export function publicInventoryEntry(entry) {
+  const out = pickFields(entry, PUBLIC_ENTRY_FIELDS);
+  const view = stockView(entry);
+  out.quantity = view.quantity;
+  out.stockLabel = view.stockLabel;
+  out.available = view.available;
   return out;
 }
 
@@ -127,7 +258,7 @@ export function publicShop(shop) {
  */
 export function publicInventory(shop) {
   const visible = (shop?.inventory || []).filter((e) => e.visible);
-  return visible.map((e) => pickFields(e, PUBLIC_ENTRY_FIELDS));
+  return visible.map((e) => publicInventoryEntry(e));
 }
 
 /**
@@ -174,10 +305,10 @@ export function sanitizeRelationship(effective) {
   };
 }
 
-export function buildCatalog(shop) {
+export function buildCatalog(shop, opts = {}) {
   return {
     type: 'catalog',
-    shop: publicShop(shop),
+    shop: publicShop(shop, { worldTime: opts?.worldTime, locations: opts?.locations }),
     inventory: publicInventory(shop),
     merchants: publicMerchants(shop),
   };
@@ -311,11 +442,36 @@ async function handleCatalog(request, requesterId, ctx) {
     return withCorrelation({ type: 'error', error: 'shop-not-found' }, request);
   }
 
+  // Resolve the authoritative world time ONCE here (server-side, never a client
+  // clock) so both the base and the personalized catalog use the same trading
+  // and event projection. A PRESENT but invalid time fails closed as a correlated
+  // server-error (no catalog is projected); an absent time keeps the legacy
+  // no-time behavior.
+  const worldTime = resolveWorldTime(ctx);
+  if (worldTime === null) {
+    return withCorrelation({ type: 'error', error: 'server-error' }, request);
+  }
+
+  // Resolve the safe current location name from the store's location list AFTER
+  // the projected locationId is known (see publicShop). The list is read once here
+  // so both the base and the personalized catalog use the same projection; it is
+  // never exposed itself - only the single resolved `locationName` string is. A
+  // read failure fails closed as a correlated server-error; a legacy context
+  // without `listLocations` supplies no list and resolves to ''.
+  let locations = [];
+  if (typeof ctx.store?.listLocations === 'function') {
+    try {
+      locations = await ctx.store.listLocations();
+    } catch (err) {
+      return withCorrelation({ type: 'error', error: 'server-error' }, request);
+    }
+  }
+
   // No actor => the base (non-personalized) public catalog. It still carries the
   // public merchant projection for the next UI, but no per-actor pricing.
   const actorId = request.actorId || null;
   if (!actorId) {
-    return withCorrelation(buildCatalog(shop), request);
+    return withCorrelation(buildCatalog(shop, { worldTime, locations }), request);
   }
 
   // With a requested actor, validate it (must exist and be owned by the
@@ -328,6 +484,10 @@ async function handleCatalog(request, requesterId, ctx) {
   if (!ctx.actorOwnedBy(actor, requesterId)) {
     return withCorrelation({ type: 'error', error: 'actor-not-owned' }, request);
   }
+
+  // The authoritative public shop projection is computed once and shared by every
+  // entry's `canBuy` (which depends on the projected `open`, not the raw toggle).
+  const shopView = publicShop(shop, { worldTime, locations });
 
   let effective;
   try {
@@ -365,18 +525,22 @@ async function handleCatalog(request, requesterId, ctx) {
       band: quote.band,
       refused: quote.refused,
     });
-    const publicEntry = pickFields(entry, PUBLIC_ENTRY_FIELDS);
+    // The same projection helper as the base catalog (so a non-exact entry never
+    // leaks a real count and `stockLabel`/`available` stay consistent), then the
+    // per-actor social fields and `canBuy` which also requires the entry to be in
+    // stock and the projected shop to be open.
+    const publicEntry = publicInventoryEntry(entry);
     publicEntry.price = quote.unitPrice;
     publicEntry.basePrice = entry.price;
     publicEntry.priceBreakdown = breakdown;
-    publicEntry.canBuy = !quote.refused;
+    publicEntry.canBuy = !quote.refused && publicEntry.available && shopView.open;
     inventory.push(publicEntry);
   }
 
   return withCorrelation(
     {
       type: 'catalog',
-      shop: publicShop(shop),
+      shop: shopView,
       inventory,
       merchants: publicMerchants(shop),
       relationship: sanitizeRelationship(effective),

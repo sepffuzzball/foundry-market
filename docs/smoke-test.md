@@ -450,12 +450,113 @@ client is the one that exercises the storefront.
 - A stale actor's catalog response is discarded (correlation on `requestId` +
   `actorId`).
 
-## 17. Summary / verdict
+## 17. M4 - GM automation editor (hours, travel, events, restock, inventory generation)
 
-Record a pass/fail + notes row for each section. Take **all** sections (1-16) as
-the minimum signal for M1/M2/M3 - do not claim completion on the strength of
+> **Status: Node-tested only.** The M4 GM automation editor UI, the active-GM
+> guards, the per-entry restock/visibility save and the RollTable generation
+> entry point are verified by the automated `npm test` suite in Node. This
+> section is the intended real-runtime check for the manager automation editor,
+> the `updateWorldTime` sweep and the RollTable `drawMany` call on a live v14
+> install.
+
+### 17.1 GM saves scheduled hours
+
+1. As the **GM**, open the Market Manager, select a shop, and in the "Hours &
+   arrivals" card enable **Use scheduled hours**, check some weekdays, set an
+   open and close minute, and click **Save hours**.
+
+**Expected**
+
+- The values persist after reopening the shop; the weekday checkerboard reflects
+  the saved days and the travel/events/diagnostics are untouched.
+- Entering an invalid minute (e.g. `1500`) shows a notice and does NOT write.
+
+### 17.2 GM saves a travel schedule
+
+1. In the "Hours & arrivals" card enable **Enable travel**, check two or more
+   destination locations, set an anchor time and an interval, and click **Save
+   travel**.
+
+**Expected**
+
+- The travel destinations persist and the shop's own `locationId` is unchanged
+  (a travel shop keeps trading at its base until the runner moves it).
+- Selecting a destination that was deleted from the locations list shows an
+  "Unknown travel destination" notice and does NOT write.
+- Changing the schedule identity resets the cycle; re-saving unchanged values
+  keeps the cycle marker.
+
+### 17.3 GM adds / removes / saves events
+
+1. Click **Add event**; confirm a "New event" row appears. Edit the title,
+   description, start/end (world seconds) and visibility, then click **Save
+   events**.
+
+**Expected**
+
+- A shop holds at most ten events; adding an eleventh shows a notice.
+- Removing an event removes only that row.
+- A saved visible/active event appears in the storefront's public notices; an
+  invalid window (end <= start) shows a notice and leaves the form intact (no
+  write).
+
+### 17.4 GM sets per-entry stock visibility / restock
+
+1. In an inventory row, set "Player stock" to "Low / available" or "Hidden",
+   enable **Auto-restock** and set a target/anchor/interval, then click the row
+   **Save**.
+
+**Expected**
+
+- The entry persists the visibility/restock, and the restock cycle resets only
+  when the schedule identity changed.
+- An invalid restock (e.g. an interval under 3600) shows a notice and does NOT
+  write.
+
+### 17.5 GM runs automation on demand
+
+1. In the "Automation" card click **Run now** (as the active GM).
+
+**Expected**
+
+- The summary is shown and the diagnostics panel reflects the fresh run.
+- With no active GM the button is disabled and pressing it shows the "Only the
+  active Game Master can run automation." notice with no store read.
+
+### 17.6 GM generates inventory from a RollTable
+
+1. In the "Roll table stock" form pick a RollTable, set a draw count in 1..20,
+   and click **Generate inventory**.
+
+**Expected**
+
+- The result counters (added / skipped / invalid / duplicate) are shown and the
+  new entries appear in the shop inventory.
+- A draw count outside 1..20, or no table chosen, shows a notice and does NOT
+  call the service.
+- The generator is active-GM gated (the button is disabled without the active
+  GM).
+
+### 17.7 Player sees projected trading / stock / events
+
+1. As the **player**, open the storefront for a shop whose GM set hours/travel, a
+   low/hidden stock entry and a visible active event.
+
+**Expected**
+
+- The storefront reflects the projected `closedReason`, `stockLabel`/
+  `available` and active `marketEvents`; a hidden/low entry never leaks a real
+  quantity, and a closed / outside-hours / not-arrived shop disables purchase.
+- The GM-only automation config (raw days/hours, travel, restock control,
+  private event list) is never exposed to the player.
+
+## 18. Summary / verdict
+
+Record a pass/fail + notes row for each section. Take **all** sections (1-17) as
+the minimum signal for M1/M2/M3/M4 - do not claim completion on the strength of
 `npm test` alone (that only mocks the Foundry boundaries). If you are about to
 run a real economy, treat sections 1, 4 (UI/hook shapes), 12 (last-item
-contention), 15.3/15.4 (M2 action dispatch), 16.4 (M3 personalized quote) and
-the multi-GM concurrency note as mandatory, and confirm the two blockers in the
-intro are addressed before you trust a live economy to the module.
+contention), 15.3/15.4 (M2 action dispatch), 16.4 (M3 personalized quote), 17.5
+(M4 active-GM automation) and the multi-GM concurrency note as mandatory, and
+confirm the two blockers in the intro are addressed before you trust a live
+economy to the module.

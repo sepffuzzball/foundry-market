@@ -10,6 +10,8 @@
 
 import { makeId, normalizePriceBreakdown } from '../services/model.js';
 import { createCommerce } from '../services/commerce.js';
+import { createAutomationService } from '../automation/service.js';
+import { createTableInventoryService } from '../automation/tables.js';
 import { createReputationService } from '../social/service.js';
 import { quoteSocial } from '../social/pricing.js';
 import { getAdapter } from '../adapters/index.js';
@@ -21,6 +23,32 @@ import { registerPlacements, createMarketMarker } from '../canvas/placements.js'
 import { registerTheme } from '../themes/registry.js';
 
 const MODULE_ID = 'market';
+
+/**
+ * Whether the current user is the active GM. Both the automation service gate and
+ * the runtime tick use this exact predicate, and it is re-checked inside the
+ * service on every run, so a GM handover between ticks never triggers a store read.
+ */
+function isActiveGM() {
+  return game.user?.id === game.users.activeGM?.id && game.user?.isGM;
+}
+
+/**
+ * The authoritative world-time in whole seconds from the Foundry server clock.
+ * Never trust a client-supplied time; every M4 trading/automation decision reads
+ * this getter. Shared by commerce (`getWorldTime`), the request context
+ * (`worldTime`) and the automation service (`now`).
+ *
+ * An invalid server clock (NaN/undefined/Infinity/non-safe) returns null rather
+ * than `Math.floor`-ing a bad value into NaN/Infinity; every consumer already
+ * treats a null as `invalid-world-time` and never coerces it to week zero.
+ */
+function worldTimeNow() {
+  const t = game.time?.worldTime;
+  if (!Number.isFinite(t)) return null;
+  const floored = Math.floor(t);
+  return Number.isSafeInteger(floored) ? floored : null;
+}
 
 function registerSettings() {
   game.settings.register(MODULE_ID, 'genericWallet', {
@@ -118,6 +146,44 @@ async function getSocialEffective(shop, actor) {
   return repService.getEffective(shop, actor.uuid);
 }
 
+/**
+ * Resolve a single v14 RollTable document result to a world or compendium Item.
+ *
+ * Only `type === 'document'` results are usable; a text row (or any other result
+ * shape) returns null so the caller can count it invalid. A world Item is
+ * addressed when `documentCollection === 'Item'` and is resolved via
+ * `game.items.get(documentId)`. Any other collection is treated as a compendium
+ * pack id: it is accepted only when `game.packs.get(collection)` exists and the
+ * pack is an Item pack (`pack.documentName === 'Item'`) or reports a v14
+ * document-class name of `'Item'` (`pack.documentClass?.documentName === 'Item'`),
+ * and the document is then fetched via `pack.getDocument(id)`. The resolved
+ * document is verified to be an Item before it is returned, so a compendium that
+ * advertises an Item class but yields a non-Item row is rejected. We never
+ * construct an arbitrary UUID; a missing `documentId`, an unknown collection, or
+ * a non-Item pack/document returns null so the caller skips/counts the result.
+ */
+async function resolveTableResult(result) {
+  if (!result || result.type !== 'document') return null;
+  const collection = result.documentCollection;
+  const id = result.documentId;
+  if (typeof id !== 'string' || id === '') return null;
+  if (collection === 'Item') {
+    return game.items.get(id) || null;
+  }
+  if (typeof collection === 'string' && collection !== '') {
+    const pack = game.packs.get(collection);
+    if (pack) {
+      const isItemPack =
+        pack.documentName === 'Item' || pack.documentClass?.documentName === 'Item';
+      if (isItemPack) {
+        const doc = await pack.getDocument(id);
+        return doc && doc.documentName === 'Item' ? doc : null;
+      }
+    }
+  }
+  return null;
+}
+
 function buildCommerce() {
   return createCommerce({
     store,
@@ -137,6 +203,7 @@ function buildCommerce() {
     now: () => Date.now(),
     makeId,
     getSocial: getSocialEffective,
+    getWorldTime: worldTimeNow,
   });
 }
 
@@ -152,6 +219,7 @@ function buildRequestContext(commerce) {
     getActor: (id) => (id ? game.actors.get(id) : null),
     actorOwnedBy,
     getSocial: getSocialEffective,
+    worldTime: worldTimeNow,
   };
 }
 
@@ -199,10 +267,40 @@ function placeShopMarker(shopId) {
   });
 }
 
-function exposeApi(commerce) {
+function exposeApi(commerce, automation) {
   const api = {
     store,
     commerce,
+    // M4 GM-only automation surface. Each method guards on the active GM before
+    // doing anything, and the raw service/store are NOT exposed - a caller only
+    // ever sees the bounded summaries/diagnostics the service returns. The
+    // service itself also re-checks active-GM internally, so this is defense in
+    // depth, not the only guard.
+    automation: {
+      runAll: () => {
+        if (!isActiveGM()) return Promise.resolve({ status: 'idle', summaries: [] });
+        return automation.runAll();
+      },
+      runShop: (shopId) => {
+        if (!isActiveGM()) return Promise.resolve({ status: 'idle', shopId });
+        return automation.runShop(shopId);
+      },
+      getDiagnostics: (shopId) => {
+        if (!isActiveGM()) return Promise.resolve({ status: 'idle', diagnostics: [] });
+        return automation.getDiagnostics(shopId);
+      },
+    },
+    // M4 GM-only RollTable inventory generation. The raw service and the store are
+    // NOT exposed: a caller only ever receives the bounded numbers the service
+    // returns. Guarded on THIS user being the active GM before anything is read,
+    // so a player never triggers a table draw or a store read, and no
+    // caller-supplied GM identity is ever trusted.
+    generateInventory: (params = {}) => {
+      if (!isActiveGM()) {
+        return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+      }
+      return tableInventoryService.generate(params);
+    },
     // Always resolve world settings, even when the adapter is requested through
     // the settings-menu path which has no injected deps.
     getAdapter: (systemId, opts) =>
@@ -340,13 +438,72 @@ function registerJournalDirectory() {
   });
 }
 
+/**
+ * Schedule one automation sweep. Reentrancy is guarded by a single in-flight
+ * promise: while a sweep is running, any tick (or startup) that arrives merely
+ * requests one follow-up, which runs after the current sweep finishes. This
+ * never blocks the request handler (the sweep is not awaited by the hook), and
+ * the active GM is re-checked inside the service before any store access.
+ */
+function scheduleAutomationRun() {
+  if (automationRunInFlight) {
+    automationRunQueued = true;
+    return;
+  }
+  automationRunInFlight = (async () => {
+    if (!isActiveGM()) {
+      automationRunInFlight = null;
+      return;
+    }
+    try {
+      await automationService.runAll();
+    } catch (err) {
+      // Caught and logged so a bad shop never breaks the request channel.
+      console.error('[market] automation sweep failed', err);
+    } finally {
+      automationRunInFlight = null;
+      if (automationRunQueued) {
+        automationRunQueued = false;
+        scheduleAutomationRun();
+      }
+    }
+  })();
+}
+
+/**
+ * Wire the M4 automation runtime. Registers the `updateWorldTime` hook and
+ * runs once at startup when the current user is the active GM. Only the active
+ * GM's client drives automation, and any handover is picked up on the next clock
+ * tick (or a reload) - we do not attempt a mid-tick re-evaluation.
+ */
+function registerAutomationRuntime() {
+  Hooks.on('updateWorldTime', () => {
+    if (isActiveGM()) scheduleAutomationRun();
+  });
+  if (isActiveGM()) scheduleAutomationRun();
+}
+
 let commerceInstance = null;
+let automationService = null;
 let repService = null;
+let tableInventoryService = null;
+let automationRunInFlight = null;
+let automationRunQueued = false;
 
 Hooks.once('init', () => {
   registerSettings();
   registerSettingsMenu();
   commerceInstance = buildCommerce();
+  // Built after commerce so it shares commerce's per-shop lock runner; the SAME
+  // lock purchases and GM manager inventory edits use. All automation mutations
+  // thus run strictly serially against purchases on that shop.
+  automationService = createAutomationService({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    now: worldTimeNow,
+    logger: console,
+  });
   repService = createReputationService({
     store,
     runShopExclusive: commerceInstance.runShopExclusive,
@@ -357,7 +514,28 @@ Hooks.once('init', () => {
     makeId,
     now: () => Date.now(),
   });
-  exposeApi(commerceInstance);
+  // M4 GM-only RollTable inventory generation. Shares commerce's per-shop lock,
+  // uses the same active-GM predicate as the automation service, resolves the
+  // table strictly through `fromUuid` (never a caller-constructed UUID), and
+  // resolves each drawn result through the live game API (world Items +
+  // compendium Item packs only).
+  tableInventoryService = createTableInventoryService({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    getTable: async (tableUuid) => {
+      const doc = await fromUuid(tableUuid);
+      return doc && doc.documentName === 'RollTable' ? doc : null;
+    },
+    resolveResult: resolveTableResult,
+    getAdapter: () =>
+      getAdapter(String(game.system.id || 'generic'), {
+        resolver: (key) => game.settings.get(MODULE_ID, key),
+      }),
+    makeId,
+    logger: console,
+  });
+  exposeApi(commerceInstance, automationService);
 });
 
 Hooks.once('ready', () => {
@@ -374,6 +552,7 @@ Hooks.once('ready', () => {
     findShop: (id) => store.findShop(id),
   });
   registerJournalDirectory();
+  registerAutomationRuntime();
 });
 
 // Re-exports for tooling/tests that import this module directly.
