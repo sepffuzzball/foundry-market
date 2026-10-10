@@ -50,22 +50,27 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.5`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.6`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.5/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.6/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
 
-> **The `0.1.5` `download` URL is live only once the `0.1.5` release has been
-> published** - the release action must upload `module.zip` and `module.json` to
-> the GitHub release for tag `0.1.5`. The `0.1.4` release is published and
-> installable; until the `0.1.5` release is published, install the module by
-> pointing Foundry at this repository directory as a module source (the manifest
-> and `src/core/main.js` are unchanged), or download the zip from the published
-> `0.1.5` release once it is available.
+> **The `0.1.5` release is published but broken - the GM "View storefront" path
+> fails to parse.** The storefront template `templates/shop.hbs` left a
+> `{{#if}}` block unterminated, so clicking "View storefront" in the manager
+> throws a Handlebars `Parse error ... EOF expecting {{/if}}` on a live install.
+> That parse failure is fixed in this **prospective `0.1.6` prerelease**, which
+> is **not yet re-confirmed on a live Foundry VTT 14 install**. The `0.1.6`
+> `download` URL is live only once the `0.1.6` release has been published - the
+> release action must upload `module.zip` and `module.json` to the GitHub
+> release for tag `0.1.6`. Until then, install the module by pointing Foundry at
+> this repository directory as a module source (the manifest and
+> `src/core/main.js` are unchanged), or download the zip from the published
+> `0.1.6` release once it is available.
 
 ### Enable in a world
 

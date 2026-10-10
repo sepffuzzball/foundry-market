@@ -6076,3 +6076,124 @@ test('runtime api.backup is active-GM gated and never exposes the raw service', 
     else globalThis.game.time = prevTime;
   }
 });
+
+// ---- Handlebars block-balance guard (CI-portable, dependency-free) ----------
+//
+// A live Foundry storefront opened with a malformed Handlebars template (an
+// unterminated `{{#if}}`) fails at render time with a parse error such as
+// "Parse error ... EOF expecting {{/if}} at line <n>". This guard tokenizes the
+// Handlebars block *structural* tags in the shipped templates with a plain
+// regex, validates that every block open has a matching close, that `{{else}}`
+// only appears inside an open block, and that the block stack is empty at EOF.
+// It intentionally ignores interpolation/helper expressions ({{shop.name}},
+// {{lookup ...}}, {{eq ...}}) and escaped literal `\{{` text, and supports the
+// whitespace-trim markers (`{{~` / `~}}`) if a template ever uses them. It does
+// not depend on a Handlebars runtime, node_modules, or the cwd.
+
+const HANDLEBARS_TAG_RE = /\{\{[-~]?([\s\S]*?)[-~]?\}\}/g;
+
+// Return an ordered list of structural Handlebars events:
+//   { type: 'open',  name, content, offset }
+//   { type: 'close', name, content, offset }
+//   { type: 'else',  content, offset }
+// Only block opens (#if/#each/#unless/#with), block closes ({{/name}}) and
+// inverse branches ({{else}} / {{else if ...}}) produce events; helper and
+// interpolation expressions are ignored.
+function handlebarsBlockEvents(source) {
+  const events = [];
+  const re = new RegExp(HANDLEBARS_TAG_RE.source, 'g');
+  let match;
+  while ((match = re.exec(source)) !== null) {
+    // A `\{{...}}` renders literal braces and is not a real tag.
+    if (match.index > 0 && source[match.index - 1] === '\\') continue;
+    const content = match[1].trim();
+    if (content.startsWith('#')) {
+      const nameMatch = content.match(/^#([A-Za-z0-9_]+)/);
+      if (nameMatch) {
+        events.push({ type: 'open', name: nameMatch[1], content, offset: match.index });
+      }
+    } else if (content.startsWith('/')) {
+      const nameMatch = content.match(/^\/([A-Za-z0-9_]+)/);
+      if (nameMatch) {
+        events.push({ type: 'close', name: nameMatch[1], content, offset: match.index });
+      }
+    } else if (content === 'else' || /^else\s+if\b/.test(content)) {
+      events.push({ type: 'else', content, offset: match.index });
+    }
+  }
+  return events;
+}
+
+// Validate that a template's block structure is balanced. Attaches the
+// pre-event block-stack depth to each event as `depthBefore`. Returns the event
+// list so callers can assert on ordering (e.g. a block must close before a
+// later `{{else}}`).
+function assertHandlebarsBalanced(source, label) {
+  const events = handlebarsBlockEvents(source);
+  const stack = [];
+  for (const ev of events) {
+    ev.depthBefore = stack.length;
+    if (ev.type === 'open') {
+      stack.push(ev.name);
+    } else if (ev.type === 'close') {
+      assert.ok(stack.length > 0, `${label}: {{/${ev.name}}} with an empty block stack`);
+      const top = stack.pop();
+      assert.equal(top, ev.name, `${label}: {{/${ev.name}}} closes a mismatched {{#${top}}}`);
+    } else if (ev.type === 'else') {
+      assert.ok(stack.length > 0, `${label}: {{else}} appeared outside any open block`);
+    }
+  }
+  assert.equal(
+    stack.length,
+    0,
+    `${label}: ${stack.length} unterminated block(s) at EOF (${stack.join(', ')})`
+  );
+  return events;
+}
+
+// Find the offset of the close of the block opened at `openIndex`, matching
+// nested blocks by name so an inner block is never mistaken for the outer one.
+function matchingCloseOffset(events, openIndex) {
+  const stack = [events[openIndex].name];
+  for (let j = openIndex + 1; j < events.length; j++) {
+    const ev = events[j];
+    if (ev.type === 'open') {
+      stack.push(ev.name);
+    } else if (ev.type === 'close') {
+      assert.equal(stack[stack.length - 1], ev.name, 'nested block close must match');
+      stack.pop();
+      if (stack.length === 0) return ev.offset;
+    }
+  }
+  assert.fail('matching close not found');
+}
+
+test('storefront and manager templates keep Handlebars blocks balanced', () => {
+  const shopPath = new URL('../templates/shop.hbs', import.meta.url);
+  const managerPath = new URL('../templates/manager.hbs', import.meta.url);
+  const shopSource = readFileSync(shopPath, 'utf8');
+  const managerSource = readFileSync(managerPath, 'utf8');
+
+  const shopEvents = assertHandlebarsBalanced(shopSource, 'templates/shop.hbs');
+  assertHandlebarsBalanced(managerSource, 'templates/manager.hbs');
+
+  // Regression: the storefront's `{{#if actors.length}}` block must be closed
+  // before the outer `{{#if shop}}` missing-shop `{{else}}` branch. Otherwise a
+  // Handlebars parser consumes the missing-shop `{{else}}` (and the trailing
+  // `{{/if}}`) as the actors block's own branch, leaving the outer `if` open
+  // and failing at render time with "EOF expecting {{/if}}".
+  const actorsOpenIndex = shopEvents.findIndex(
+    (ev) => ev.type === 'open' && /^#if\s+actors\.length\b/.test(ev.content)
+  );
+  assert.ok(actorsOpenIndex !== -1, 'storefront template opens an actors block');
+  const actorsCloseOffset = matchingCloseOffset(shopEvents, actorsOpenIndex);
+
+  // The missing-shop `{{else}}` is the only inverse whose enclosing block is
+  // exactly the outermost `{{#if shop}}` stack depth 1.
+  const missingShopElse = shopEvents.find((ev) => ev.type === 'else' && ev.depthBefore === 1);
+  assert.ok(missingShopElse, 'storefront template has a missing-shop else branch');
+  assert.ok(
+    actorsCloseOffset < missingShopElse.offset,
+    'the actors block must close before the missing-shop else branch'
+  );
+});

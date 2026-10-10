@@ -53,6 +53,7 @@
     {{#if feedback}}<p class="market-feedback" role="status" aria-live="polite">{{feedback}}</p>{{/if}}
      {{#if pending}}<p class="market-pending" role="status" aria-live="polite"><span class="pending-mark" aria-hidden="true"></span> Processing your request...</p>{{/if}}
      <button type="button" class="sound-toggle" data-action="toggle-sound" aria-pressed="{{#if soundEnabled}}true{{else}}false{{/if}}">{{#if soundEnabled}}Sound on{{else}}Sound off{{/if}}</button>
+      {{/if}}
   </main>
   {{else}}
   <main class="storefront-missing"><span class="welcome-seal" aria-hidden="true">✧</span><p class="market-eyebrow">No destination selected</p><h1>This market has<br>no open door.</h1><p>Select a shop to browse its wares.</p>{{#if loading}}<p class="market-muted">Loading the storefront...</p>{{else}}{{#unless hasGM}}<p class="market-muted">A Game Master may need to open a shop first.</p>{{/unless}}<button type="button" class="market-button market-button-dark" data-action="refresh">Try again <span aria-hidden="true">↻</span></button>{{/if}}</main>

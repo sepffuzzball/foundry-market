@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.5`).
+  `download` release pointers, with `version` `0.1.6`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -132,7 +132,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.5/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.6/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -155,12 +155,16 @@ which was published as a prerelease (the workflow now sets up Node 22, where
 `crypto.getRandomValues` is available).
 
 The **`0.1.4` release was published** as a prerelease (tag `0.1.4`, carrying
-`module.json` and `module.zip` release assets), so the `0.1.4` download URL is
-live and installable. The **`0.1.5` release is being prepared but not yet
-published**: the `0.1.5` download URL is live only once that tag's `release` job
-completes and publishes the `0.1.5` GitHub release. Until then, install by
-pointing Foundry at the repo directory as a module source, or from the published
-`0.1.5` release once it exists.
+`module.json` and `module.zip` release assets). The **`0.1.5` release was also
+published** as a prerelease (tag `0.1.5`), so its download URL is live and
+installable - but its storefront is broken: the GM "View storefront" path throws
+a Handlebars parse error because `templates/shop.hbs` left a `{{#if}}` block
+unterminated (see `docs/smoke-test.md` section 6). That parse failure is fixed in
+this **`0.1.6` patch prerelease** (the `0.1.6` download URL is live only once that
+tag's `release` job completes and publishes the `0.1.6` GitHub release), and the
+fix is **not yet re-confirmed on a live Foundry VTT 14 install**. Until then,
+install by pointing Foundry at the repo directory as a module source, or from the
+published `0.1.6` release once it exists.
 
 ### Known issues / caveats
 
@@ -171,6 +175,16 @@ pointing Foundry at the repo directory as a module source, or from the published
   the Foundry boundaries (`game`/`Hooks`/`CONST`, `JournalEntry`, the actor
   document API) instead of a live runtime, so passing tests do not establish V14
   behavior - run the manual checklist in `docs/smoke-test.md` for that.
+- The storefront template (`templates/shop.hbs`) previously failed to parse on a
+  live install: the `{{#if actors.length}}` block was left unterminated, so
+  opening the storefront threw `Parse error ... EOF expecting {{/if}}`. That
+  block is now closed and a dependency-free block-balance regression test in
+  `tests/ui.test.js` guards both `templates/shop.hbs` and `templates/manager.hbs`
+  (validating every block open has a matching close, that `{{else}}` only appears
+  inside an open block, and that the block stack is empty at EOF). The fix is
+  **not yet re-confirmed on a live Foundry VTT 14 install** - see
+  `docs/smoke-test.md` section 6, which remains the manual real-runtime check and
+  should not be marked live-tested until retested there.
 - The `Daggerheart` adapter only reports support once the GM configures the
   generic adapter path settings; `DC20` and `Twodsix` are first-class and report
   support regardless (use `getAdapter('generic', config)` for a custom generic

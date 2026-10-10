@@ -11,7 +11,7 @@ with a fresh world where you can discard the data. You need at least two browser
 clients (one on an **active GM** user, one on a **player** user). The player
 client is the one that exercises the storefront.
 
-This checklist targets the current **0.1.5** prerelease. **No live Foundry VTT
+This checklist targets the current **0.1.6** prerelease. **No live Foundry VTT
 14 verification has been run yet** for M1-M6 - the automated `npm test` suite
 only mocks the Foundry boundaries, so every section below is the intended manual
 real-runtime check and nothing here has yet been confirmed on a live install.
@@ -146,12 +146,28 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 
 ## 6. Player opens the shop via the Note
 
+> **Status: template parse failure fixed, live retest still pending.** The
+> storefront template (`templates/shop.hbs`) previously left the
+> `{{#if actors.length}}` block unterminated, so opening the storefront failed at
+> render time with a Handlebars parse error ("Parse error ... EOF expecting
+> `{{/if}}`"). That block is now closed and the template is guarded by an
+> automated block-balance unit test in `tests/ui.test.js`. It has **not** yet
+> been re-confirmed on a live Foundry VTT 14 install - run this section again
+> before treating the storefront as verified. Do not mark this section as
+> live-tested by the automated suite.
+
 1. As the **player**, click the Scene Note created in section 4.
+2. As the **GM** (or player), also open the storefront via the manager's **View
+   storefront** button. Immediately confirm the console reports **no
+   Handlebars parse failure** (no `Parse error ... EOF expecting {{/if}}`
+   message) - a blank/erroring storefront on either path is a regression.
 
 **Expected**
 
 - The **Market Storefront** opens instead of the Journal sheet (the Note handler
-  suppresses the default journal).
+  suppresses the default journal), and the storefront renders without a
+  Handlebars parse failure on **both** the Note path and the manager's **View
+  storefront** path.
 - The storefront shows shop 1's catalog, including the entry from section 3.
 - The entry's `system` data and `itemUuid` are NOT exposed - only the allowlisted
   public fields (id, name, img, price, quantity, stockMode, visible) are shown.
