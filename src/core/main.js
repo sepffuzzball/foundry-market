@@ -10,12 +10,26 @@
 
 import { makeId, normalizePriceBreakdown } from '../services/model.js';
 import { createCommerce } from '../services/commerce.js';
+import { createSellingService } from '../advanced/selling.js';
+import { createCartCommerce } from '../advanced/cart.js';
+import { createValuationService } from '../advanced/valuation.js';
+import { createServiceCommerce } from '../advanced/services.js';
+import { createPreorderCommerce } from '../advanced/preorders.js';
+import { createTheftCommerce } from '../advanced/theft.js';
 import { createAutomationService } from '../automation/service.js';
 import { createTableInventoryService } from '../automation/tables.js';
 import { createReputationService } from '../social/service.js';
 import { quoteSocial } from '../social/pricing.js';
+import { canAccessEntry } from '../advanced/policy.js';
 import { getAdapter } from '../adapters/index.js';
-import { requestMessageData, attachMarketHandler } from './requests.js';
+import {
+  requestMessageData,
+  attachMarketHandler,
+  publicServiceResult,
+  publicPreorderResult,
+  publicTheftResult,
+  publicAdvancedOrder,
+} from './requests.js';
 import { store } from '../storage/store.js';
 import { MarketManager } from '../ui/manager.js';
 import { MarketStorefront } from '../ui/storefront.js';
@@ -48,6 +62,17 @@ function worldTimeNow() {
   if (!Number.isFinite(t)) return null;
   const floored = Math.floor(t);
   return Number.isSafeInteger(floored) ? floored : null;
+}
+
+/**
+ * Resolve the configured generic-adapter path settings through the live game
+ * settings registry. Shared by the advanced-commerce services so they read the
+ * same adapter configuration the purchase/catalog path uses.
+ */
+function getLiveAdapter() {
+  return getAdapter(String(game.system.id || 'generic'), {
+    resolver: (key) => game.settings.get(MODULE_ID, key),
+  });
 }
 
 function registerSettings() {
@@ -207,9 +232,14 @@ function buildCommerce() {
   });
 }
 
-function buildRequestContext(commerce) {
+function buildRequestContext(commerce, selling, advanced = {}) {
   return {
     commerce,
+    selling,
+    cart: advanced.cart,
+    services: advanced.services,
+    preorders: advanced.preorders,
+    theft: advanced.theft,
     store,
     activeGMId: () => game.users.activeGM?.id || null,
     currentUserId: () => game.user.id,
@@ -267,7 +297,7 @@ function placeShopMarker(shopId) {
   });
 }
 
-function exposeApi(commerce, automation) {
+function exposeApi(commerce, automation, advanced = {}) {
   const api = {
     store,
     commerce,
@@ -290,6 +320,91 @@ function exposeApi(commerce, automation) {
         return automation.getDiagnostics(shopId);
       },
     },
+    // M5 GM-only advanced order resolution. These are the GM's own adjudication
+    // methods (manual service fulfillment, preorder fulfill/cancel, theft
+    // resolve, and the order list). They are guarded on THIS user being the
+    // active GM BEFORE any store read, always execute as `game.user.id` (never a
+    // caller-supplied GM id), and each result is run through the SAME per-type
+    // public sanitizer the player request channel uses, so no private field leaks
+    // to the UI. The raw service/store objects are NOT exposed. `resolveTheft`
+    // is deliberately NOT reachable through a player request - only the GM can
+    // grant or refuse a theft.
+    advanced: {
+      fulfillService: (params = {}) => {
+        if (!isActiveGM()) return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+        const fn = advanced.services?.fulfill;
+        return fn
+          ? fn(params, game.user.id).then(publicServiceResult)
+          : Promise.resolve({ status: 'error', error: 'server-error' });
+      },
+      fulfillPreorder: (params = {}) => {
+        if (!isActiveGM()) return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+        const fn = advanced.preorders?.fulfill;
+        return fn
+          ? fn(params, game.user.id).then(publicPreorderResult)
+          : Promise.resolve({ status: 'error', error: 'server-error' });
+      },
+      cancelPreorder: (params = {}) => {
+        if (!isActiveGM()) return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+        const fn = advanced.preorders?.cancel;
+        return fn
+          ? fn(params, game.user.id).then(publicPreorderResult)
+          : Promise.resolve({ status: 'error', error: 'server-error' });
+      },
+      resolveTheft: (params = {}) => {
+        if (!isActiveGM()) return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+        const fn = advanced.theft?.resolve;
+        return fn
+          ? fn(params, game.user.id).then(publicTheftResult)
+          : Promise.resolve({ status: 'error', error: 'server-error' });
+      },
+      // M6 GM-only per-Item valuation approval. Guarded on THIS user being the
+      // active GM before any store read, always executes as `game.user.id`, and
+      // returns only the approved valuation id/itemName/amount (the private
+      // fingerprint and the raw entry are never exposed to the caller).
+      approveValuation: (params = {}) => {
+        if (!isActiveGM()) {
+          return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+        }
+        const fn = advanced.valuations?.approve;
+        if (!fn) return Promise.resolve({ status: 'error', error: 'server-error' });
+        return fn(params, game.user.id).then((r) =>
+          r && r.status === 'approved'
+            ? {
+                status: 'approved',
+                valuationId: r.valuationId,
+                itemName: r.itemName,
+                amount: r.amount,
+              }
+            : { status: (r && r.status) || 'error', error: (r && r.error) || 'server-error' }
+        );
+      },
+      listOrders: async (params = {}) => {
+        if (!isActiveGM()) return { status: 'error', error: 'not-active-gm' };
+        try {
+          // Limit is bounded to 1..100 (at least one record per page, never more
+          // than the documented 100-record cap) and offset must be non-negative;
+          // both are validated here before being forwarded to the store so a
+          // caller can never request an empty page or a runaway slice.
+          const rawLimit = params.limit == null ? 100 : Number(params.limit);
+          const limit = Number.isFinite(rawLimit)
+            ? Math.max(1, Math.min(Math.floor(rawLimit), 100))
+            : 100;
+          const rawOffset = params.offset == null ? 0 : Number(params.offset);
+          const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.floor(rawOffset)) : 0;
+          const records = await store.listAdvancedOrders({
+            shopId: params.shopId,
+            status: params.status,
+            kind: params.kind,
+            limit,
+            offset,
+          });
+          return { status: 'ok', orders: records.map(publicAdvancedOrder) };
+        } catch (err) {
+          return { status: 'error', error: 'server-error' };
+        }
+      },
+    },
     // M4 GM-only RollTable inventory generation. The raw service and the store are
     // NOT exposed: a caller only ever receives the bounded numbers the service
     // returns. Guarded on THIS user being the active GM before anything is read,
@@ -300,6 +415,17 @@ function exposeApi(commerce, automation) {
         return Promise.resolve({ status: 'error', error: 'not-active-gm' });
       }
       return tableInventoryService.generate(params);
+    },
+    // M5 GM-only whole-item sale. Guarded on THIS user being the active GM before
+    // any read/write, so a player never triggers a store read or an effect; the
+    // executing user is always `game.user.id` (never a caller-supplied GM id).
+    // The raw service is NOT exposed - a caller only ever receives the bounded
+    // sell result the service returns.
+    sellItem: (params = {}) => {
+      if (!isActiveGM()) {
+        return Promise.resolve({ status: 'error', error: 'not-active-gm' });
+      }
+      return sellingService.sell(params, game.user.id);
     },
     // Always resolve world settings, even when the adapter is requested through
     // the settings-menu path which has no injected deps.
@@ -356,13 +482,20 @@ function exposeApi(commerce, automation) {
     quotePrice: async (shopId, entryId, actorId, qty) => {
       const actor = game.actors.get(actorId);
       if (!actor) return null;
-      if (!(game.user?.isGM || actorOwnedBy(actor, game.user.id))) return null;
+      const isGm = !!game.user?.isGM;
+      if (!(isGm || actorOwnedBy(actor, game.user.id))) return null;
       const shop = await store.findShop(shopId);
       if (!shop) return null;
       const entry = shop.inventory.find((e) => e.id === entryId);
       if (!entry) return null;
       if (entry.visible === false) return null;
       const effective = await repService.getEffective(shop, actor.uuid);
+      // M5: a non-GM caller may only quote an entry their owned actor may access.
+      // A `backroom` entry that the actor cannot access returns null (never
+      // leaked to a player); the GM may quote any entry.
+      if (!isGm && !canAccessEntry(entry, { actorUuid: actor.uuid, score: effective?.score })) {
+        return null;
+      }
       const quote = quoteSocial(entry, qty == null ? 1 : qty, {
         shop,
         scores: { individual: effective.individual, party: effective.party },
@@ -413,8 +546,8 @@ function exposeApi(commerce, automation) {
   }
 }
 
-function attachHandler(commerce) {
-  attachMarketHandler(buildRequestContext(commerce));
+function attachHandler(commerce, selling, advanced) {
+  attachMarketHandler(buildRequestContext(commerce, selling, advanced));
 }
 
 /** Best-effort world-directory entry point: a Market button on the Journal sidebar. */
@@ -487,6 +620,12 @@ let commerceInstance = null;
 let automationService = null;
 let repService = null;
 let tableInventoryService = null;
+let sellingService = null;
+let cartCommerce = null;
+let valuationService = null;
+let serviceCommerce = null;
+let preorderCommerce = null;
+let theftCommerce = null;
 let automationRunInFlight = null;
 let automationRunQueued = false;
 
@@ -535,11 +674,118 @@ Hooks.once('init', () => {
     makeId,
     logger: console,
   });
-  exposeApi(commerceInstance, automationService);
+  // M6 GM-authored per-Item valuation for sell/barter. Shares commerce's per-shop
+  // lock and active-GM predicate; reads the actor strictly through the live game
+  // API. Exposes the GM-only `approve` and the private `getApprovedValuation`
+  // read side, which the sell/cart services inject so a player-owned Item is
+  // never priced by its own (player-inflatable) system price.
+  valuationService = createValuationService({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    getActor: (id) => (id ? game.actors.get(id) : null),
+    makeId,
+    logger: console,
+  });
+  // M5 GM-authoritative whole-item sale for buyback. Shares commerce's per-shop
+  // lock (so a sell and a buy never interleave their shop writes), uses the same
+  // active-GM predicate and world-time getter as automation, reads the actor and
+  // adapter strictly through the live game API, and resolves each embedded Item
+  // through `actor.items.get` (never a caller-constructed id). The sale is priced
+  // only by the GM-approved valuation (`getApprovedValuation(item, shop)`), never
+  // the item's own system price.
+  sellingService = createSellingService({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    getActor: (id) => (id ? game.actors.get(id) : null),
+    actorOwnedBy,
+    getAdapter: () =>
+      getAdapter(String(game.system.id || 'generic'), {
+        resolver: (key) => game.settings.get(MODULE_ID, key),
+      }),
+    getApprovedValuation: valuationService.getApprovedValuation,
+    now: worldTimeNow,
+    makeId,
+    logger: console,
+  });
+  // M5 advanced commerce services (cart / service / preorder / theft). Each
+  // shares commerce's per-shop lock (so an advanced order never interleaves a
+  // purchase), uses the same active-GM predicate and world-time getter as
+  // automation, reads the actor and adapter strictly through the live game API,
+  // and resolves UUIDs through `fromUuid` (never a caller-constructed UUID). The
+  // service-booker has no social / snapshot needs, so it is built without
+  // `getSocial` / `fromUuid`; the cart/preorder/theft services resolve the actor's
+  // effective reputation through the live reputation service when they need a
+  // personalized quote.
+  cartCommerce = createCartCommerce({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    getActor: (id) => (id ? game.actors.get(id) : null),
+    actorOwnedBy,
+    getAdapter: getLiveAdapter,
+    fromUuid: (uuid) => (uuid ? fromUuid(uuid) : null),
+    getSocial: getSocialEffective,
+    getWorldTime: worldTimeNow,
+    now: () => Date.now(),
+    // The bartered tender is credited only at the GM-approved valuation (never
+    // its own system price) and consumed at commit, same as the sell path.
+    getApprovedValuation: valuationService.getApprovedValuation,
+    logger: console,
+  });
+  serviceCommerce = createServiceCommerce({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    getActor: (id) => (id ? game.actors.get(id) : null),
+    actorOwnedBy,
+    getAdapter: getLiveAdapter,
+    getWorldTime: worldTimeNow,
+    now: () => Date.now(),
+    logger: console,
+  });
+  preorderCommerce = createPreorderCommerce({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    getActor: (id) => (id ? game.actors.get(id) : null),
+    actorOwnedBy,
+    getAdapter: getLiveAdapter,
+    fromUuid: (uuid) => (uuid ? fromUuid(uuid) : null),
+    getSocial: getSocialEffective,
+    getWorldTime: worldTimeNow,
+    now: () => Date.now(),
+    logger: console,
+  });
+  theftCommerce = createTheftCommerce({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isActiveGM,
+    getActor: (id) => (id ? game.actors.get(id) : null),
+    actorOwnedBy,
+    getAdapter: getLiveAdapter,
+    fromUuid: (uuid) => (uuid ? fromUuid(uuid) : null),
+    getWorldTime: worldTimeNow,
+    now: () => Date.now(),
+    logger: console,
+  });
+  exposeApi(commerceInstance, automationService, {
+    cart: cartCommerce,
+    services: serviceCommerce,
+    preorders: preorderCommerce,
+    theft: theftCommerce,
+    valuations: valuationService,
+  });
 });
 
 Hooks.once('ready', () => {
-  attachHandler(commerceInstance);
+  attachHandler(commerceInstance, sellingService, {
+    cart: cartCommerce,
+    services: serviceCommerce,
+    preorders: preorderCommerce,
+    theft: theftCommerce,
+  });
   registerPlacements({
     isGM: (userId) => {
       const user = game.users.get(userId);

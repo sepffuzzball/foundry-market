@@ -764,6 +764,76 @@ function fakeShopForm(values = {}) {
   };
 }
 
+// ---- M5 commerce/special/service editor form fakes --------------------------------
+
+// A fake `.commerce-panel` element exposing only the top-level commerce fields the
+// manager reads on save (funds, rates, preorders, theft). `querySelector` returns
+// null for a field that is not wired, so a test can omit a control to exercise the
+// concrete fallback (e.g. an empty merchantFunds field).
+function fakeCommercePanel(values = {}) {
+  const checks = {
+    '[name="unlimitedFunds"]': fakeCheckbox({ checked: values.unlimitedFunds === true }),
+    '[name="preordersEnabled"]': fakeCheckbox({ checked: values.preordersEnabled === true }),
+    '[name="theftEnabled"]': fakeCheckbox({ checked: values.theftEnabled === true }),
+  };
+  const nums = {
+    '[name="merchantFunds"]': fakeNumber(values.merchantFunds ?? 0),
+    '[name="buyRateBps"]': fakeNumber(values.buyRateBps ?? 0),
+    '[name="buybackRateBps"]': fakeNumber(values.buybackRateBps ?? 0),
+    '[name="depositBps"]': fakeNumber(values.depositBps ?? 0),
+    '[name="maxPerActor"]': fakeNumber(values.maxPerActor ?? 1),
+  };
+  return fakeElement({ ...checks, ...nums });
+}
+
+// A fake service editor row. The manager reads `[data-service-id]` rows via
+// `querySelectorAll`; each row must expose `dataset.serviceId` and the named inputs.
+function fakeServiceRow(serviceId, values = {}) {
+  const row = fakeElement({
+    '[name="serviceName"]': fakeTextField(values.name ?? ''),
+    '[name="serviceDescription"]': fakeTextarea(values.description ?? ''),
+    '[name="servicePrice"]': fakeNumber(values.price ?? 0),
+    '[name="serviceVisible"]': fakeCheckbox({ checked: values.visible !== false }),
+    '[name="serviceEnabled"]': fakeCheckbox({ checked: values.enabled !== false }),
+  });
+  row.dataset = { serviceId: String(serviceId) };
+  return row;
+}
+
+// A fake special editor row, mirroring the service row but with the special fields.
+function fakeSpecialRow(specialId, values = {}) {
+  const row = fakeElement({
+    '[name="specialTitle"]': fakeTextField(values.title ?? ''),
+    '[name="specialDescription"]': fakeTextarea(values.description ?? ''),
+    '[name="specialPrice"]': fakeNumber(values.price ?? 0),
+    '[name="specialVisible"]': fakeCheckbox({ checked: values.visible !== false }),
+    '[name="specialEntryId"]': fakeSelect(values.entryId ?? ''),
+    '[name="specialActorUuids"]': fakeTextField(values.actorUuids ?? ''),
+  });
+  row.dataset = { specialId: String(specialId) };
+  return row;
+}
+
+// A fake inventory row that additionally carries the M5 access gate controls
+// (backroom mode, actor UUIDs, minimum reputation). The manager only reads these
+// when the row actually exposes them, so this helper is used only by the M5
+// access-gate entry tests. Setting `withMinReputation: false` omits the
+// accessMinReputation control so the persisted value is preserved.
+function fakeTrAccess(entryId, values = {}) {
+  const base = fakeTr(entryId, values);
+  const tr = base.closest();
+  const origQ = tr.querySelector;
+  const access = {
+    '[name="accessMode"]': fakeSelect(values.accessMode ?? 'public'),
+    '[name="accessActorUuids"]': fakeTextField(values.accessActorUuids ?? ''),
+  };
+  if (values.withMinReputation !== false) {
+    access['[name="accessMinReputation"]'] = fakeNumber(values.accessMinReputation ?? 0);
+  }
+  tr.querySelector = (sel) => access[sel] || origQ(sel);
+  return base;
+}
+
 test('manager concurrent stock editing does not lose updates under the shared lock', async () => {
   const lockMap = createLockMap();
   const runShopExclusive = (shopId, fn) => lockMap.run('shop:' + shopId, fn);
@@ -1994,6 +2064,54 @@ test('runtime api.reputation.getEffective is GM-only: a non-GM read returns null
   const gmResult = await api.reputation.getEffective(shop, 'Actor.a');
   assert.ok(gmResult, 'GM getEffective read resolves the effective reputation');
   assert.equal(typeof gmResult.score, 'number');
+});
+
+test('runtime api.quotePrice returns null for an inaccessible backroom to a player but quotes it for the GM', async () => {
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {} };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+
+  await import('../src/core/main.js');
+  fireHook('init');
+
+  const api = globalThis.game.modules.get('market').api;
+  const shop = {
+    id: 's1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    social: { primaryPersonality: 'honest', shopMarkupBps: 0, individualWeight: 70, partyWeight: 30, partyId: '' },
+    inventory: [
+      { id: 'backroom', name: 'Secret', price: 100, quantity: 5, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.alice'], minReputation: -100 } },
+      { id: 'public', name: 'Open', price: 50, quantity: 5, visible: true },
+    ],
+  };
+  const owner = { id: 'a1', uuid: 'Actor.bob', testUserPermission: () => true };
+  const stranger = { id: 'a2', uuid: 'Actor.alice', testUserPermission: () => false };
+  const origActors = globalThis.game.actors;
+  globalThis.game.actors = { get: (id) => (id === 'a1' ? owner : id === 'a2' ? stranger : null) };
+  const { store } = await import('../src/storage/store.js');
+  const origFindShop = store.findShop;
+  store.findShop = async () => shop;
+  try {
+    // Non-GM player owns a1 (Actor.bob) but is not allowlisted for the backroom.
+    globalThis.game.user = { id: 'u1', isGM: false };
+    assert.equal(await api.quotePrice('s1', 'backroom', 'a1', 1), null, 'a player cannot quote an inaccessible backroom');
+    assert.ok(await api.quotePrice('s1', 'public', 'a1', 1), 'a player can quote a public entry');
+    // The GM may quote any entry, including the inaccessible backroom.
+    globalThis.game.user = { id: 'gm1', isGM: true };
+    const gmBackroom = await api.quotePrice('s1', 'backroom', 'a1', 1);
+    assert.ok(gmBackroom, 'the GM may quote an inaccessible backroom');
+    assert.equal(gmBackroom.unitPrice, 100);
+    // A nonowned actor cannot probe either entry (returns null before any rep read).
+    globalThis.game.user = { id: 'u1', isGM: false };
+    assert.equal(await api.quotePrice('s1', 'backroom', 'a2', 1), null, 'a nonowned actor cannot probe the backroom');
+    assert.equal(await api.quotePrice('s1', 'public', 'a2', 1), null, 'a nonowned actor cannot probe a public entry');
+  } finally {
+    store.findShop = origFindShop;
+    globalThis.game.actors = origActors;
+  }
 });
 
 // ---- M3: manager social / NPC / reputation UI wiring -------------------------
@@ -3743,4 +3861,1679 @@ test('runtime api.generateInventory draws a world Item and a compendium pack Ite
     if (origPacks === undefined) delete globalThis.game.packs;
     else globalThis.game.packs = origPacks;
   }
+});
+
+// ---- M5: runtime GM-only sell API guard -------------------------------------
+
+test('runtime api.sellItem is GM-gated and routes only the active GM into the service', async () => {
+  // Wire enough of the Foundry boundary that main.js `init` can run, then fire it
+  // so the api is attached (module is cached; re-firing re-runs init).
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {}, get: () => '' };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+
+  await import('../src/core/main.js');
+  fireHook('init');
+
+  const api = globalThis.game.modules.get('market').api;
+  assert.ok(api, 'module api attached');
+  assert.equal(typeof api.sellItem, 'function', 'sellItem surface exposed');
+
+  const prevUser = globalThis.game.user;
+  const prevUsers = globalThis.game.users;
+
+  try {
+    // Non-active GM: rejected before any read/write.
+    globalThis.game.user = { id: 'player1', isGM: false };
+    globalThis.game.users = Object.assign({}, prevUsers, {
+      activeGM: { id: 'gm1' },
+      filter: () => [],
+    });
+    const idle = await api.sellItem({
+      shopId: 'shop1',
+      actorId: 'actor1',
+      itemId: 'item1',
+      requestId: 'r1',
+    });
+    assert.equal(idle.status, 'error');
+    assert.equal(idle.error, 'not-active-gm');
+
+    // Active GM: routes into the live selling service. A missing shop surfaces as
+    // shop-not-found, proving the request reached the service with THIS user's id.
+    globalThis.game.user = { id: 'gm1', isGM: true };
+    const res = await api.sellItem({
+      shopId: 'missing',
+      actorId: 'actor1',
+      itemId: 'item1',
+      requestId: 'r2',
+    });
+    assert.equal(res.status, 'error');
+    assert.equal(res.error, 'shop-not-found');
+  } finally {
+    globalThis.game.user = prevUser;
+    globalThis.game.users = prevUsers;
+  }
+});
+
+// ---- M5: runtime GM-only advanced order API guard -----------------------------
+
+test('runtime api.advanced is GM-gated and routes only the active GM into the advanced services', async () => {
+  // Wire enough of the Foundry boundary that main.js `init` can run, then fire it
+  // so the api is attached (module is cached; re-firing re-runs init).
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {}, get: () => '' };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+
+  await import('../src/core/main.js');
+  fireHook('init');
+
+  const api = globalThis.game.modules.get('market').api;
+  assert.ok(api, 'module api attached');
+  assert.equal(typeof api.advanced, 'object', 'advanced surface exposed');
+
+  const { store } = await import('../src/storage/store.js');
+  const origListAdvancedOrders = store.listAdvancedOrders;
+  let listCalls = 0;
+  store.listAdvancedOrders = async () => {
+    listCalls += 1;
+    return [
+      {
+        id: 'o1',
+        key: 'cart:req-1',
+        kind: 'cart',
+        status: 'committed',
+        phase: 'committed',
+        shopId: 'shop1',
+        actorId: 'actor1',
+        entryId: null,
+        relatedOrderId: null,
+        quantity: 2,
+        total: 200,
+        deposit: null,
+        remaining: null,
+        userId: 'player1',
+        createdAt: 100,
+        updatedAt: 200,
+        error: null,
+        details: { unitPrice: 100, fundsBefore: 500, compensation: [] },
+        outcome: { total: 200 },
+        payload: { lines: [{ entryId: 'e1', quantity: 2 }] },
+        intentHash: 'abc123',
+      },
+    ];
+  };
+
+  const prevUser = globalThis.game.user;
+  const prevUsers = globalThis.game.users;
+
+  try {
+    // Non-active GM: rejected before any store read.
+    globalThis.game.user = { id: 'player1', isGM: false };
+    globalThis.game.users = Object.assign({}, prevUsers, {
+      activeGM: { id: 'gm1' },
+      filter: () => [],
+    });
+
+    const idleSvc = await api.advanced.fulfillService({ orderId: 'missing' });
+    assert.equal(idleSvc.status, 'error');
+    assert.equal(idleSvc.error, 'not-active-gm');
+
+    const idlePre = await api.advanced.fulfillPreorder({ orderId: 'missing' });
+    assert.equal(idlePre.status, 'error');
+    assert.equal(idlePre.error, 'not-active-gm');
+
+    const idleCancel = await api.advanced.cancelPreorder({ orderId: 'missing' });
+    assert.equal(idleCancel.status, 'error');
+    assert.equal(idleCancel.error, 'not-active-gm');
+
+    const idleTheft = await api.advanced.resolveTheft({ orderId: 'missing', success: true });
+    assert.equal(idleTheft.status, 'error');
+    assert.equal(idleTheft.error, 'not-active-gm');
+
+    const idleList = await api.advanced.listOrders({ shopId: 'shop1' });
+    assert.equal(idleList.status, 'error');
+    assert.equal(idleList.error, 'not-active-gm');
+    assert.equal(listCalls, 0, 'a non-active GM never reads the advanced-order store');
+
+    // Active GM: routes into the live services (missing order => order-not-found)
+    // and listOrders projects through publicAdvancedOrder, stripping private data.
+    globalThis.game.user = { id: 'gm1', isGM: true };
+
+    const svc = await api.advanced.fulfillService({ orderId: 'missing' });
+    assert.equal(svc.error, 'order-not-found', 'fulfillService reached the service');
+
+    const pre = await api.advanced.fulfillPreorder({ orderId: 'missing' });
+    assert.equal(pre.error, 'order-not-found', 'fulfillPreorder reached the service');
+
+    const cancel = await api.advanced.cancelPreorder({ orderId: 'missing' });
+    assert.equal(cancel.error, 'order-not-found', 'cancelPreorder reached the service');
+
+    const theft = await api.advanced.resolveTheft({ orderId: 'missing', success: true });
+    assert.equal(theft.error, 'order-not-found', 'resolveTheft reached the service');
+
+    const orders = await api.advanced.listOrders({ shopId: 'shop1' });
+    assert.equal(orders.status, 'ok');
+    assert.equal(orders.orders.length, 1);
+    const o = orders.orders[0];
+    assert.equal(o.id, 'o1');
+    assert.equal(o.kind, 'cart');
+    assert.equal(o.status, 'committed');
+    assert.equal(o.shopId, 'shop1');
+    assert.equal(o.quantity, 2);
+    assert.equal(o.total, 200);
+    assert.ok(!('details' in o), 'listOrders strips the private details snapshot');
+    assert.ok(!('outcome' in o));
+    assert.ok(!('payload' in o));
+    assert.ok(!('intentHash' in o));
+  } finally {
+    store.listAdvancedOrders = origListAdvancedOrders;
+    globalThis.game.user = prevUser;
+    globalThis.game.users = prevUsers;
+  }
+});
+
+// ---- M6: runtime GM-only valuation approval gate ------------------------------
+
+test('runtime api.advanced.approveValuation is GM-gated and routes only the active GM into the valuation service', async () => {
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {}, get: () => '' };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+
+  await import('../src/core/main.js');
+  fireHook('init');
+
+  const api = globalThis.game.modules.get('market').api;
+  assert.equal(typeof api.advanced.approveValuation, 'function', 'approveValuation exposed');
+
+  const { store } = await import('../src/storage/store.js');
+  const origFindShop = store.findShop;
+  let findCalls = 0;
+  store.findShop = async () => {
+    findCalls += 1;
+    return null;
+  };
+
+  const prevUser = globalThis.game.user;
+  const prevUsers = globalThis.game.users;
+  const prevActors = globalThis.game.actors;
+
+  try {
+    // Non-active GM: rejected before any store read.
+    globalThis.game.user = { id: 'player1', isGM: false };
+    globalThis.game.users = Object.assign({}, prevUsers, {
+      activeGM: { id: 'gm1' },
+      filter: () => [],
+    });
+
+    const idle = await api.advanced.approveValuation({
+      shopId: 'shop1',
+      actorId: 'actor1',
+      itemId: 'item1',
+      amount: 42,
+    });
+    assert.equal(idle.status, 'error');
+    assert.equal(idle.error, 'not-active-gm');
+    assert.equal(findCalls, 0, 'a non-active GM never reads the shop store');
+
+    // Active GM: routes into the live valuation service. A missing shop surfaces as
+    // shop-not-found, proving the request reached the service with THIS user's id.
+    globalThis.game.user = { id: 'gm1', isGM: true };
+    const res = await api.advanced.approveValuation({
+      shopId: 'missing',
+      actorId: 'actor1',
+      itemId: 'item1',
+      amount: 42,
+    });
+    assert.equal(res.status, 'error');
+    assert.equal(res.error, 'shop-not-found');
+    assert.ok(findCalls >= 1, 'the active GM reached the shop read');
+  } finally {
+    store.findShop = origFindShop;
+    globalThis.game.user = prevUser;
+    globalThis.game.users = prevUsers;
+    globalThis.game.actors = prevActors;
+  }
+});
+
+// ---- M5: storefront cart / special / service / preorder / theft / sell ---------
+
+// Build a GM response whisper for an M5 advanced request so a test can route it
+// through `_onChatMessage` without constructing the chat flag shape by hand.
+function wrapAdvancedResponse(requestId, type, actorId, shopId, result) {
+  const response = { requestId, type, actorId, shopId };
+  if (result) response.result = result;
+  return {
+    flags: {
+      market: {
+        type: 'response',
+        response,
+      },
+    },
+  };
+}
+
+test('storefront M5: adds to cart, removes, and checks out with a barter tender', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true },
+  });
+  app.render = async () => {};
+  app._request = (payload) => {
+    sent.push(payload);
+    return Promise.resolve(null);
+  };
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [] };
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', price: 10, available: true, canBuy: true },
+  ];
+
+  // Add e1 at qty 2; the display projection must reflect the merged price.
+  app.element = {
+    querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '2' } : null),
+  };
+  await app._onAddToCart({}, { dataset: { entryId: 'e1' } }, {});
+  assert.equal(app._data.cartLines.length, 1);
+  assert.deepEqual(app._data.cartLines[0], { entryId: 'e1', quantity: 2, specialId: '' });
+  const ctx = app._prepareContext();
+  assert.equal(ctx.cartLines.length, 1);
+  assert.equal(ctx.cartLines[0].total, 20, 'display total derived from the catalog price');
+  assert.equal(ctx.cartTotal, 20, 'cart total derived');
+
+  // Merge: adding e1 again at qty 3 raises the line to 5.
+  app.element = {
+    querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '3' } : null),
+  };
+  await app._onAddToCart({}, { dataset: { entryId: 'e1' } }, {});
+  assert.equal(app._data.cartLines[0].quantity, 5, 'identical line merged');
+
+  // Remove the line.
+  await app._onRemoveFromCart({}, { dataset: { entryId: 'e1', specialId: '' } }, {});
+  assert.equal(app._data.cartLines.length, 0, 'line removed');
+
+  // Re-add then checkout with a barter tender.
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="quantity"]') return { value: '2' };
+      if (sel === '[name="barterItemId"]') return { value: 'barter-1' };
+      return null;
+    },
+  };
+  await app._onAddToCart({}, { dataset: { entryId: 'e1' } }, {});
+  assert.equal(app._data.cartLines.length, 1);
+  await app._onCheckoutCart({}, {}, {});
+  assert.ok(sent.length >= 1, 'a cart request was sent');
+  const cart = sent[sent.length - 1];
+  assert.equal(cart.type, 'cart');
+  assert.equal(cart.actorId, 'a1');
+  assert.equal(cart.shopId, 'shop1');
+  assert.ok(cart.requestId, 'cart request carries a requestId');
+  assert.deepEqual(cart.lines, [{ entryId: 'e1', quantity: 2, specialId: '' }]);
+  assert.equal(cart.barterItemId, 'barter-1');
+  assert.ok(!('price' in cart), 'cart request never carries a client price');
+  assert.ok(!('success' in cart), 'cart request never carries a client success');
+  assert.equal(app._data.pending, true);
+});
+
+test('storefront M5: cart lines are unique by entry and a special replaces a regular line in place', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true },
+  });
+  app.render = async () => {};
+  app._request = (payload) => {
+    sent.push(payload);
+    return Promise.resolve(null);
+  };
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [{ id: 'sp1', entryId: 'e1' }], services: [] };
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', price: 10, available: true, canBuy: true, visible: true },
+  ];
+
+  // Regular e1 at qty 2.
+  app.element = { querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '2' } : null) };
+  await app._onAddToCart({}, { dataset: { entryId: 'e1' } }, {});
+  assert.deepEqual(app._data.cartLines, [{ entryId: 'e1', quantity: 2, specialId: '' }], 'regular line added');
+
+  // Adding the special over the same entry replaces specialId in place, never
+  // creating a second line for the same entry, and accumulates the quantity.
+  app.element = { querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '3' } : null) };
+  await app._onAddSpecialToCart({}, { dataset: { specialId: 'sp1' } }, {});
+  assert.equal(app._data.cartLines.length, 1, 'no duplicate line for the same entry');
+  assert.equal(app._data.cartLines[0].entryId, 'e1');
+  assert.equal(app._data.cartLines[0].specialId, 'sp1', 'special id replaces the regular line');
+  assert.equal(app._data.cartLines[0].quantity, 5, 'quantity accumulates in place');
+
+  // Adding the regular entry again resets specialId but keeps the accumulated qty.
+  app.element = { querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '1' } : null) };
+  await app._onAddToCart({}, { dataset: { entryId: 'e1' } }, {});
+  assert.equal(app._data.cartLines.length, 1);
+  assert.equal(app._data.cartLines[0].specialId, '', 'regular add resets the special id');
+  assert.equal(app._data.cartLines[0].quantity, 6, 'quantity retained after resetting special');
+
+  // Two distinct entries never collapse into one line.
+  app.element = { querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '1' } : null) };
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', price: 10, available: true, canBuy: true, visible: true },
+    { id: 'e2', name: 'Bread', price: 5, available: true, canBuy: true, visible: true },
+  ];
+  await app._onAddToCart({}, { dataset: { entryId: 'e2' } }, {});
+  assert.equal(app._data.cartLines.length, 2, 'different entries remain distinct lines');
+
+  // Removal is by entryId alone, regardless of any specialId on the line.
+  await app._onRemoveFromCart({}, { dataset: { entryId: 'e1', specialId: 'sp1' } }, {});
+  assert.equal(app._data.cartLines.length, 1, 'remove is by entryId only');
+  assert.equal(app._data.cartLines[0].entryId, 'e2');
+
+  // Re-add a unique line and checkout: only unique entry lines are sent and never
+  // a client price.
+  app.element = { querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '4' } : null) };
+  await app._onAddToCart({}, { dataset: { entryId: 'e1' } }, {});
+  assert.equal(app._data.cartLines.length, 2);
+  await app._onCheckoutCart({}, {}, {});
+  assert.ok(sent.length >= 1, 'a cart request was sent');
+  const cart = sent[sent.length - 1];
+  assert.equal(cart.type, 'cart');
+  assert.deepEqual(cart.lines, [
+    { entryId: 'e2', quantity: 1, specialId: '' },
+    { entryId: 'e1', quantity: 4, specialId: '' },
+  ]);
+  assert.ok(!('price' in cart), 'cart request never carries a client price');
+  assert.equal(app._data.pending, true);
+});
+
+test('storefront M5: a special cart line prices from the personalized shop.specials[].price, never entry.specialPrice or raw', async () => {
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true },
+  });
+  app.render = async () => {};
+  app._request = () => Promise.resolve(null);
+  app._data.selectedActorId = 'a1';
+  // The personalized catalog carry the SOCIAL-QUOTED shop.specials[].price (e.g.
+  // 60 and 70 marked up 10%). With no client price ever sent, the display total
+  // must agree with the GM checkout quote for those offers.
+  app._data.shop = {
+    open: true,
+    specials: [
+      { id: 'sp1', entryId: 'e1', price: 66 },
+      { id: 'sp2', entryId: 'e2', price: 77 },
+    ],
+    services: [],
+  };
+  // `entry.specialPrice` deliberately disagrees with shop.specials[].price to
+  // prove the cart uses the offer list price, never the entry cross-reference.
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', price: 100, available: true, canBuy: true, visible: true, specialId: 'sp1', specialPrice: 60 },
+    { id: 'e2', name: 'Sword', price: 100, available: true, canBuy: true, visible: true, specialId: 'sp2', specialPrice: 70 },
+  ];
+
+  app.element = { querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '2' } : null) };
+  await app._onAddSpecialToCart({}, { dataset: { specialId: 'sp1' } }, {});
+  app.element = { querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '1' } : null) };
+  await app._onAddSpecialToCart({}, { dataset: { specialId: 'sp2' } }, {});
+
+  const ctx = app._prepareContext();
+  assert.equal(ctx.cartLines.length, 2);
+  const sp1 = ctx.cartLines.find((l) => l.specialId === 'sp1');
+  const sp2 = ctx.cartLines.find((l) => l.specialId === 'sp2');
+  // Unit/total come from shop.specials[].price (66 / 77), not entry.specialPrice.
+  assert.equal(sp1.unitPrice, 66);
+  assert.equal(sp1.total, 132);
+  assert.equal(sp2.unitPrice, 77);
+  assert.equal(sp2.total, 77);
+  // The displayed total equals the GM checkout quote for the personalized offers.
+  assert.equal(ctx.cartTotal, 132 + 77);
+  // With a character selected the cart is NOT an estimate.
+  assert.equal(ctx.cartEstimate, false);
+});
+
+test('storefront M5: no character selected annotates the cart as an estimate and the checkout is disabled', async () => {
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true },
+  });
+  app.render = async () => {};
+  app._request = () => Promise.resolve(null);
+  // No character selected (null) => the base public catalog.
+  app._data.selectedActorId = null;
+  app._data.shop = {
+    open: true,
+    specials: [{ id: 'sp1', entryId: 'e1', price: 60 }],
+    services: [],
+  };
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', price: 100, available: true, canBuy: true, visible: true },
+  ];
+  app._data.cartLines = [{ entryId: 'e1', quantity: 2, specialId: 'sp1' }];
+
+  const ctx = app._prepareContext();
+  assert.equal(ctx.cartTotal, 120);
+  assert.equal(ctx.cartEstimate, true, 'no-actor cart is annotated as an estimate');
+  // The checkout request is guarded: with no actor `_requestAdvanced` refuses and
+  // shows the "choose a character" feedback rather than sending.
+  const sent = [];
+  app._request = (p) => {
+    sent.push(p);
+    return Promise.resolve(null);
+  };
+  let sentAny = false;
+  app._data.pending = false;
+  await app._onCheckoutCart({}, {}, {});
+  const sentCart = sent.find((s) => s.type === 'cart');
+  assert.ok(!sentCart, 'no cart request is sent without a selected character');
+  assert.equal(app._data.feedback, 'Choose a character to shop as.');
+  // An explicit empty (undefined) selection is treated the same way.
+  app._data.selectedActorId = undefined;
+  assert.equal(app._prepareContext().cartEstimate, true);
+});
+
+test('storefront M5: an actor switch clears the cart and abandons pending advanced requests', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: {
+      hasActiveGM: () => true,
+      request: async (p) => {
+        sent.push(p);
+        return null;
+      },
+    },
+  });
+  app.render = async () => {};
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [] };
+  app._data.cartLines = [{ entryId: 'e1', quantity: 2, specialId: '' }];
+  app._data.pending = true;
+  app._pendingAdvancedRequestId = 'adv-1';
+  app._pendingAdvancedType = 'cart';
+  await app._onSelectActor({}, { value: 'a2' }, {});
+  assert.equal(app._data.selectedActorId, 'a2');
+  assert.equal(app._data.cartLines.length, 0, 'cart cleared on actor switch');
+  assert.equal(app._data.pending, false, 'pending abandoned on switch');
+  assert.equal(app._pendingAdvancedRequestId, null);
+  assert.equal(app._pendingAdvancedType, null);
+  assert.ok(sent.length >= 1, 'a catalog refresh was issued');
+  const last = sent[sent.length - 1];
+  assert.equal(last.type, 'catalog');
+  assert.equal(last.actorId, 'a2', 'refresh for the newly selected actor');
+});
+
+test('storefront M5: books a service through an authenticated request', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true },
+  });
+  app.render = async () => {};
+  app._request = (payload) => {
+    sent.push(payload);
+    return Promise.resolve(null);
+  };
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [{ id: 'svc1', name: 'Repair' }] };
+  app._data.inventory = [];
+  await app._onBookService({}, { dataset: { serviceId: 'svc1' } }, {});
+  assert.ok(sent.length >= 1, 'a service request was sent');
+  const req = sent[sent.length - 1];
+  assert.equal(req.type, 'service');
+  assert.equal(req.serviceId, 'svc1');
+  assert.equal(req.actorId, 'a1');
+  assert.equal(req.shopId, 'shop1');
+  assert.ok(req.requestId, 'service request carries a requestId');
+  assert.ok(!('success' in req), 'service never carries a client success');
+  assert.ok(!('price' in req), 'service never carries a client price');
+  assert.equal(app._data.pending, true);
+});
+
+test('storefront M5: derives sellable owned items and sells a selected whole item', async () => {
+  const sent = [];
+  const actor = {
+    items: [
+      { id: 'i1', name: 'Sword', system: { quantity: 1 } },
+      { id: 'i2', name: 'Shield', system: { quantity: 3 } },
+      { id: 'i3', name: 'Ring', system: {} },
+    ],
+  };
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true, getActor: (id) => (id === 'a1' ? actor : null) },
+  });
+  app.render = async () => {};
+  app._request = (payload) => {
+    sent.push(payload);
+    return Promise.resolve(null);
+  };
+  app._data.selectedActorId = 'a1';
+  app._data.shop = {
+    open: true,
+    specials: [],
+    services: [],
+    // Only GM-approved items may be sold/bartered; i1 and i3 are approved, the
+    // stacked i2 is not (and is excluded by the whole-item rule regardless).
+    approvedItems: [{ itemId: 'i1', amount: 100 }, { itemId: 'i3', amount: 50 }],
+  };
+  app._data.inventory = [];
+  const ctx = app._prepareContext();
+  assert.deepEqual(ctx.sellItems.map((i) => i.id).sort(), ['i1', 'i3'], 'stacked item excluded');
+  assert.deepEqual(ctx.barterItems.map((i) => i.id).sort(), ['i1', 'i3'], 'same list for barter');
+
+  app.element = {
+    querySelector: (sel) => (sel === '[name="sellItemId"]' ? { value: 'i1' } : null),
+  };
+  await app._onSellItem({}, {}, {});
+  assert.ok(sent.length >= 1, 'a sell request was sent');
+  const req = sent[sent.length - 1];
+  assert.equal(req.type, 'sell');
+  assert.equal(req.itemId, 'i1');
+  assert.equal(req.actorId, 'a1');
+  assert.equal(req.shopId, 'shop1');
+  assert.ok(req.requestId, 'sell request carries a requestId');
+  assert.ok(!('price' in req), 'a sell never carries a client price');
+  assert.ok(!('success' in req), 'a sell never carries a client success');
+});
+
+test('storefront M5: only GM-approved items are offered for sell/barter', async () => {
+  const actor = {
+    items: [
+      { id: 'i1', name: 'Sword', system: { quantity: 1 } },
+      { id: 'i3', name: 'Ring', system: {} },
+    ],
+  };
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true, getActor: (id) => (id === 'a1' ? actor : null) },
+  });
+  app.render = async () => {};
+  app._data.selectedActorId = 'a1';
+  app._data.shop = {
+    open: true,
+    specials: [],
+    services: [],
+    approvedItems: [{ itemId: 'i1', amount: 100 }],
+  };
+  app._data.inventory = [];
+  const ctx = app._prepareContext();
+  assert.deepEqual(ctx.sellItems.map((i) => i.id), ['i1'], 'an unapproved owned item is dropped');
+  assert.equal(ctx.sellEmpty, false);
+  assert.deepEqual(ctx.barterItems.map((i) => i.id), ['i1'], 'barter dropdown mirrors the allowlist');
+});
+
+test('storefront M5: shows the ask-GM message when no item is approved', async () => {
+  const actor = {
+    items: [
+      { id: 'i1', name: 'Sword', system: { quantity: 1 } },
+      { id: 'i3', name: 'Ring', system: {} },
+    ],
+  };
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true, getActor: (id) => (id === 'a1' ? actor : null) },
+  });
+  app.render = async () => {};
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [], approvedItems: [] };
+  app._data.inventory = [];
+  const ctx = app._prepareContext();
+  assert.deepEqual(ctx.sellItems, [], 'no approved item => nothing offered');
+  assert.equal(ctx.sellEmpty, true, 'no approvals => ask-GM message flag');
+  // With no character selected nothing is offered but the ask-GM message is off.
+  app._data.selectedActorId = null;
+  const ctx2 = app._prepareContext();
+  assert.equal(ctx2.sellEmpty, false, 'no actor chosen => no ask-GM message');
+});
+
+test('storefront M5: approved-only filtering never offers an item for a different actor', async () => {
+  const actorA = {
+    items: [{ id: 'i1', name: 'Sword', system: { quantity: 1 } }],
+  };
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: {
+      hasActiveGM: () => true,
+      getActor: (id) => (id === 'a1' ? actorA : null),
+    },
+  });
+  app.render = async () => {};
+  app._data.selectedActorId = 'a1';
+  // The allowlist only carries i1 for this actor; an owned stacked i2 is absent.
+  app._data.shop = {
+    open: true,
+    specials: [],
+    services: [],
+    approvedItems: [{ itemId: 'i1', amount: 100 }],
+  };
+  app._data.inventory = [];
+  const ctx = app._prepareContext();
+  assert.deepEqual(ctx.sellItems.map((i) => i.id), ['i1']);
+  // A sell request still carries no client price - the amount is server-side.
+  app.element = {
+    querySelector: (sel) => (sel === '[name="sellItemId"]' ? { value: 'i1' } : null),
+  };
+  const sent = [];
+  app._request = async (payload) => {
+    sent.push(payload);
+    return null;
+  };
+  await app._onSellItem({}, {}, {});
+  const req = sent[sent.length - 1];
+  assert.equal(req.itemId, 'i1');
+  assert.ok(!('price' in req), 'a sell never carries a client price');
+  assert.ok(!('amount' in req), 'a sell never carries a client amount');
+});
+
+test('manager approves a GM item valuation through the advanced channel and refreshes', async () => {
+  const approved = [];
+  let refreshed = 0;
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      listActors: () => [{ id: 'a1', name: 'A', uuid: 'Actor.a1' }],
+      getActor: async (id) => ({ id, uuid: `Actor.${id}`, name: 'A', items: [] }),
+      approveValuation: async (params) => {
+        approved.push(params);
+        return { status: 'approved', valuationId: 'v1', itemName: 'Sword', amount: params.amount };
+      },
+    },
+  });
+  app._refreshData = async () => {
+    refreshed++;
+  };
+  app.render = async () => {};
+  app._data.selectedShopId = 'shop1';
+  app._data.selectedReputationActorId = 'a1';
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="valuationItemId"]') return { value: 'i1' };
+      if (sel === '[name="valuationAmount"]') return { value: '75', type: 'number' };
+      return null;
+    },
+  };
+  await app._onApproveValuation({}, {}, {});
+  assert.equal(approved.length, 1);
+  assert.deepEqual(
+    approved[0],
+    { shopId: 'shop1', actorId: 'a1', itemId: 'i1', amount: 75 }
+  );
+  assert.equal(refreshed, 1, 'the shop is refreshed after an approval');
+  assert.equal(app._data.notice, 'Valuation approved for Sword.');
+});
+
+test('manager valuation action validates a chosen item and a positive amount', async () => {
+  const approved = [];
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      listActors: () => [{ id: 'a1', name: 'A', uuid: 'Actor.a1' }],
+      getActor: async (id) => ({ id, uuid: `Actor.${id}`, name: 'A', items: [] }),
+      approveValuation: async (params) => {
+        approved.push(params);
+        return { status: 'approved', valuationId: 'v1', itemName: 'Sword', amount: 75 };
+      },
+    },
+  });
+  app.render = async () => {};
+  app._refreshData = async () => {};
+  app._data.selectedShopId = 'shop1';
+  app._data.selectedReputationActorId = 'a1';
+  // No item chosen => no request, and a helpful notice.
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="valuationItemId"]') return { value: '' };
+      if (sel === '[name="valuationAmount"]') return { value: '75', type: 'number' };
+      return null;
+    },
+  };
+  await app._onApproveValuation({}, {}, {});
+  assert.equal(approved.length, 0, 'no request sent without a chosen item');
+  assert.equal(app._data.notice, 'Choose an item to value.');
+  // A non-positive (or non-integer) amount is rejected.
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="valuationItemId"]') return { value: 'i1' };
+      if (sel === '[name="valuationAmount"]') return { value: '0', type: 'number' };
+      return null;
+    },
+  };
+  await app._onApproveValuation({}, {}, {});
+  assert.equal(approved.length, 0);
+  assert.equal(app._data.notice, 'The valuation must be a positive whole number.');
+  // A valid amount sends the request.
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="valuationItemId"]') return { value: 'i1' };
+      if (sel === '[name="valuationAmount"]') return { value: '5', type: 'number' };
+      return null;
+    },
+  };
+  await app._onApproveValuation({}, {}, {});
+  assert.equal(approved.length, 1);
+  assert.equal(approved[0].amount, 5);
+});
+
+test('storefront M5: preorder and theft requests carry no client success or price', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true },
+  });
+  app.render = async () => {};
+  app._request = (payload) => {
+    sent.push(payload);
+    return Promise.resolve(null);
+  };
+  app._data.selectedActorId = 'a1';
+  app._data.shop = {
+    open: true,
+    specials: [],
+    services: [],
+    preordersEnabled: true,
+    theftEnabled: true,
+  };
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', price: 10, canPreorder: true, canAttemptTheft: true, available: true },
+  ];
+
+  // Preorder via the select; quantity 2.
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="quantity"]') return { value: '2' };
+      if (sel === '[name="preorderEntryId"]') return { value: 'e1' };
+      return null;
+    },
+  };
+  await app._onPlacePreorder({}, {}, {});
+  assert.ok(sent.length >= 1, 'a preorder request was sent');
+  let req = sent[sent.length - 1];
+  assert.equal(req.type, 'preorder');
+  assert.equal(req.entryId, 'e1');
+  assert.equal(req.quantity, 2);
+  assert.ok(!('success' in req), 'preorder never carries a success');
+  assert.ok(!('price' in req), 'preorder never carries a price');
+
+  // Theft via the select (pending reset so the second request can send).
+  app._data.pending = false;
+  app.element = {
+    querySelector: (sel) => (sel === '[name="theftEntryId"]' ? { value: 'e1' } : null),
+  };
+  await app._onAttemptTheft({}, {}, {});
+  req = sent[sent.length - 1];
+  assert.equal(req.type, 'theft');
+  assert.equal(req.entryId, 'e1');
+  assert.ok(!('success' in req), 'theft never carries a client success');
+  assert.ok(!('price' in req), 'theft never carries a client price');
+});
+
+test('storefront M5: preorder and theft accept a data-entry-id from the product card', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true },
+  });
+  app.render = async () => {};
+  app._request = (payload) => {
+    sent.push(payload);
+    return Promise.resolve(null);
+  };
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [] };
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', canPreorder: true, canAttemptTheft: true, available: true },
+  ];
+  app.element = {
+    querySelector: (sel) => (sel === '[name="quantity"]' ? { value: '1' } : null),
+  };
+  await app._onPlacePreorder({}, { dataset: { entryId: 'e1' } }, {});
+  assert.equal(sent[sent.length - 1].type, 'preorder');
+  assert.equal(sent[sent.length - 1].entryId, 'e1');
+  app._data.pending = false;
+  await app._onAttemptTheft({}, { dataset: { entryId: 'e1' } }, {});
+  assert.equal(sent[sent.length - 1].type, 'theft');
+  assert.equal(sent[sent.length - 1].entryId, 'e1');
+});
+
+test('storefront M5: rejects a stale advanced response and applies only a matching one', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { isGM: () => true } });
+  app.render = async () => {};
+  app._request = async () => null;
+  app._data.selectedActorId = 'a2';
+  app._data.shop = { open: true, specials: [], services: [] };
+  app._data.cartLines = [{ entryId: 'e1', quantity: 1, specialId: '' }];
+  app._pendingAdvancedRequestId = 'adv-1';
+  app._pendingAdvancedType = 'cart';
+  app._data.pending = true;
+
+  // Wrong actor: ignored, cart untouched.
+  await app._onChatMessage(wrapAdvancedResponse('adv-1', 'cart', 'a1', 'shop1', { status: 'committed' }), {}, 'gm1');
+  assert.equal(app._pendingAdvancedRequestId, 'adv-1', 'stale-actor response ignored');
+  assert.equal(app._data.cartLines.length, 1, 'cart not cleared by a stale actor');
+
+  // Wrong shop: ignored.
+  await app._onChatMessage(wrapAdvancedResponse('adv-1', 'cart', 'a2', 'other-shop', { status: 'committed' }), {}, 'gm1');
+  assert.equal(app._pendingAdvancedRequestId, 'adv-1', 'stale-shop response ignored');
+
+  // Matching: applied, cart cleared, refresh issued.
+  await app._onChatMessage(wrapAdvancedResponse('adv-1', 'cart', 'a2', 'shop1', { status: 'committed' }), {}, 'gm1');
+  assert.equal(app._pendingAdvancedRequestId, null);
+  assert.equal(app._data.cartLines.length, 0, 'matched cart clears the cart');
+  assert.equal(app._data.pending, false);
+  assert.equal(app._data.feedback, 'Cart checkout complete.');
+});
+
+test('storefront M5: advanced responses report booked status truthfully', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { hasActiveGM: () => true } });
+  app.render = async () => {};
+  app._request = async () => null;
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [] };
+  await app._onAdvancedResponse({ type: 'service', result: { status: 'booked' }, actorId: 'a1', shopId: 'shop1' });
+  assert.equal(app._data.feedback, 'Service booked.');
+  assert.ok(!app._data.feedback.includes('fulfilled'), 'a booked service is not reported fulfilled');
+
+  await app._onAdvancedResponse({ type: 'preorder', result: { status: 'booked' }, actorId: 'a1', shopId: 'shop1' });
+  assert.equal(app._data.feedback, 'Preorder placed.');
+
+  await app._onAdvancedResponse({ type: 'theft', result: { status: 'booked' }, actorId: 'a1', shopId: 'shop1' });
+  assert.ok(app._data.feedback.includes('awaiting the GM'), 'a theft claim is not pre-resolved');
+  assert.ok(!app._data.feedback.includes('succeeded'));
+});
+
+test('storefront M5: advanced requests guard on actor, GM, open shop and pending', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: { hasActiveGM: () => true },
+  });
+  app.render = async () => {};
+  app._request = (payload) => {
+    sent.push(payload);
+    return Promise.resolve(null);
+  };
+
+  // No actor selected.
+  app._data.selectedActorId = null;
+  app._data.shop = { open: true };
+  let ok = app._requestAdvanced('service', { serviceId: 'svc1' });
+  assert.equal(ok, false);
+  assert.ok(app._data.feedback.includes('character'), 'no-actor feedback');
+
+  // Selected actor but shop closed.
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: false };
+  ok = app._requestAdvanced('service', { serviceId: 'svc1' });
+  assert.equal(ok, false);
+  assert.ok(app._data.feedback.includes('closed'), 'closed-shop feedback');
+
+  // No active GM.
+  app._data.shop = { open: true };
+  app._deps.hasActiveGM = () => false;
+  ok = app._requestAdvanced('service', { serviceId: 'svc1' });
+  assert.equal(ok, false);
+  assert.ok(app._data.feedback.includes('Game Master'), 'no-GM feedback');
+  app._deps.hasActiveGM = () => true;
+
+  // A pending request blocks another.
+  app._data.pending = true;
+  ok = app._requestAdvanced('service', { serviceId: 'svc1' });
+  assert.equal(ok, false);
+  app._data.pending = false;
+
+  // Valid request sends.
+  ok = app._requestAdvanced('service', { serviceId: 'svc1' });
+  assert.equal(ok, true);
+  assert.equal(app._data.pending, true);
+  assert.equal(sent[sent.length - 1].type, 'service');
+  assert.equal(sent[sent.length - 1].serviceId, 'svc1');
+});
+
+test('storefront M5: M1 direct Buy is unaffected by an in-progress cart', async () => {
+  const sent = [];
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { hasActiveGM: () => true } });
+  app.render = async () => {};
+  app._request = (payload) => {
+    sent.push(payload);
+    return Promise.resolve(null);
+  };
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [] };
+  app._data.inventory = [{ id: 'e1', name: 'Potion', price: 10, canBuy: true, available: true }];
+  app._data.cartLines = [{ entryId: 'e1', quantity: 1, specialId: '' }];
+  app._readQuantity = () => 2;
+  app._onBuy({}, { dataset: { entryId: 'e1' } }, {});
+  await Promise.resolve();
+  assert.ok(sent.length >= 1, 'a purchase request was sent');
+  const req = sent[sent.length - 1];
+  assert.equal(req.type, 'purchase');
+  assert.equal(req.entryId, 'e1');
+  assert.equal(req.quantity, 2);
+  assert.ok(!('lines' in req), 'a direct buy never carries cart lines');
+  assert.equal(app._data.cartLines.length, 1, 'cart untouched by a direct buy');
+});
+
+test('storefront M5: catalog refresh prunes cart lines for entries no longer on display', () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: {} });
+  app.render = async () => {};
+  app._data.cartLines = [
+    { entryId: 'e1', quantity: 2, specialId: '' },
+    { entryId: 'e2', quantity: 1, specialId: '' },
+  ];
+  app._data.inventory = [{ id: 'e1', name: 'Potion', price: 10 }];
+  app._onCatalogResponse({
+    type: 'catalog',
+    shop: { id: 'shop1', open: true, specials: [], services: [] },
+    inventory: [{ id: 'e1', name: 'Potion', price: 10 }],
+    merchants: [],
+  });
+  assert.equal(app._data.cartLines.length, 1, 'unavailable line pruned');
+  assert.equal(app._data.cartLines[0].entryId, 'e1');
+});
+
+// ---- M5: manager commerce settings, service/special editor, order actions ----
+
+test('manager save-commerce maps unlimited funds to null and persists valid rates', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    commerce: {
+      funds: 100,
+      buyRateBps: 100,
+      buybackRateBps: 150,
+      preorders: { enabled: false, depositBps: 50, maxPerActor: 1 },
+      theft: { enabled: false },
+      services: [],
+      specials: [],
+    },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) =>
+      sel === '.commerce-panel'
+        ? fakeCommercePanel({
+            unlimitedFunds: true,
+            buyRateBps: 200,
+            buybackRateBps: 250,
+            preordersEnabled: true,
+            depositBps: 100,
+            maxPerActor: 3,
+            theftEnabled: true,
+          })
+        : null,
+  };
+  await app._onSaveCommerce({}, {}, {});
+  const commerce = store._shops.get('shop1').commerce;
+  assert.equal(commerce.funds, null, 'unlimited funds maps funds to null');
+  assert.equal(commerce.buyRateBps, 200);
+  assert.equal(commerce.buybackRateBps, 250);
+  assert.equal(commerce.preorders.enabled, true);
+  assert.equal(commerce.preorders.depositBps, 100);
+  assert.equal(commerce.preorders.maxPerActor, 3);
+  assert.equal(commerce.theft.enabled, true);
+});
+
+test('manager save-commerce enforces finite funds when unlimited is unchecked', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    commerce: { funds: null, buyRateBps: 100, buybackRateBps: 150, preorders: {}, theft: {} },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) =>
+      sel === '.commerce-panel'
+        ? fakeCommercePanel({ merchantFunds: 350, unlimitedFunds: false, buyRateBps: 100, buybackRateBps: 150 })
+        : null,
+  };
+  await app._onSaveCommerce({}, {}, {});
+  assert.equal(store._shops.get('shop1').commerce.funds, 350, 'a concrete funds value is persisted');
+});
+
+test('manager save-commerce rejects a buyback rate below the buy rate without writing', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    commerce: { funds: 100, buyRateBps: 100, buybackRateBps: 150, preorders: {}, theft: {} },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  let refreshed = 0;
+  app._refreshData = async () => {
+    refreshed += 1;
+  };
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) =>
+      sel === '.commerce-panel'
+        ? fakeCommercePanel({ merchantFunds: 100, buyRateBps: 200, buybackRateBps: 150 })
+        : null,
+  };
+  await app._onSaveCommerce({}, {}, {});
+  assert.match(app._data.notice, /buybackRateBps/, 'invalid rate surfaced in the notice');
+  assert.equal(store._shops.get('shop1').commerce.buyRateBps, 100, 'no write on an invalid rate');
+  assert.equal(refreshed, 0, 'no data refresh after a validation error');
+});
+
+test('manager save-services merges edits by id and preserves a concurrently added service', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    commerce: {
+      services: [
+        { id: 'svc1', name: 'Repair', description: '', price: 5, visible: true, enabled: true },
+        { id: 'svc2', name: 'Heal', description: '', price: 8, visible: true, enabled: true },
+      ],
+      specials: [],
+    },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = fakeElement({
+    '[data-service-id]': [fakeServiceRow('svc1', { name: 'Repair (updated)', price: 12 })],
+  });
+  await app._onSaveServices({}, {}, {});
+  const services = store._shops.get('shop1').commerce.services;
+  assert.equal(services.length, 2, 'no service is deleted by a save');
+  const byId = Object.fromEntries(services.map((s) => [s.id, s]));
+  assert.equal(byId.svc1.name, 'Repair (updated)', 'edit applied to svc1');
+  assert.equal(byId.svc1.price, 12);
+  assert.equal(byId.svc2.name, 'Heal', 'svc2 absent from the DOM is preserved, not deleted');
+  assert.equal(app._data.notice, '', 'no fail-closed notice on a valid merge');
+});
+
+test('manager save-services fails closed on a forged row id and never deletes missing services', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    commerce: { services: [{ id: 'svc1', name: 'Repair', description: '', price: 5, visible: true, enabled: true }], specials: [] },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  let refreshed = 0;
+  app._refreshData = async () => {
+    refreshed += 1;
+  };
+  app.render = async () => {};
+  app.element = fakeElement({
+    '[data-service-id]': [
+      fakeServiceRow('svc1', { name: 'Repaired' }),
+      fakeServiceRow('forged', { name: 'Ghost' }),
+    ],
+  });
+  await app._onSaveServices({}, {}, {});
+  const services = store._shops.get('shop1').commerce.services;
+  assert.equal(services.length, 1, 'forged id failed closed; nothing was written');
+  assert.equal(services[0].name, 'Repair', 'svc1 is unchanged (no write)');
+  assert.match(app._data.notice, /no longer matches a saved service/, 'fail-closed notice surfaced');
+  assert.equal(refreshed, 0, 'no data refresh after a fail-closed (form preserved)');
+});
+
+test('manager save-specials rejects a special whose inventory item is gone', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [{ id: 'e1', name: 'Potion', itemUuid: 'Item.p1', price: 10, quantity: 5, stockMode: 'finite' }],
+    commerce: { specials: [{ id: 'sp1', title: 'Deal', description: '', price: 4, visible: true, entryId: 'e1', actorUuids: [] }], services: [] },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = fakeElement({
+    '[data-special-id]': [fakeSpecialRow('sp1', { title: 'Deal', price: 4, entryId: 'ghost', actorUuids: '' })],
+  });
+  await app._onSaveSpecials({}, {}, {});
+  assert.equal(store._shops.get('shop1').commerce.specials[0].entryId, 'e1', 'no write on a missing entry');
+  assert.match(app._data.notice, /no longer available/, 'missing-entry notice surfaced');
+});
+
+test('manager save-specials validates actor UUIDs through normalization', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [{ id: 'e1', name: 'Potion', itemUuid: 'Item.p1', price: 10, quantity: 5, stockMode: 'finite' }],
+    commerce: { specials: [{ id: 'sp1', title: 'Deal', description: '', price: 4, visible: true, entryId: 'e1', actorUuids: [] }], services: [] },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = fakeElement({
+    '[data-special-id]': [
+      fakeSpecialRow('sp1', { title: 'Deal', price: 4, entryId: 'e1', actorUuids: 'Actor.abc, notauuid' }),
+    ],
+  });
+  await app._onSaveSpecials({}, {}, {});
+  assert.match(app._data.notice, /actorUuids/, 'invalid actor UUID surfaced');
+  assert.equal(store._shops.get('shop1').commerce.specials[0].actorUuids.length, 0, 'no write on invalid actor uuids');
+});
+
+test('manager save-specials merges edits by id and preserves a concurrently added special', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [{ id: 'e1', name: 'Potion', itemUuid: 'Item.p1', price: 10, quantity: 5, stockMode: 'finite' }],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'Old deal', description: '', price: 4, visible: true, entryId: 'e1', actorUuids: [] },
+        { id: 'sp2', title: 'Kept deal', description: '', price: 9, visible: true, entryId: 'e1', actorUuids: [] },
+      ],
+      services: [],
+    },
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = fakeElement({
+    '[data-special-id]': [fakeSpecialRow('sp1', { title: 'New deal', price: 6, entryId: 'e1', actorUuids: '' })],
+  });
+  await app._onSaveSpecials({}, {}, {});
+  const specials = store._shops.get('shop1').commerce.specials;
+  assert.equal(specials.length, 2, 'no special is deleted by a save');
+  const byId = Object.fromEntries(specials.map((s) => [s.id, s]));
+  assert.equal(byId.sp1.title, 'New deal', 'edit applied to sp1');
+  assert.equal(byId.sp1.price, 6);
+  assert.equal(byId.sp2.title, 'Kept deal', 'sp2 absent from the DOM is preserved, not deleted');
+  assert.equal(app._data.notice, '', 'no fail-closed notice on a valid merge');
+});
+
+test('manager source binds the special inventory select directly to the special block parameter', () => {
+  // The special editor renders a nested inventory <select> by iterating
+  // `../selectedShop.inventory` with a `entry` block parameter. To preselect the
+  // entry the special is bound to it must reference the OUTER `special` block
+  // parameter directly (lexically scoped). A grandparent `../../special.entryId`
+  // path would resolve against the ROOT context, which carries no `special`, so
+  // no option would ever be marked selected.
+  const template = readFileSync(new URL('../templates/manager.hbs', import.meta.url), 'utf8');
+  assert.match(
+    template,
+    /\(eq special\.entryId entry\.id\)/,
+    'the special select compares the special entry id against the iterated entry'
+  );
+  assert.ok(
+    !template.includes('../../special.entryId'),
+    'no grandparent-scoped special entry id path remains'
+  );
+});
+
+test('manager add/remove service and special are active-GM gated and capped', async () => {
+  // Non-active GM: no store write, only the notice.
+  const store = makePersistentShopStore([
+    { id: 'shop1', name: 'S', locationId: 'loc1', open: true, inventory: [], commerce: { services: [], specials: [] } },
+  ]);
+  const app = new MarketManager({ deps: { store, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => false } });
+  app._data.selectedShopId = 'shop1';
+  app.render = async () => {};
+  app._refreshData = async () => {};
+  await app._onAddService({}, {}, {});
+  assert.equal(store._shops.get('shop1').commerce.services.length, 0, 'non-active GM does not add');
+  assert.match(app._data.notice, /active Game Master/);
+
+  // Active GM: add a service, then hit the cap.
+  const runShopExclusive = (_id, fn) => fn();
+  const store2 = makePersistentShopStore([
+    {
+      id: 'shop1',
+      name: 'S',
+      locationId: 'loc1',
+      open: true,
+      inventory: [],
+      commerce: {
+        services: Array.from({ length: 20 }, (_, i) => ({ id: `svc${i}`, name: `S${i}`, description: '', price: 1, visible: true, enabled: true })),
+        specials: [],
+      },
+    },
+  ]);
+  const app2 = new MarketManager({ deps: { store: store2, runShopExclusive, systemId: () => 'dnd5e', isGM: () => true, isActiveGM: () => true } });
+  app2._data.selectedShopId = 'shop1';
+  app2.render = async () => {};
+  app2._refreshData = async () => {};
+  await app2._onAddService({}, {}, {});
+  assert.equal(store2._shops.get('shop1').commerce.services.length, 20, 'cap enforced');
+  assert.equal(app2._data.notice, 'A shop can have at most twenty services.');
+
+  // Remove by id.
+  await app2._onRemoveService({}, { dataset: { serviceId: 'svc3' } }, {});
+  assert.equal(store2._shops.get('shop1').commerce.services.length, 19, 'only the matching service removed');
+  assert.ok(!store2._shops.get('shop1').commerce.services.some((s) => s.id === 'svc3'));
+});
+
+test('manager GM order actions only offer manual adjudication for booked orders and disable for a non-active GM', () => {
+  const template = readFileSync(new URL('../templates/manager.hbs', import.meta.url), 'utf8');
+  // The order cards gate each action on `booked` (services toString to a booked
+  // order, not pending).
+  assert.match(template, /\{\{#if \(eq order\.status "booked"\)\}\}/, 'order actions gate on booked');
+  assert.ok(!template.includes('order.status "pending"'), 'no pending gating remains');
+  assert.match(template, /data-action="fulfill-service"[\s\S]*?\{\{#unless (\.\.\/)?isActiveGM\}\}disabled/, 'fulfill-service disabled for non-active GM');
+  assert.match(template, /data-action="fulfill-preorder"[\s\S]*?\{\{#unless (\.\.\/)?isActiveGM\}\}disabled/, 'fulfill-preorder disabled for non-active GM');
+  assert.match(template, /data-action="cancel-preorder"[\s\S]*?\{\{#unless (\.\.\/)?isActiveGM\}\}disabled/, 'cancel-preorder disabled for non-active GM');
+  assert.match(template, /data-action="resolve-theft-success"[\s\S]*?\{\{#unless (\.\.\/)?isActiveGM\}\}disabled/, 'resolve-theft-success disabled for non-active GM');
+  assert.match(template, /data-action="resolve-theft-failure"[\s\S]*?\{\{#unless (\.\.\/)?isActiveGM\}\}disabled/, 'resolve-theft-failure disabled for non-active GM');
+  // Inside the advancedOrders loop the active-GM scope must step OUT of the
+  // `{{#each advancedOrders as |order|}}` block, so every order button references
+  // `../isActiveGM` - never the shadowed `isActiveGM` (which is undefined and would
+  // disable the button for an active GM).
+  assert.ok(template.includes('{{#unless ../isActiveGM}}disabled'), 'order actions use the parent-scope isActiveGM');
+  // Bound the scan to the advanced-orders section so legitimate bare guards in the
+  // editor/generator sections (outside the loop) do not trip the check.
+  const orderBlock = template.slice(
+    template.indexOf('data-action="fulfill-service"'),
+    template.indexOf('data-action="next-orders"')
+  );
+  assert.ok(
+    !orderBlock.includes('{{#unless isActiveGM}}'),
+    'no shadowed isActiveGM guard remains inside the order each loop'
+  );
+  // The commerce/special/service editor controls are read-only for a non-active GM.
+  assert.match(template, /\{\{#unless (\.\.\/)?isActiveGM\}\}disabled/, 'commerce editor controls disabled for non-active GM');
+  // The advanced-order list pages through booked records, exposing next/previous.
+  assert.match(template, /data-action="next-orders"/, 'next-orders navigation present');
+  assert.match(template, /data-action="prev-orders"/, 'prev-orders navigation present');
+  assert.ok(template.includes('{{#if hasPreviousOrders}}'), 'prev gated on hasPreviousOrders');
+  assert.ok(template.includes('{{#if hasNextOrders}}'), 'next gated on hasNextOrders');
+});
+
+test('manager GM order action calls the advanced service with a fresh requestId and reports the outcome', async () => {
+  const calls = [];
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      fulfillService: async (p) => {
+        calls.push(p);
+        return { status: 'fulfilled', orderId: p.orderId };
+      },
+    },
+  });
+  app._data.selectedShopId = 'shop1';
+  let ordersOnly = 0;
+  app._refreshOrdersOnly = async () => {
+    ordersOnly += 1;
+  };
+  app.render = async () => {};
+  await app._onFulfillService({}, { dataset: { orderId: 'o1' } }, {});
+  assert.equal(calls.length, 1, 'the advanced service is called');
+  assert.equal(calls[0].orderId, 'o1', 'the order id is passed');
+  assert.ok(calls[0].requestId, 'a fresh idempotency requestId is passed');
+  assert.equal(app._data.notice, 'Order marked fulfilled.');
+  assert.ok(ordersOnly >= 1, 'orders are refreshed (never the shop)');
+});
+
+test('manager GM order actions are active-GM gated', async () => {
+  let calls = 0;
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => false,
+      fulfillService: async () => {
+        calls += 1;
+        return { status: 'fulfilled' };
+      },
+    },
+  });
+  app._data.selectedShopId = 'shop1';
+  app.render = async () => {};
+  app._refreshOrdersOnly = async () => {};
+  await app._onFulfillService({}, { dataset: { orderId: 'o1' } }, {});
+  assert.equal(calls, 0, 'no advanced call for a non-active GM');
+  assert.match(app._data.notice, /active Game Master/);
+});
+
+test('manager GM order list pages through booked advanced orders (status booked, page size 100) and exposes next/previous', async () => {
+  const calls = [];
+  const orders = Array.from({ length: 101 }, (_, i) => ({
+    id: `o${i}`,
+    kind: i % 3 === 0 ? 'service' : i % 3 === 1 ? 'preorder' : 'theft',
+    status: 'booked',
+    shopId: 'shop1',
+    actorId: `actor-${i}`,
+    entryId: `entry-${i}`,
+    total: 100 + i,
+    deposit: 0,
+    remaining: 100 + i,
+    createdAt: 1000 - i,
+  }));
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      listAdvancedOrders: async ({ shopId, status, limit, offset }) => {
+        calls.push({ shopId, status, limit, offset });
+        const start = offset || 0;
+        return orders.slice(start, start + limit);
+      },
+    },
+  });
+  app.render = async () => {};
+  app._data.selectedShopId = 'shop1';
+
+  // First page: exactly 100 booked records, with a next page available.
+  await app._refreshOrdersOnly();
+  assert.equal(calls.length, 1, 'one paging read');
+  assert.equal(calls[0].shopId, 'shop1');
+  assert.equal(calls[0].status, 'booked', 'only booked orders are fetched');
+  assert.equal(calls[0].limit, 100, 'page size 100');
+  assert.equal(calls[0].offset, 0);
+  assert.equal(app._data.advancedOrders.length, 100);
+  assert.equal(app._data.hasNextOrders, true);
+  assert.equal(app._data.hasPreviousOrders, false);
+
+  // Advance to the second page: one remaining record, no further page.
+  await app._onNextOrders();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].offset, 100, 'second page offset is 100');
+  assert.equal(app._data.advancedOrders.length, 1, 'second page carries the single old order');
+  assert.equal(app._data.advancedOrders[0].id, 'o100', 'the old booked order is reachable');
+  assert.ok(['service', 'preorder', 'theft'].includes(app._data.advancedOrders[0].kind), 'old order is an actionable kind');
+  assert.equal(app._data.hasNextOrders, false);
+  assert.equal(app._data.hasPreviousOrders, true);
+
+  // Step back to the first page.
+  await app._onPrevOrders();
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].offset, 0);
+  assert.equal(app._data.advancedOrders.length, 100);
+  assert.equal(app._data.hasNextOrders, true);
+  assert.equal(app._data.hasPreviousOrders, false);
+});
+
+test('manager GM order list steps back to a non-empty page when the current page empties', async () => {
+  const orders = Array.from({ length: 100 }, (_, i) => ({
+    id: `o${i}`,
+    kind: 'service',
+    status: 'booked',
+    shopId: 'shop1',
+    actorId: `actor-${i}`,
+    entryId: `entry-${i}`,
+    total: 100 + i,
+    deposit: 0,
+    remaining: 100 + i,
+    createdAt: 1000 - i,
+  }));
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      listAdvancedOrders: async ({ limit, offset }) => {
+        const start = offset || 0;
+        return orders.slice(start, start + limit);
+      },
+    },
+  });
+  app.render = async () => {};
+  app._data.selectedShopId = 'shop1';
+
+  // Simulate a GM who navigated to the second page: page 1 is empty (there are
+  // exactly 100 records, offset 100 slices to nothing), so a refresh must fall
+  // back to the first page instead of stranding the GM on an empty page.
+  app._data.orderPage = 1;
+  await app._refreshOrdersOnly();
+  assert.equal(app._data.orderPage, 0, 'steps back to the first page');
+  assert.equal(app._data.advancedOrders.length, 100, 'shows the non-empty first page');
+  // Page 0 is exactly full, so the first page itself still offers a next page
+  // (the one that just emptied); clicking it self-corrects back to page 0.
+  assert.equal(app._data.hasNextOrders, true, 'a full first page still offers next');
+  assert.equal(app._data.hasPreviousOrders, false, 'no page before the first');
+});
+
+test('manager resolve-theft passes a typed success boolean', async () => {
+  const calls = [];
+  const app = new MarketManager({
+    deps: {
+      systemId: () => 'dnd5e',
+      isGM: () => true,
+      isActiveGM: () => true,
+      resolveTheft: async (p) => {
+        calls.push(p);
+        return { status: 'committed', orderId: p.orderId };
+      },
+    },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshOrdersOnly = async () => {};
+  app.render = async () => {};
+  await app._onResolveTheftSuccess({}, { dataset: { orderId: 'o1' } }, {});
+  await app._onResolveTheftFailure({}, { dataset: { orderId: 'o1' } }, {});
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].success, true, 'resolve success passes a typed true');
+  assert.equal(calls[1].success, false, 'resolve failure passes a typed false');
+  assert.ok(calls[0].requestId, 'a fresh requestId is passed');
+  assert.ok(calls[1].requestId);
+  assert.equal(app._data.notice, 'Order resolved.');
+});
+
+test('manager save-entry persists the M5 access gate', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      { id: 'e1', name: 'Potion', itemUuid: 'Item.p1', price: 10, quantity: 5, stockMode: 'finite' },
+    ],
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, runShopExclusive: (_id, fn) => fn(), systemId: () => 'dnd5e' } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onSaveEntry(
+    {},
+    fakeTrAccess('e1', { accessMode: 'backroom', accessActorUuids: 'Actor.a1, Actor.b2', accessMinReputation: 2 }),
+    {}
+  );
+  const saved = store._shops.get('shop1').inventory[0];
+  assert.equal(saved.access.mode, 'backroom', 'backroom gate persisted');
+  assert.deepEqual(saved.access.actorUuids, ['Actor.a1', 'Actor.b2'], 'actor UUIDs split and trimmed');
+  assert.equal(saved.access.minReputation, 2);
+});
+
+test('manager save-entry preserves the persisted min reputation when the row omits it', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      {
+        id: 'e1',
+        name: 'Potion',
+        itemUuid: 'Item.p1',
+        price: 10,
+        quantity: 5,
+        stockMode: 'finite',
+        access: { mode: 'backroom', actorUuids: ['Actor.a1'], minReputation: 5 },
+      },
+    ],
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, runShopExclusive: (_id, fn) => fn(), systemId: () => 'dnd5e' } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onSaveEntry(
+    {},
+    fakeTrAccess('e1', { accessMode: 'backroom', accessActorUuids: '', withMinReputation: false }),
+    {}
+  );
+  const saved = store._shops.get('shop1').inventory[0];
+  assert.equal(saved.access.mode, 'backroom');
+  assert.deepEqual(saved.access.actorUuids, [], 'empty actor UUID field clears the list');
+  assert.equal(saved.access.minReputation, 5, 'omitted min reputation preserves the persisted value');
+});
+
+test('manager save-entry without access controls never resets a saved gate', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      {
+        id: 'e1',
+        name: 'Potion',
+        itemUuid: 'Item.p1',
+        price: 10,
+        quantity: 5,
+        stockMode: 'finite',
+        access: { mode: 'backroom', actorUuids: ['Actor.a1'], minReputation: 5 },
+      },
+    ],
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({ deps: { store, runShopExclusive: (_id, fn) => fn(), systemId: () => 'dnd5e' } });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  // A plain row (no access controls) - the saved gate must be carried through.
+  await app._onSaveEntry({}, fakeTr('e1', { price: 11, quantity: 6 }), {});
+  const saved = store._shops.get('shop1').inventory[0];
+  assert.equal(saved.access.mode, 'backroom', 'no access controls preserve the persisted mode');
+  assert.deepEqual(saved.access.actorUuids, ['Actor.a1']);
+  assert.equal(saved.access.minReputation, 5);
+});
+
+test('manager refreshData projects accessActorUuidsText onto the selected shop inventory', async () => {
+  const shop = {
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      {
+        id: 'e1',
+        name: 'Potion',
+        itemUuid: 'Item.p1',
+        price: 10,
+        quantity: 5,
+        stockMode: 'finite',
+        access: { mode: 'backroom', actorUuids: ['Actor.a1', 'Actor.b2'], minReputation: 2 },
+      },
+    ],
+  };
+  const store = makePersistentShopStore([shop]);
+  const app = new MarketManager({
+    deps: { store, systemId: () => 'dnd5e', isGM: () => true, listActors: () => [] },
+  });
+  await app._refreshData();
+  const entry = app._data.selectedShop.inventory[0];
+  assert.equal(entry.accessActorUuidsText, 'Actor.a1, Actor.b2', 'access uuid text projected for GM display');
+});
+
+
+test('storefront M5: a failed cart replay does not clear the cart and surfaces recovery, not completion', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { hasActiveGM: () => true } });
+  app.render = async () => {};
+  app._request = async () => null;
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [] };
+  app._data.cartLines = [{ entryId: 'e1', quantity: 1, specialId: '' }];
+  app._data.pending = true;
+  app._pendingAdvancedRequestId = 'adv-1';
+  app._pendingAdvancedType = 'cart';
+
+  // The original persisted `failed`, so the replay is a failure, NOT a completed
+  // checkout: the cart must be kept and the feedback must not say "complete".
+  await app._onAdvancedResponse({
+    type: 'cart',
+    result: { status: 'replay', originalStatus: 'failed', orderId: 'o1' },
+    actorId: 'a1',
+    shopId: 'shop1',
+  });
+  assert.equal(app._data.cartLines.length, 1, 'cart NOT cleared on a failed replay');
+  assert.equal(app._data.pending, false);
+  assert.ok(app._data.feedback.includes('pending recovery'), 'recovery feedback, not a completion');
+  assert.ok(!app._data.feedback.includes('complete'), 'no completed message on a failed replay');
+});
+
+test('storefront M5: a committed cart replay clears the cart and reports complete', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { hasActiveGM: () => true } });
+  app.render = async () => {};
+  app._request = async () => null;
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [] };
+  app._data.cartLines = [{ entryId: 'e1', quantity: 1, specialId: '' }];
+  app._data.pending = true;
+  app._pendingAdvancedRequestId = 'adv-1';
+  app._pendingAdvancedType = 'cart';
+
+  await app._onAdvancedResponse({
+    type: 'cart',
+    result: { status: 'replay', originalStatus: 'committed', orderId: 'o1' },
+    actorId: 'a1',
+    shopId: 'shop1',
+  });
+  assert.equal(app._data.cartLines.length, 0, 'committed replay clears the cart');
+  assert.equal(app._data.feedback, 'Cart checkout complete.');
+});
+
+test('storefront M5: a needsRecovery cart replay keeps the cart and surfaces recovery', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { hasActiveGM: () => true } });
+  app.render = async () => {};
+  app._request = async () => null;
+  app._data.selectedActorId = 'a1';
+  app._data.shop = { open: true, specials: [], services: [] };
+  app._data.cartLines = [{ entryId: 'e1', quantity: 1, specialId: '' }];
+  app._data.pending = true;
+  app._pendingAdvancedRequestId = 'adv-1';
+  app._pendingAdvancedType = 'cart';
+
+  await app._onAdvancedResponse({
+    type: 'cart',
+    result: { status: 'replay', originalStatus: 'needsRecovery', orderId: 'o1' },
+    actorId: 'a1',
+    shopId: 'shop1',
+  });
+  assert.equal(app._data.cartLines.length, 1, 'cart kept on a needsRecovery replay');
+  assert.ok(app._data.feedback.includes('pending recovery'));
 });

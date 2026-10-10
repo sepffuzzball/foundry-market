@@ -73,6 +73,33 @@ export const HOURS_MINUTE_MAX = 1439;
 export const LOW_STOCK_THRESHOLD = 3;
 export const RESTOCK_TARGET_MIN = 1;
 
+// ---- M5 advanced commerce configuration constants -------------------------
+// The validated `shop.commerce` configuration and per-entry `access` gate.
+// Everything here is purely declarative; the deterministic decisions derived
+// from it live in `src/advanced/policy.js` (no runtime/UI, no store writes).
+export const MAX_COMMERCE_SERVICES = 20;
+export const MAX_COMMERCE_SPECIALS = 20;
+export const MAX_COMMERCE_VALUATIONS = 100;
+export const MAX_ACCESS_UUIDS = 20;
+// GM-authored item valuations are tamper-detected against a canonical fingerprint
+// of the serialized item data. A fingerprint must be lowercase hex, at least 16
+// and at most 128 chars (an FNV-1a 64-bit digest is exactly 16 chars).
+export const VALUATION_FINGERPRINT_RE = /^[0-9a-f]{16,128}$/;
+export const SERVICE_NAME_MAX = 100;
+export const SERVICE_DESCRIPTION_MAX = 400;
+export const SPECIAL_TITLE_MAX = 100;
+export const SPECIAL_DESCRIPTION_MAX = 400;
+export const ACCESS_MODES = ['public', 'backroom'];
+export const ACCESS_REPUTATION_MIN = -100;
+export const ACCESS_REPUTATION_MAX = 100;
+// Basis-point rates are bounded to [0, 20000] (0..200%).
+export const COMMERCE_RATE_MIN = 0;
+export const COMMERCE_RATE_MAX = 20000;
+export const COMMERCE_RATE_DEFAULT_BUY = 5000;
+export const COMMERCE_RATE_DEFAULT_BUYBACK = 12000;
+export const PREORDER_DEPOSIT_BPS_DEFAULT = 2500;
+export const PREORDER_MAX_PER_ACTOR_DEFAULT = 3;
+
 export const ACCENT_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 // Only local asset paths under the Foundry asset roots are allowed. The path
@@ -276,6 +303,7 @@ export function normalizeInventoryEntry(raw = {}) {
     restock,
     price,
     visible: raw.visible === false ? false : true,
+    access: normalizeEntryAccess(raw.access),
     publicDescription: assertString(raw.publicDescription ?? '', 'entry.publicDescription', {
       allowEmpty: true,
     }).slice(0, PUBLIC_DESCRIPTION_MAX),
@@ -645,6 +673,211 @@ function normalizeRestock(raw = {}, { quantity, stockMode }) {
   };
 }
 
+// ---- M5 advanced commerce configuration normalization ----------------------
+// The validated `shop.commerce` object (funds, buy/buyback rates, service
+// booking, specials, preorders, theft) and the per-entry `access` gate. Every
+// field fails closed at GM save: an out-of-range rate, an unqualified
+// `buybackRateBps`, an over-cap array (> 20 items) or an oversized/other-
+// malformed nested value throws rather than being silently dropped or sliced.
+// A shop/entry with no M5 fields normalizes to documented defaults, so existing
+// records load unchanged operationally and `SCHEMA_VERSION` stays `1`.
+
+function boundedArray(items, cap, label, mapFn) {
+  if (items == null) return [];
+  if (!Array.isArray(items)) {
+    throw new Error(`[market] '${label}' must be an array, got ${typeof items}`);
+  }
+  if (items.length > cap) {
+    throw new Error(
+      `[market] '${label}' must contain at most ${cap} items, got ${items.length}`
+    );
+  }
+  return items.map(mapFn);
+}
+
+export function assertActorUuid(value, label) {
+  const v = assertString(value, label);
+  if (!ACTOR_UUID_RE.test(v)) {
+    throw new Error(
+      `[market] '${label}' must match /^Actor\\.[A-Za-z0-9]+$/, got '${v}'`
+    );
+  }
+  return v;
+}
+
+function normalizeActorUuidList(rawUuids, label) {
+  return boundedArray(
+    rawUuids,
+    MAX_ACCESS_UUIDS,
+    label,
+    (value) => assertActorUuid(value, label)
+  );
+}
+
+export function normalizeEntryAccess(raw = {}) {
+  const mode = ACCESS_MODES.includes(raw.mode) ? raw.mode : 'public';
+  const actorUuids = normalizeActorUuidList(
+    raw.actorUuids,
+    'entry.access.actorUuids[]'
+  );
+  const minReputation = intInRange(
+    raw.minReputation ?? ACCESS_REPUTATION_MIN,
+    ACCESS_REPUTATION_MIN,
+    ACCESS_REPUTATION_MAX,
+    'entry.access.minReputation'
+  );
+  return { mode, actorUuids, minReputation };
+}
+
+function normalizeCommerceService(raw = {}) {
+  const name = assertString(raw.name, 'commerce.services[].name').slice(
+    0,
+    SERVICE_NAME_MAX
+  );
+  const description =
+    assertString(raw.description ?? '', 'commerce.services[].description', {
+      allowEmpty: true,
+    }).slice(0, SERVICE_DESCRIPTION_MAX);
+  return {
+    id: raw.id || makeId(),
+    name,
+    description,
+    price: assertInteger(raw.price ?? 0, 'commerce.services[].price'),
+    visible: raw.visible === false ? false : true,
+    enabled: raw.enabled === false ? false : true,
+    manualFulfillment: raw.manualFulfillment === false ? false : true,
+  };
+}
+
+function normalizeCommerceSpecial(raw = {}) {
+  const title = assertString(raw.title, 'commerce.specials[].title').slice(
+    0,
+    SPECIAL_TITLE_MAX
+  );
+  const description =
+    assertString(raw.description ?? '', 'commerce.specials[].description', {
+      allowEmpty: true,
+    }).slice(0, SPECIAL_DESCRIPTION_MAX);
+  return {
+    id: raw.id || makeId(),
+    title,
+    description,
+    entryId: assertString(raw.entryId ?? '', 'commerce.specials[].entryId', {
+      allowEmpty: true,
+    }),
+    price: assertInteger(raw.price ?? 0, 'commerce.specials[].price'),
+    visible: raw.visible === false ? false : true,
+    actorUuids: normalizeActorUuidList(
+      raw.actorUuids,
+      'commerce.specials[].actorUuids[]'
+    ),
+  };
+}
+
+function normalizePreorders(raw = {}) {
+  const enabled = raw.enabled === true ? true : false;
+  const depositBps = intInRange(
+    raw.depositBps ?? PREORDER_DEPOSIT_BPS_DEFAULT,
+    COMMERCE_RATE_MIN,
+    COMMERCE_RATE_MAX,
+    'shop.commerce.preorders.depositBps'
+  );
+  const maxPerActor = assertInteger(
+    raw.maxPerActor ?? PREORDER_MAX_PER_ACTOR_DEFAULT,
+    'shop.commerce.preorders.maxPerActor',
+    { min: 1 }
+  );
+  return { enabled, depositBps, maxPerActor };
+}
+
+function normalizeTheft(raw = {}) {
+  return { enabled: raw.enabled === true ? true : false };
+}
+
+// ---- M6 GM-authored item valuations -----------------------------------------
+// GM-private per-item buyback/barter valuations, stored on `shop.commerce.
+// valuations`. Each valuation binds a world Actor UUID + an embedded Item id to
+// a GM-approved minor-unit `amount`, tamper-detected by a canonical fingerprint
+// of the serialized item data. They are NEVER projected into the public catalog.
+function normalizeValuation(raw = {}) {
+  const id = raw.id ? assertMarketId(raw.id, 'commerce.valuations[].id') : makeId();
+  const actorUuid = assertActorUuid(raw.actorUuid, 'commerce.valuations[].actorUuid');
+  const itemId = assertMarketId(raw.itemId, 'commerce.valuations[].itemId');
+  const amount = assertInteger(raw.amount, 'commerce.valuations[].amount', { min: 1 });
+  const fingerprint = assertString(raw.fingerprint, 'commerce.valuations[].fingerprint');
+  if (!VALUATION_FINGERPRINT_RE.test(fingerprint)) {
+    throw new Error(
+      `[market] 'commerce.valuations[].fingerprint' must be lowercase hex of 16..128 chars, got '${fingerprint}'`
+    );
+  }
+  return { id, actorUuid, itemId, amount, fingerprint };
+}
+
+function normalizeValuations(raw = []) {
+  const list = boundedArray(
+    raw,
+    MAX_COMMERCE_VALUATIONS,
+    'shop.commerce.valuations',
+    normalizeValuation
+  );
+  // Uniqueness by (actorUuid, itemId). A later entry wins: a re-approval of the
+  // same item on the same actor keeps only the newest valuation for the pair.
+  const seen = new Set();
+  const out = [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const v = list[i];
+    const key = `${v.actorUuid}\u0000${v.itemId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(v);
+  }
+  return out.reverse();
+}
+
+export function normalizeCommerce(raw = {}) {
+  const funds =
+    raw.funds == null ? null : assertInteger(raw.funds, 'shop.commerce.funds');
+  const buyRateBps = intInRange(
+    raw.buyRateBps ?? COMMERCE_RATE_DEFAULT_BUY,
+    COMMERCE_RATE_MIN,
+    COMMERCE_RATE_MAX,
+    'shop.commerce.buyRateBps'
+  );
+  const buybackRateBps = intInRange(
+    raw.buybackRateBps ?? COMMERCE_RATE_DEFAULT_BUYBACK,
+    COMMERCE_RATE_MIN,
+    COMMERCE_RATE_MAX,
+    'shop.commerce.buybackRateBps'
+  );
+  if (buybackRateBps < buyRateBps) {
+    throw new Error(
+      `[market] 'shop.commerce.buybackRateBps' must be >= 'shop.commerce.buyRateBps', got ${buybackRateBps} < ${buyRateBps}`
+    );
+  }
+  const services = boundedArray(
+    raw.services,
+    MAX_COMMERCE_SERVICES,
+    'shop.commerce.services',
+    normalizeCommerceService
+  );
+  const specials = boundedArray(
+    raw.specials,
+    MAX_COMMERCE_SPECIALS,
+    'shop.commerce.specials',
+    normalizeCommerceSpecial
+  );
+  return {
+    funds,
+    buyRateBps,
+    buybackRateBps,
+    services,
+    specials,
+    preorders: normalizePreorders(raw.preorders),
+    theft: normalizeTheft(raw.theft),
+    valuations: normalizeValuations(raw.valuations),
+  };
+}
+
 export function normalizeShop(raw = {}) {
   const name = assertString(raw.name, 'shop.name');
   const open = raw.open === false ? false : true;
@@ -678,6 +911,7 @@ export function normalizeShop(raw = {}) {
     npcs: resolved.npcs,
     social,
     automation: normalizeAutomation(raw.automation),
+    commerce: normalizeCommerce(raw.commerce),
     createdAt,
   };
 }
@@ -980,5 +1214,255 @@ export function normalizeReputationEvent(raw = {}) {
     source,
     status,
     createdAt,
+  };
+}
+
+// ---- M5 advanced commerce order records -------------------------------------
+// GM-owned, idempotent order records for the later M5 operations (bookable
+// services, preorder execution, theft, specials and funds-aware buying). Each
+// order is stored in its OWN GM-only JournalEntry (mirroring the ledger and
+// reputation records) - never embedded in the shop record - so there is no
+// unbounded embedded history and no schema version bump (`SCHEMA_VERSION` stays
+// 1). This records the *intent* (and its execution phase markers) for a single
+// advanced-commerce action; the M1 ledger and the existing purchase path are not
+// modified in this slice.
+//
+// Order shape:
+//   { id, key, kind: 'sell'|'cart'|'service'|'preorder'|'preorder-fulfill'|
+//     'preorder-cancel'|'theft'|'special', status: 'pending'|'committed'|
+//     'booked'|'fulfilled'|'cancelled'|'failed'|'needsRecovery',
+//     phase: 'recorded'|'debited'|'transferred'|'credited'|'stocked'|'final',
+//     shopId, userId, actorId, entryId, relatedOrderId,
+//     quantity (>= 1), total/deposit/remaining (>= 0), createdAt, updatedAt,
+//     intentHash (non-empty, <= 256), details (plain JSON <= 64KB, no
+//     functions/prototypes), outcome (plain JSON <= 8KB), error (<= 200) }
+//
+// `key` is the idempotency key (mirroring the ledger/reputation-event keys), so
+// a replayed `createAdvancedOrder` for the same key never creates a second
+// journal entry; a caller that replays is expected to verify the `intentHash`
+// before applying any side effect. `actorId` may be a world actor id (not
+// necessarily a Foundry Actor UUID), and every id is validated non-empty
+// (unless explicitly optional), at most 120 chars, and free of control
+// characters via the shared `assertMarketId` rule. No cross-GM atomicity is
+// claimed - this is a read-then-create record, not a server-side CAS.
+
+export const ADVANCED_ORDER_KIND = 'advancedOrder';
+export const ADVANCED_ORDER_KINDS = [
+  'sell',
+  'cart',
+  'service',
+  'preorder',
+  'preorder-fulfill',
+  'preorder-cancel',
+  'theft',
+  'special',
+];
+export const ADVANCED_ORDER_STATUSES = [
+  'pending',
+  'committed',
+  'booked',
+  'fulfilled',
+  'cancelled',
+  'failed',
+  'needsRecovery',
+];
+export const ADVANCED_ORDER_PHASES = [
+  'recorded',
+  'debited',
+  'transferred',
+  'credited',
+  'stocked',
+  'bartered',
+  'final',
+];
+export const ADVANCED_ORDER_INTENT_HASH_MAX = 256;
+export const ADVANCED_ORDER_DETAILS_MAX = 64 * 1024;
+export const ADVANCED_ORDER_OUTCOME_MAX = 8 * 1024;
+export const ADVANCED_ORDER_ERROR_MAX = 200;
+
+function assertAdvancedOrderKind(value) {
+  if (!ADVANCED_ORDER_KINDS.includes(value)) {
+    throw new Error(
+      `[market] advancedOrder kind must be one of ${ADVANCED_ORDER_KINDS.join(', ')}, got ${value}`
+    );
+  }
+  return value;
+}
+
+function assertAdvancedOrderStatus(value) {
+  if (!ADVANCED_ORDER_STATUSES.includes(value)) {
+    throw new Error(
+      `[market] advancedOrder status must be one of ${ADVANCED_ORDER_STATUSES.join(', ')}, got ${value}`
+    );
+  }
+  return value;
+}
+
+function assertAdvancedOrderPhase(value) {
+  if (!ADVANCED_ORDER_PHASES.includes(value)) {
+    throw new Error(
+      `[market] advancedOrder phase must be one of ${ADVANCED_ORDER_PHASES.join(', ')}, got ${value}`
+    );
+  }
+  return value;
+}
+
+// An optional market id (userId/actorId/entryId/relatedOrderId) is empty when
+// supplied as null/undefined/'' and otherwise validated with the same market-id
+// rule used elsewhere (non-empty, <= 120 chars, no control characters).
+function optionalMarketId(value, label) {
+  if (value == null || value === '') return '';
+  return assertMarketId(value, label);
+}
+
+function setOwn(obj, key, value) {
+  Object.defineProperty(obj, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+/**
+ * Deep-copy `value` into a plain JSON value, failing closed when it contains a
+ * function, a Symbol, a BigInt, a non-finite number, or an object whose
+ * prototype is not `Object.prototype`/null (a Date/Map/class instance). Nested
+ * `undefined` object values are dropped (matching JSON.stringify); array
+ * `undefined` collapses to null. The copy is always a fresh plain object/array,
+ * so an input prototype chain can never leak into the stored record.
+ */
+function clonePlainJson(value, label, path) {
+  if (value === null) return null;
+  const t = typeof value;
+  const at = path || 'root';
+  if (t === 'boolean' || t === 'string') return value;
+  if (t === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error(`[market] '${label}' must not contain a non-finite number at ${at}`);
+    }
+    return value;
+  }
+  if (t === 'undefined') return null;
+  if (t === 'bigint') {
+    throw new Error(`[market] '${label}' must not contain a BigInt at ${at}`);
+  }
+  if (t === 'symbol') {
+    throw new Error(`[market] '${label}' must not contain a Symbol at ${at}`);
+  }
+  if (t === 'function') {
+    throw new Error(`[market] '${label}' must not contain a function at ${at}`);
+  }
+  if (t === 'object') {
+    if (Array.isArray(value)) {
+      return value.map((v, i) => clonePlainJson(v, label, `${path}[${i}]`));
+    }
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new Error(
+        `[market] '${label}' must be plain JSON (no custom prototype) at ${at}`
+      );
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      // JSON.stringify drops object values that are `undefined`; mirror that.
+      if (v === undefined) continue;
+      setOwn(out, k, clonePlainJson(v, label, path ? `${path}.${k}` : k));
+    }
+    return out;
+  }
+  throw new Error(`[market] '${label}' has an unsupported value of type '${t}' at ${at}`);
+}
+
+function normalizePlainJson(value, label, maxLength, fallback) {
+  if (value == null) return fallback;
+  const normalized = clonePlainJson(value, label, '');
+  const json = JSON.stringify(normalized);
+  if (json.length > maxLength) {
+    throw new Error(
+      `[market] '${label}' must be at most ${maxLength} chars of serialized JSON, got ${json.length}`
+    );
+  }
+  return normalized;
+}
+
+/**
+ * Normalize an advanced-commerce order record to a known, validated shape.
+ * Fail-closed at GM save: an unknown kind/status/phase, a bad id, a non-positive
+ * quantity, an empty or oversized intentHash, a non-plain/oversized
+ * details/outcome, or a too-long error throw rather than silently dropping data.
+ * An absent/empty optional id (userId/actorId/entryId/relatedOrderId) normalizes
+ * to ''; `shopId` is required (an advanced order is always tied to a shop).
+ * Defaults: status 'pending', phase 'recorded', quantity 1, totals 0,
+ * createdAt/updatedAt now, details/outcome {}.
+ */
+export function normalizeAdvancedOrder(raw = {}) {
+  const key = assertString(raw.key, 'advancedOrder.key');
+  const kind = assertAdvancedOrderKind(raw.kind);
+  const status = assertAdvancedOrderStatus(raw.status || 'pending');
+  const phase = assertAdvancedOrderPhase(raw.phase || 'recorded');
+  const shopId = assertMarketId(raw.shopId, 'advancedOrder.shopId');
+  const userId = optionalMarketId(raw.userId, 'advancedOrder.userId');
+  const actorId = optionalMarketId(raw.actorId, 'advancedOrder.actorId');
+  const entryId = optionalMarketId(raw.entryId, 'advancedOrder.entryId');
+  const relatedOrderId = optionalMarketId(
+    raw.relatedOrderId,
+    'advancedOrder.relatedOrderId'
+  );
+  const quantity = assertPositiveInteger(raw.quantity ?? 1, 'advancedOrder.quantity');
+  const total = assertInteger(raw.total ?? 0, 'advancedOrder.total');
+  const deposit = assertInteger(raw.deposit ?? 0, 'advancedOrder.deposit');
+  const remaining = assertInteger(raw.remaining ?? 0, 'advancedOrder.remaining');
+  const createdAt = Number(raw.createdAt ?? Date.now());
+  if (!Number.isSafeInteger(createdAt)) {
+    throw new Error('[market] advancedOrder.createdAt must be a safe integer');
+  }
+  const updatedAt = Number(raw.updatedAt ?? createdAt);
+  if (!Number.isSafeInteger(updatedAt)) {
+    throw new Error('[market] advancedOrder.updatedAt must be a safe integer');
+  }
+  const intentHash = assertString(raw.intentHash, 'advancedOrder.intentHash');
+  if (intentHash.length > ADVANCED_ORDER_INTENT_HASH_MAX) {
+    throw new Error(
+      `[market] 'advancedOrder.intentHash' must be at most ${ADVANCED_ORDER_INTENT_HASH_MAX} chars, got ${intentHash.length}`
+    );
+  }
+  const details = normalizePlainJson(
+    raw.details,
+    'advancedOrder.details',
+    ADVANCED_ORDER_DETAILS_MAX,
+    {}
+  );
+  const outcome = normalizePlainJson(
+    raw.outcome,
+    'advancedOrder.outcome',
+    ADVANCED_ORDER_OUTCOME_MAX,
+    {}
+  );
+  const error = assertString(raw.error ?? '', 'advancedOrder.error', {
+    allowEmpty: true,
+  }).slice(0, ADVANCED_ORDER_ERROR_MAX);
+
+  return {
+    id: raw.id || makeId(),
+    key,
+    kind,
+    status,
+    phase,
+    shopId,
+    userId,
+    actorId,
+    entryId,
+    relatedOrderId,
+    quantity,
+    total,
+    deposit,
+    remaining,
+    createdAt,
+    updatedAt,
+    intentHash,
+    details,
+    outcome,
+    error,
   };
 }

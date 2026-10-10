@@ -1,6 +1,6 @@
 {
   "name": "foundry-market",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Foundry VTT v14 market core (module id `market`). Native browser ESM, no build/transpile.",
   "type": "module",
@@ -10,6 +10,6 @@
   "scripts": {
     "test": "node --test",
     "build": "sh scripts/package.sh",
-    "lint": "node --check src/core/main.js && node --check src/core/requests.js && node --check src/themes/registry.js && node --check src/storage/store.js && node --check src/adapters/index.js && node --check src/services/commerce.js && node --check src/services/pricing.js && node --check src/services/model.js && node --check src/automation/policy.js && node --check src/automation/service.js && node --check src/automation/tables.js && node --check src/social/personalities.js && node --check src/social/reputation.js && node --check src/social/pricing.js && node --check src/social/service.js && node --check src/ui/manager.js && node --check src/ui/storefront.js && node --check src/canvas/placements.js && node --check tests/core.test.js && node --check tests/themes.test.js && node --check tests/ui.test.js && node --check tests/social.test.js && node --check tests/reputation-store.test.js && node --check tests/automation.test.js && node --check tests/automation-service.test.js && node --check tests/automation-tables.test.js"
+    "lint": "node --check src/core/main.js && node --check src/core/requests.js && node --check src/themes/registry.js && node --check src/storage/store.js && node --check src/adapters/index.js && node --check src/services/commerce.js && node --check src/services/pricing.js && node --check src/services/model.js && node --check src/automation/policy.js && node --check src/automation/service.js && node --check src/automation/tables.js && node --check src/social/personalities.js && node --check src/social/reputation.js && node --check src/social/pricing.js && node --check src/social/service.js && node --check src/advanced/policy.js && node --check src/advanced/selling.js && node --check src/advanced/services.js && node --check src/advanced/cart.js && node --check src/advanced/preorders.js && node --check src/advanced/theft.js && node --check src/advanced/valuation.js && node --check src/ui/manager.js && node --check src/ui/storefront.js && node --check src/canvas/placements.js && node --check tests/core.test.js && node --check tests/themes.test.js && node --check tests/ui.test.js && node --check tests/social.test.js && node --check tests/reputation-store.test.js && node --check tests/automation.test.js && node --check tests/automation-service.test.js && node --check tests/automation-tables.test.js && node --check tests/advanced-policy.test.js && node --check tests/advanced-store.test.js && node --check tests/advanced-selling.test.js && node --check tests/advanced-services.test.js && node --check tests/advanced-cart.test.js && node --check tests/advanced-preorders.test.js && node --check tests/advanced-valuation.test.js && node --check tests/advanced-theft.test.js"
   }
 }

@@ -46,11 +46,27 @@ import {
   buildCatalog,
   publicShop,
   publicPurchaseResult,
+  publicSellResult,
+  publicCartResult,
+  publicServiceResult,
+  publicPreorderResult,
+  publicTheftResult,
+  publicAdvancedOrder,
+  requestMessageData,
   handleMarketChatMessage,
   PUBLIC_ENTRY_FIELDS,
   PUBLIC_SHOP_FIELDS,
 } from '../src/core/requests.js';
+import { fingerprintItem } from '../src/advanced/valuation.js';
 import { createStore, store as defaultStore } from '../src/storage/store.js';
+import {
+  makeItem as sellMakeItem,
+  createMockActor as sellCreateMockActor,
+  makeAdapter as sellMakeAdapter,
+  makeShop as sellMakeShop,
+  createFakeStore as sellCreateStore,
+  makeService as sellMakeService,
+} from './advanced-selling.test.js';
 
 // ---------------------------------------------------------------- helpers
 
@@ -157,7 +173,7 @@ function makeSourceItem() {
   };
 }
 
-function makeShop({ open = true, stockMode = 'finite', price = 100, quantity = 10, visible = true } = {}) {
+function makeShop({ open = true, stockMode = 'finite', price = 100, quantity = 10, visible = true, commerce } = {}) {
   const entry = normalizeInventoryEntry({
     id: 'entry1',
     itemUuid: 'Compendium.books.Item.potion',
@@ -169,7 +185,7 @@ function makeShop({ open = true, stockMode = 'finite', price = 100, quantity = 1
     price,
     visible,
   });
-  return normalizeShop({ id: 'shop1', name: 'General Store', locationId: 'loc1', open, inventory: [entry] });
+  return normalizeShop({ id: 'shop1', name: 'General Store', locationId: 'loc1', open, inventory: [entry], commerce });
 }
 
 function makeCommerceCtx({ store, actor, itemSource, adapter, getActor, isGM = () => true, actorOwnedBy = () => true, systemId = () => 'dnd5e', getAdapter = () => adapter, fromUuid = () => itemSource, now = () => 1000, logger = console }) {
@@ -785,6 +801,811 @@ test('publicPurchaseResult never echoes conflict internals', () => {
   assert.ok(!('conflict' in safe));
 });
 
+// ------------------------------------------------ M5 sell request wiring
+
+function makeSellMessage(request) {
+  return {
+    flags: { market: { type: 'request', request: { type: 'sell', ...request } } },
+  };
+}
+
+function makeSellCtx({ selling, activeGM = 'gm1', currentUser = 'gm1' } = {}) {
+  const responses = [];
+  return {
+    activeGMId: () => activeGM,
+    currentUserId: () => currentUser,
+    gmIds: () => ['gm1'],
+    respond: async (data) => responses.push(data.flags.market.response),
+    selling,
+    responses,
+  };
+}
+
+test('publicSellResult never echoes private selling internals', () => {
+  const safe = publicSellResult({
+    status: 'conflict',
+    conflict: true,
+    error: 'conflicting duplicate payload',
+    expected: 'abc',
+    existing: { id: 'o1', details: {} },
+    orderId: 'o1',
+    details: { payout: 50, fundsBefore: 100, compensation: ['credit-refunded'] },
+    compensation: ['credit-refunded'],
+    outcome: { payout: 50 },
+    record: { id: 'o1', kind: 'sell' },
+    payout: 50,
+    buybackEntryId: 'b1',
+    itemName: 'Potion',
+  });
+  assert.equal(safe.status, 'conflict');
+  assert.equal(safe.error, 'conflicting duplicate payload');
+  assert.equal(safe.orderId, 'o1');
+  assert.equal(safe.payout, 50);
+  assert.equal(safe.buybackEntryId, 'b1');
+  assert.equal(safe.itemName, 'Potion');
+  assert.ok(!('conflict' in safe));
+  assert.ok(!('expected' in safe));
+  assert.ok(!('existing' in safe));
+  assert.ok(!('details' in safe));
+  assert.ok(!('compensation' in safe));
+  assert.ok(!('outcome' in safe));
+  assert.ok(!('record' in safe));
+  assert.ok(!('order' in safe));
+});
+
+test('publicSellResult maps unknown and raw error text to a bounded server-error', () => {
+  // A raw exception message (adapter/store detail) must not be echoed.
+  const raw = publicSellResult({
+    status: 'error',
+    error: new Error('shop update exploded after apply'),
+  });
+  assert.equal(raw.error, 'server-error');
+
+  // A malicious/detail-bearing string must not be echoed verbatim.
+  const malicious = publicSellResult({
+    status: 'error',
+    error: "[market] itemPrice did not carry a numeric minorUnits value <script>alert(1)</script>",
+  });
+  assert.equal(malicious.error, 'server-error');
+
+  // An unknown internal detail string collapses to the generic code.
+  const unknown = publicSellResult({ status: 'error', error: 'some internal detail' });
+  assert.equal(unknown.error, 'server-error');
+
+  // A known bounded code is preserved verbatim.
+  const known = publicSellResult({ status: 'error', error: 'conflicting duplicate payload' });
+  assert.equal(known.error, 'conflicting duplicate payload');
+
+  // A known code with an appended internal detail keeps only the bounded code.
+  const prefixed = publicSellResult({
+    status: 'error',
+    error: 'order-read-failed: unexpected token',
+  });
+  assert.equal(prefixed.error, 'order-read-failed');
+});
+
+test('a sell request dispatches to the selling service with the hook userId as requester', async () => {
+  const calls = [];
+  const selling = {
+    sell: async (payload, requesterId) => {
+      calls.push({ payload, requesterId });
+      return { status: 'committed', orderId: 'o1', payout: 50, buybackEntryId: 'b1', itemName: 'Potion' };
+    },
+  };
+  const ctx = makeSellCtx({ selling });
+  const data = await handleMarketChatMessage(
+    makeSellMessage({
+      shopId: 'shop1',
+      actorId: 'actor1',
+      itemId: 'item1',
+      requestId: 'req-1',
+      userId: 'forged-user',
+    }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'sell');
+  assert.equal(data.result.status, 'committed');
+  assert.equal(data.result.orderId, 'o1');
+  assert.equal(data.result.payout, 50);
+  assert.equal(data.result.buybackEntryId, 'b1');
+  assert.equal(data.result.itemName, 'Potion');
+  assert.equal(data.requestId, 'req-1');
+  assert.equal(data.shopId, 'shop1');
+  assert.equal(data.actorId, 'actor1');
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].requesterId,
+    'user1',
+    'the hook userId is the requester, never the payload userId'
+  );
+  assert.deepEqual(calls[0].payload, {
+    shopId: 'shop1',
+    actorId: 'actor1',
+    itemId: 'item1',
+    requestId: 'req-1',
+  });
+  assert.ok(!('userId' in calls[0].payload), 'no payload userId leaks into the service call');
+});
+
+test('a sell request without the required fields is rejected on the GM side', async () => {
+  let called = false;
+  const selling = {
+    sell: async () => {
+      called = true;
+      return { status: 'committed' };
+    },
+  };
+  const cases = [
+    [{ actorId: 'actor1', itemId: 'item1', requestId: 'req' }, 'missing-shop-id'],
+    [{ shopId: 'shop1', itemId: 'item1', requestId: 'req' }, 'missing-actor-id'],
+    [{ shopId: 'shop1', actorId: 'actor1', requestId: 'req' }, 'missing-item-id'],
+    [{ shopId: 'shop1', actorId: 'actor1', itemId: 'item1' }, 'missing-request-id'],
+  ];
+  for (const [fields, expected] of cases) {
+    called = false;
+    const ctx = makeSellCtx({ selling });
+    const data = await handleMarketChatMessage(makeSellMessage(fields), 'user1', ctx);
+    assert.equal(data.result.status, 'error');
+    assert.equal(data.result.error, expected);
+    assert.equal(called, false, `selling.sell must not run without ${expected}`);
+  }
+});
+
+test('a sell request commits through the real selling service and exposes only public fields', async () => {
+  const shop = sellMakeShop({ funds: 100 });
+  const adapter = sellMakeAdapter({ minorUnits: 100 });
+  const actor = sellCreateMockActor({ item: sellMakeItem({ name: 'Potion' }) });
+  const store = sellCreateStore({ shop });
+  const service = sellMakeService({ store, actor, adapter });
+  const ctx = makeSellCtx({ selling: service });
+  const data = await handleMarketChatMessage(
+    makeSellMessage({
+      shopId: 'shop1',
+      actorId: 'actor1',
+      itemId: 'item1',
+      requestId: 'req-1',
+      userId: 'forged',
+    }),
+    'gm1',
+    ctx
+  );
+  assert.equal(data.type, 'sell');
+  assert.equal(data.result.status, 'committed');
+  assert.ok(Number.isSafeInteger(data.result.payout) && data.result.payout > 0);
+  assert.equal(data.result.itemName, 'Potion');
+  assert.ok(typeof data.result.orderId === 'string');
+  assert.ok(typeof data.result.buybackEntryId === 'string');
+  assert.equal(data.requestId, 'req-1');
+  assert.equal(data.shopId, 'shop1');
+  assert.equal(data.actorId, 'actor1');
+  assert.ok(!('details' in data.result));
+  assert.ok(!('compensation' in data.result));
+  // The actor was credited and the shop gained a single buyback listing.
+  assert.equal(actor.wallet, data.result.payout);
+  assert.equal(store._shops.get('shop1').inventory.length, 1);
+});
+
+test('a sell request replays/conflicts through the request path without leaking internals', async () => {
+  const selling = {
+    sell: async () => ({
+      status: 'conflict',
+      conflict: true,
+      error: 'conflicting duplicate payload',
+      orderId: 'o1',
+      expected: 'hash',
+      existing: { id: 'o1' },
+    }),
+  };
+  const ctx = makeSellCtx({ selling });
+  const data = await handleMarketChatMessage(
+    makeSellMessage({ shopId: 'shop1', actorId: 'actor1', itemId: 'item1', requestId: 'req-1' }),
+    'gm1',
+    ctx
+  );
+  assert.equal(data.type, 'sell');
+  assert.equal(data.result.status, 'conflict');
+  assert.equal(data.result.error, 'conflicting duplicate payload');
+  assert.equal(data.result.orderId, 'o1');
+  assert.ok(!('expected' in data.result));
+  assert.ok(!('existing' in data.result));
+  assert.ok(!('conflict' in data.result));
+});
+
+// ---- M5: advanced order request dispatch (cart/service/preorder/theft) ---------
+
+function makeAdvancedMessage(type, request = {}) {
+  return {
+    flags: { market: { type: 'request', request: { type, ...request } } },
+  };
+}
+
+function makeAdvancedCtx({ cart, services, preorders, theft, activeGM = 'gm1', currentUser = 'gm1' } = {}) {
+  const responses = [];
+  return {
+    activeGMId: () => activeGM,
+    currentUserId: () => currentUser,
+    gmIds: () => ['gm1'],
+    respond: async (data) => responses.push(data.flags.market.response),
+    cart,
+    services,
+    preorders,
+    theft,
+    responses,
+  };
+}
+
+test('a cart request dispatches to the cart service with the hook userId as requester', async () => {
+  const calls = [];
+  const cart = {
+    checkout: async (payload, requesterId) => {
+      calls.push({ payload, requesterId });
+      return {
+        status: 'committed',
+        orderId: 'o1',
+        total: 700,
+        quantity: 3,
+        items: [
+          { entryId: 'entry1', quantity: 2 },
+          { entryId: 'entry2', quantity: 1 },
+        ],
+      };
+    },
+  };
+  const ctx = makeAdvancedCtx({ cart });
+  const data = await handleMarketChatMessage(
+    makeAdvancedMessage('cart', {
+      shopId: 'shop1',
+      actorId: 'actor1',
+      lines: [
+        { entryId: 'entry1', quantity: 2 },
+        { entryId: 'entry2', quantity: 1 },
+      ],
+      barterItemId: 'item-9',
+      requestId: 'req-1',
+      userId: 'forged-user',
+    }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'cart');
+  assert.equal(data.result.status, 'committed');
+  assert.equal(data.result.orderId, 'o1');
+  assert.equal(data.result.total, 700);
+  assert.equal(data.result.quantity, 3);
+  assert.equal(data.requestId, 'req-1');
+  assert.equal(data.shopId, 'shop1');
+  assert.equal(data.actorId, 'actor1');
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].requesterId,
+    'user1',
+    'the hook userId is the requester, never the payload userId'
+  );
+  assert.deepEqual(calls[0].payload, {
+    shopId: 'shop1',
+    actorId: 'actor1',
+    lines: [
+      { entryId: 'entry1', quantity: 2 },
+      { entryId: 'entry2', quantity: 1 },
+    ],
+    requestId: 'req-1',
+    barterItemId: 'item-9',
+  });
+  assert.ok(!('userId' in calls[0].payload), 'no payload userId leaks into the service call');
+});
+
+test('a cart request without the required fields is rejected on the GM side', async () => {
+  let called = false;
+  const cart = {
+    checkout: async () => {
+      called = true;
+      return { status: 'committed' };
+    },
+  };
+  const cases = [
+    [{ actorId: 'actor1', lines: [], requestId: 'req' }, 'missing-shop-id'],
+    [{ shopId: 'shop1', lines: [], requestId: 'req' }, 'missing-actor-id'],
+    [{ shopId: 'shop1', actorId: 'actor1', lines: 'not-an-array', requestId: 'req' }, 'missing-lines'],
+    [{ shopId: 'shop1', actorId: 'actor1', lines: [] }, 'missing-request-id'],
+  ];
+  for (const [fields, expected] of cases) {
+    called = false;
+    const ctx = makeAdvancedCtx({ cart });
+    const data = await handleMarketChatMessage(makeAdvancedMessage('cart', fields), 'user1', ctx);
+    assert.equal(data.result.status, 'error');
+    assert.equal(data.result.error, expected);
+    assert.equal(called, false, `cart.checkout must not run without ${expected}`);
+  }
+});
+
+test('a service request dispatches to the booking service with the hook userId as requester', async () => {
+  const calls = [];
+  const services = {
+    book: async (payload, requesterId) => {
+      calls.push({ payload, requesterId });
+      return { status: 'booked', orderId: 'o1', serviceId: 'svc1', serviceName: 'Repair', price: 150 };
+    },
+  };
+  const ctx = makeAdvancedCtx({ services });
+  const data = await handleMarketChatMessage(
+    makeAdvancedMessage('service', {
+      shopId: 'shop1',
+      serviceId: 'svc1',
+      actorId: 'actor1',
+      requestId: 'req-1',
+      userId: 'forged-user',
+    }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'service');
+  assert.equal(data.result.status, 'booked');
+  assert.equal(data.result.orderId, 'o1');
+  assert.equal(data.result.serviceId, 'svc1');
+  assert.equal(data.result.serviceName, 'Repair');
+  assert.equal(data.result.price, 150);
+  assert.equal(data.requestId, 'req-1');
+  assert.equal(data.shopId, 'shop1');
+  assert.equal(data.actorId, 'actor1');
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].requesterId,
+    'user1',
+    'the hook userId is the requester, never the payload userId'
+  );
+  assert.deepEqual(calls[0].payload, {
+    shopId: 'shop1',
+    serviceId: 'svc1',
+    actorId: 'actor1',
+    requestId: 'req-1',
+  });
+  assert.ok(!('userId' in calls[0].payload), 'no payload userId leaks into the service call');
+});
+
+test('a service request without the required fields is rejected on the GM side', async () => {
+  let called = false;
+  const services = {
+    book: async () => {
+      called = true;
+      return { status: 'booked' };
+    },
+  };
+  const cases = [
+    [{ serviceId: 'svc1', actorId: 'actor1', requestId: 'req' }, 'missing-shop-id'],
+    [{ shopId: 'shop1', actorId: 'actor1', requestId: 'req' }, 'missing-service-id'],
+    [{ shopId: 'shop1', serviceId: 'svc1', requestId: 'req' }, 'missing-actor-id'],
+    [{ shopId: 'shop1', serviceId: 'svc1', actorId: 'actor1' }, 'missing-request-id'],
+  ];
+  for (const [fields, expected] of cases) {
+    called = false;
+    const ctx = makeAdvancedCtx({ services });
+    const data = await handleMarketChatMessage(makeAdvancedMessage('service', fields), 'user1', ctx);
+    assert.equal(data.result.status, 'error');
+    assert.equal(data.result.error, expected);
+    assert.equal(called, false, `services.book must not run without ${expected}`);
+  }
+});
+
+test('a preorder request dispatches to the preorder service with the hook userId as requester', async () => {
+  const calls = [];
+  const preorders = {
+    place: async (payload, requesterId) => {
+      calls.push({ payload, requesterId });
+      return { status: 'booked', orderId: 'o1', entryId: 'entry1', quantity: 2, total: 200, deposit: 100, remaining: 100 };
+    },
+  };
+  const ctx = makeAdvancedCtx({ preorders });
+  const data = await handleMarketChatMessage(
+    makeAdvancedMessage('preorder', {
+      shopId: 'shop1',
+      entryId: 'entry1',
+      actorId: 'actor1',
+      quantity: 2,
+      requestId: 'req-1',
+      userId: 'forged-user',
+    }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'preorder');
+  assert.equal(data.result.status, 'booked');
+  assert.equal(data.result.orderId, 'o1');
+  assert.equal(data.result.entryId, 'entry1');
+  assert.equal(data.result.quantity, 2);
+  assert.equal(data.result.total, 200);
+  assert.equal(data.requestId, 'req-1');
+  assert.equal(data.shopId, 'shop1');
+  assert.equal(data.actorId, 'actor1');
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].requesterId,
+    'user1',
+    'the hook userId is the requester, never the payload userId'
+  );
+  assert.deepEqual(calls[0].payload, {
+    shopId: 'shop1',
+    entryId: 'entry1',
+    actorId: 'actor1',
+    quantity: 2,
+    requestId: 'req-1',
+  });
+  assert.ok(!('userId' in calls[0].payload), 'no payload userId leaks into the service call');
+});
+
+test('a preorder request without the required fields is rejected on the GM side', async () => {
+  let called = false;
+  const preorders = {
+    place: async () => {
+      called = true;
+      return { status: 'booked' };
+    },
+  };
+  const cases = [
+    [{ entryId: 'entry1', actorId: 'actor1', requestId: 'req' }, 'missing-shop-id'],
+    [{ shopId: 'shop1', actorId: 'actor1', requestId: 'req' }, 'missing-entry-id'],
+    [{ shopId: 'shop1', entryId: 'entry1', requestId: 'req' }, 'missing-actor-id'],
+    [{ shopId: 'shop1', entryId: 'entry1', actorId: 'actor1' }, 'missing-request-id'],
+  ];
+  for (const [fields, expected] of cases) {
+    called = false;
+    const ctx = makeAdvancedCtx({ preorders });
+    const data = await handleMarketChatMessage(makeAdvancedMessage('preorder', fields), 'user1', ctx);
+    assert.equal(data.result.status, 'error');
+    assert.equal(data.result.error, expected);
+    assert.equal(called, false, `preorders.place must not run without ${expected}`);
+  }
+});
+
+test('a theft request dispatches to the theft service with the hook userId as requester', async () => {
+  const calls = [];
+  const theft = {
+    attempt: async (payload, requesterId) => {
+      calls.push({ payload, requesterId });
+      return { status: 'committed', orderId: 'o1', entryId: 'entry1', success: true };
+    },
+  };
+  const ctx = makeAdvancedCtx({ theft });
+  const data = await handleMarketChatMessage(
+    makeAdvancedMessage('theft', {
+      shopId: 'shop1',
+      entryId: 'entry1',
+      actorId: 'actor1',
+      requestId: 'req-1',
+      userId: 'forged-user',
+    }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'theft');
+  assert.equal(data.result.status, 'committed');
+  assert.equal(data.result.orderId, 'o1');
+  assert.equal(data.result.entryId, 'entry1');
+  assert.equal(data.result.success, true);
+  assert.equal(data.requestId, 'req-1');
+  assert.equal(data.shopId, 'shop1');
+  assert.equal(data.actorId, 'actor1');
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].requesterId,
+    'user1',
+    'the hook userId is the requester, never the payload userId'
+  );
+  assert.deepEqual(calls[0].payload, {
+    shopId: 'shop1',
+    entryId: 'entry1',
+    actorId: 'actor1',
+    requestId: 'req-1',
+  });
+  assert.ok(!('userId' in calls[0].payload), 'no payload userId leaks into the service call');
+});
+
+test('a theft request without the required fields is rejected on the GM side', async () => {
+  let called = false;
+  const theft = {
+    attempt: async () => {
+      called = true;
+      return { status: 'committed' };
+    },
+  };
+  const cases = [
+    [{ entryId: 'entry1', actorId: 'actor1', requestId: 'req' }, 'missing-shop-id'],
+    [{ shopId: 'shop1', actorId: 'actor1', requestId: 'req' }, 'missing-entry-id'],
+    [{ shopId: 'shop1', entryId: 'entry1', requestId: 'req' }, 'missing-actor-id'],
+    [{ shopId: 'shop1', entryId: 'entry1', actorId: 'actor1' }, 'missing-request-id'],
+  ];
+  for (const [fields, expected] of cases) {
+    called = false;
+    const ctx = makeAdvancedCtx({ theft });
+    const data = await handleMarketChatMessage(makeAdvancedMessage('theft', fields), 'user1', ctx);
+    assert.equal(data.result.status, 'error');
+    assert.equal(data.result.error, expected);
+    assert.equal(called, false, `theft.attempt must not run without ${expected}`);
+  }
+});
+
+test('theft request ignores a client-supplied success and only attempts the claim', async () => {
+  let resolveCalled = false;
+  const attemptCalls = [];
+  const theft = {
+    attempt: async (payload) => {
+      attemptCalls.push(payload);
+      return { status: 'committed', orderId: 'o1' };
+    },
+    resolve: async () => {
+      resolveCalled = true;
+      return { status: 'booked' };
+    },
+  };
+  const ctx = makeAdvancedCtx({ theft });
+  const data = await handleMarketChatMessage(
+    makeAdvancedMessage('theft', {
+      shopId: 'shop1',
+      entryId: 'entry1',
+      actorId: 'actor1',
+      requestId: 'req-1',
+      success: true,
+    }),
+    'gm1',
+    ctx
+  );
+  assert.equal(data.type, 'theft');
+  assert.equal(data.result.status, 'committed');
+  assert.equal(data.result.orderId, 'o1');
+  assert.equal(attemptCalls.length, 1);
+  assert.ok(!('success' in attemptCalls[0]), 'a client success never reaches attempt');
+  assert.equal(resolveCalled, false, 'a player theft request never resolves; only the GM does');
+});
+
+test('requestMessageData copies only the allowlisted advanced fields, never a server/GM snapshot', () => {
+  const data = requestMessageData({
+    type: 'service',
+    requestId: 'req-1',
+    shopId: 'shop1',
+    actorId: 'actor1',
+    serviceId: 'svc1',
+    success: true,
+    price: 999,
+    gmUserId: 'gm-x',
+    lines: [{ entryId: 'e1', quantity: 1 }],
+    barterItemId: 'item-9',
+  });
+  const request = data.flags.market.request;
+  assert.equal(request.type, 'service');
+  assert.equal(request.serviceId, 'svc1');
+  assert.deepEqual(request.lines, [{ entryId: 'e1', quantity: 1 }]);
+  assert.equal(request.barterItemId, 'item-9');
+  assert.ok(!('success' in request), 'a client success/price/gmUserId never rides the request');
+  assert.ok(!('price' in request));
+  assert.ok(!('gmUserId' in request));
+});
+
+// ---- M5: advanced public sanitizers strip private response internals ------------
+
+test('publicCartResult strips private cart internals and never echoes carrybacks', () => {
+  const safe = publicCartResult({
+    status: 'committed',
+    conflict: true,
+    expected: 'hash',
+    existing: { id: 'o1' },
+    record: { id: 'o1', kind: 'cart', details: {} },
+    outcome: { total: 700 },
+    details: { fundsBefore: 1000, barter: [], delivered: [] },
+    barter: { itemId: 'x' },
+    delivered: [],
+    orderId: 'o1',
+    total: 700,
+    quantity: 3,
+    barterCredit: 50,
+    cashPaid: 650,
+    items: [
+      { entryId: 'e1', name: 'Potion', quantity: 2, itemUuid: 'Compendium.Item.p', snapshot: {}, createdId: 'e1' },
+      { entryId: 'e2', name: 'Sword', quantity: 1, specialId: 's1', specialPrice: 400 },
+    ],
+  });
+  assert.equal(safe.status, 'committed');
+  assert.equal(safe.orderId, 'o1');
+  assert.equal(safe.total, 700);
+  assert.equal(safe.quantity, 3);
+  assert.equal(safe.barterCredit, 50);
+  assert.equal(safe.cashPaid, 650);
+  assert.deepEqual(safe.items, [
+    { entryId: 'e1', name: 'Potion', quantity: 2 },
+    { entryId: 'e2', name: 'Sword', quantity: 1, specialId: 's1', specialPrice: 400 },
+  ]);
+  assert.ok(!('conflict' in safe));
+  assert.ok(!('expected' in safe));
+  assert.ok(!('existing' in safe));
+  assert.ok(!('record' in safe));
+  assert.ok(!('outcome' in safe));
+  assert.ok(!('details' in safe));
+  assert.ok(!('barter' in safe));
+  assert.ok(!('delivered' in safe));
+});
+
+test('publicServiceResult strips private service internals and never echoes carrybacks', () => {
+  const safe = publicServiceResult({
+    status: 'fulfilled',
+    conflict: true,
+    expected: 'hash',
+    existing: { id: 'o1' },
+    record: { id: 'o1', kind: 'service' },
+    outcome: { serviceId: 'svc1' },
+    details: { unitPrice: 150, serviceName: 'Repair', priceInfo: {}, fundsBefore: 1000 },
+    compensation: ['credit-refunded'],
+    orderId: 'o1',
+    serviceId: 'svc1',
+    serviceName: 'Repair',
+    price: 150,
+  });
+  assert.equal(safe.status, 'fulfilled');
+  assert.equal(safe.orderId, 'o1');
+  assert.equal(safe.serviceId, 'svc1');
+  assert.equal(safe.serviceName, 'Repair');
+  assert.equal(safe.price, 150);
+  assert.ok(!('conflict' in safe));
+  assert.ok(!('expected' in safe));
+  assert.ok(!('existing' in safe));
+  assert.ok(!('record' in safe));
+  assert.ok(!('outcome' in safe));
+  assert.ok(!('details' in safe));
+  assert.ok(!('compensation' in safe));
+});
+
+test('publicPreorderResult strips private preorder internals and never echoes carrybacks', () => {
+  const safe = publicPreorderResult({
+    status: 'booked',
+    conflict: true,
+    expected: 'hash',
+    existing: { id: 'o1' },
+    record: { id: 'o1', kind: 'preorder' },
+    outcome: { total: 200 },
+    details: { unitPrice: 100, itemUuid: 'Compendium.Item.p', fundsBefore: 1000, compensation: [] },
+    orderId: 'o1',
+    entryId: 'entry1',
+    quantity: 2,
+    total: 200,
+    deposit: 100,
+    remaining: 100,
+  });
+  assert.equal(safe.status, 'booked');
+  assert.equal(safe.orderId, 'o1');
+  assert.equal(safe.entryId, 'entry1');
+  assert.equal(safe.quantity, 2);
+  assert.equal(safe.total, 200);
+  assert.equal(safe.deposit, 100);
+  assert.equal(safe.remaining, 100);
+  assert.ok(!('conflict' in safe));
+  assert.ok(!('expected' in safe));
+  assert.ok(!('existing' in safe));
+  assert.ok(!('record' in safe));
+  assert.ok(!('outcome' in safe));
+  assert.ok(!('details' in safe));
+});
+
+test('publicTheftResult strips private theft internals and never echoes carrybacks', () => {
+  const safe = publicTheftResult({
+    status: 'committed',
+    success: true,
+    conflict: true,
+    expected: 'hash',
+    existing: { id: 'o1' },
+    record: { id: 'o1', kind: 'theft' },
+    outcome: { success: true },
+    details: { compensation: [] },
+    orderId: 'o1',
+    entryId: 'entry1',
+  });
+  assert.equal(safe.status, 'committed');
+  assert.equal(safe.orderId, 'o1');
+  assert.equal(safe.entryId, 'entry1');
+  assert.equal(safe.success, true);
+  assert.ok(!('conflict' in safe));
+  assert.ok(!('expected' in safe));
+  assert.ok(!('existing' in safe));
+  assert.ok(!('record' in safe));
+  assert.ok(!('outcome' in safe));
+  assert.ok(!('details' in safe));
+});
+
+test('advanced cart/preorder detail is bounded and only emitted for the two documented errors', () => {
+  const cartShort = publicCartResult({ status: 'error', error: 'insufficient-funds', detail: 'need 250 more' });
+  assert.equal(cartShort.detail, 'need 250 more');
+  const cartLong = publicCartResult({
+    status: 'error',
+    error: 'insufficient-funds',
+    detail: 'x'.repeat(300),
+  });
+  assert.equal(cartLong.detail.length, 200);
+  const cartOther = publicCartResult({ status: 'error', error: 'order-read-failed', detail: 'boom' });
+  assert.ok(!('detail' in cartOther), 'detail only appears for the two documented errors');
+  const preorderRefused = publicPreorderResult({ status: 'error', error: 'service-refused', detail: 'Hated' });
+  assert.equal(preorderRefused.detail, 'Hated');
+  const svc = publicServiceResult({ status: 'error', error: 'service-refused', detail: 'x' });
+  assert.ok(!('detail' in svc), 'service never emits a detail');
+  const theft = publicTheftResult({ status: 'error', error: 'insufficient-funds', detail: 'x' });
+  assert.ok(!('detail' in theft), 'theft never emits a detail');
+});
+
+test('advanced public results carry a stable originalStatus and keep shop-write-missing', () => {
+  // A replay response must expose the recorded original status so the storefront
+  // can distinguish a success replay from a failed/needsRecovery one.
+  const cart = publicCartResult({ status: 'replay', orderId: 'o1', originalStatus: 'committed' });
+  assert.equal(cart.originalStatus, 'committed');
+  const svc = publicServiceResult({ status: 'replay', orderId: 'o1', originalStatus: 'booked' });
+  assert.equal(svc.originalStatus, 'booked');
+  const pre = publicPreorderResult({ status: 'replay', orderId: 'o1', originalStatus: 'cancelled' });
+  assert.equal(pre.originalStatus, 'cancelled');
+  const theft = publicTheftResult({ status: 'replay', orderId: 'o1', originalStatus: 'failed' });
+  assert.equal(theft.originalStatus, 'failed');
+  const sell = publicSellResult({ status: 'replay', orderId: 'o1', originalStatus: 'committed' });
+  assert.equal(sell.originalStatus, 'committed');
+
+  // An unknown / non-string originalStatus is dropped, never leaked.
+  const unknown = publicCartResult({ status: 'replay', originalStatus: 'bogus' });
+  assert.ok(!('originalStatus' in unknown));
+  const nonString = publicCartResult({ status: 'replay', originalStatus: 42 });
+  assert.ok(!('originalStatus' in nonString));
+
+  // The null shop-write compensation code is a kept, stable error - it must not
+  // collapse to server-error.
+  const missing = publicCartResult({ status: 'failed', error: 'shop-write-missing' });
+  assert.equal(missing.error, 'shop-write-missing');
+  const sellMissing = publicSellResult({ status: 'failed', error: 'shop-write-missing' });
+  assert.equal(sellMissing.error, 'shop-write-missing');
+});
+
+test('publicAdvancedOrder projects only the bounded scalar summary and strips private fields', () => {
+  const o = publicAdvancedOrder({
+    id: 'o1',
+    key: 'cart:req-1',
+    kind: 'cart',
+    status: 'committed',
+    phase: 'committed',
+    shopId: 'shop1',
+    actorId: 'actor1',
+    entryId: null,
+    relatedOrderId: null,
+    quantity: 2,
+    total: 200,
+    deposit: null,
+    remaining: null,
+    userId: 'player1',
+    createdAt: 100,
+    updatedAt: 200,
+    error: null,
+    details: { unitPrice: 100, fundsBefore: 500, compensation: [] },
+    outcome: { total: 200 },
+    payload: { lines: [{ entryId: 'e1', quantity: 2 }] },
+    intentHash: 'abc123',
+    extra: 'ignored',
+  });
+  assert.deepEqual(o, {
+    id: 'o1',
+    key: 'cart:req-1',
+    kind: 'cart',
+    status: 'committed',
+    phase: 'committed',
+    shopId: 'shop1',
+    actorId: 'actor1',
+    entryId: null,
+    relatedOrderId: null,
+    quantity: 2,
+    total: 200,
+    deposit: null,
+    remaining: null,
+    userId: 'player1',
+    createdAt: 100,
+    updatedAt: 200,
+    error: null,
+  });
+  assert.ok(!('details' in o));
+  assert.ok(!('outcome' in o));
+  assert.ok(!('payload' in o));
+  assert.ok(!('intentHash' in o));
+  assert.ok(!('extra' in o));
+});
+
 // ----------------------------------------------------------- commerce edge cases
 
 test('a pending ledger replay surfaces pending instead of silently implying success', async () => {
@@ -932,6 +1753,180 @@ test('purchase marks needsRecovery when restoring the stock itself fails', async
   const ledger = getLedgerForUser(store, 'user1:');
   assert.equal(ledger.status, 'needsRecovery');
   assert.ok(ledger.compensation.includes('stock-restore-failed'));
+});
+
+// ---------------------------------------------- merchant funds on direct Buy
+
+test('purchase earns finite merchant funds on a regular sale', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10, commerce: { funds: 500 } }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.inventory[0].quantity, 8, 'stock decremented');
+  assert.equal(shop.commerce.funds, 700, 'finite merchant funds gained the total');
+  assert.equal(actor.system.currency.gp, 3, 'wallet debited by 200 copper');
+});
+
+test('purchase earns finite merchant funds on an unlimited-stock sale', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, stockMode: 'unlimited', commerce: { funds: 500 } }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.inventory[0].quantity, 10, 'unlimited stock unchanged');
+  assert.equal(shop.commerce.funds, 700, 'finite merchant funds gained the total');
+});
+
+test('purchase refuses a merchant-funds overflow before any debit', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10, commerce: { funds: Number.MAX_SAFE_INTEGER } }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error, 'merchant-funds-overflow');
+  assert.equal(actor.system.currency.gp, 5, 'no charge before the overflow refusal');
+  assert.equal(actor.items.length, 0, 'no item delivered');
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.inventory[0].quantity, 10, 'stock unchanged');
+  assert.equal(shop.commerce.funds, Number.MAX_SAFE_INTEGER, 'funds unchanged');
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'failed');
+  assert.equal(ledger.error, 'merchant-funds-overflow');
+});
+
+test('purchase compensates when the shop write applies but then throws', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10, commerce: { funds: 500 } }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const originalUpdateShop = store.updateShop;
+  let updateShopCalls = 0;
+  store.updateShop = async (id, patch) => {
+    updateShopCalls += 1;
+    if (updateShopCalls === 1) {
+      // Apply the patch, then throw: the write landed but the call failed.
+      const current = store._shops.get(id);
+      if (current) store._shops.set(id, { ...current, ...patch });
+      throw new Error('shop write exploded after apply');
+    }
+    return originalUpdateShop(id, patch);
+  };
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  assert.ok(result.compensation.includes('currency-refunded'));
+  assert.ok(result.compensation.includes('item-removed'));
+  assert.ok(result.compensation.includes('shop-restored'));
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.inventory[0].quantity, 10, 'stock restored to the original count');
+  assert.equal(shop.commerce.funds, 500, 'merchant funds restored to the original amount');
+  assert.equal(actor.system.currency.gp, 5, 'currency refunded');
+});
+
+test('purchase escalates a mixed shop write to needsRecovery', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10, commerce: { funds: 500 } }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const originalUpdateShop = store.updateShop;
+  let updateShopCalls = 0;
+  store.updateShop = async (id, patch) => {
+    updateShopCalls += 1;
+    if (updateShopCalls === 1) {
+      // Apply only the stock change (drop the commerce patch), then throw: the
+      // write halves apart - one dimension applied, the other did not.
+      const current = store._shops.get(id);
+      if (current) store._shops.set(id, { ...current, inventory: patch.inventory });
+      throw new Error('write exploded with a half-applied patch');
+    }
+    return originalUpdateShop(id, patch);
+  };
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'needsRecovery');
+  assert.ok(result.compensation.includes('shop-state-mixed'));
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.inventory[0].quantity, 8, 'stock left as the half-applied write left it');
+  assert.equal(shop.commerce.funds, 500, 'funds left untouched by the half-applied write');
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'needsRecovery');
+});
+
+test('purchase refunds a failure and leaves finite funds unchanged', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10, commerce: { funds: 500 } }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  actor.createEmbeddedDocuments = async () => {
+    throw new Error('delivery exploded');
+  };
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  assert.ok(result.compensation.includes('currency-refunded'));
+  assert.equal(actor.system.currency.gp, 5, 'currency refunded');
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.inventory[0].quantity, 10, 'stock never touched');
+  assert.equal(shop.commerce.funds, 500, 'merchant funds never touched');
+});
+
+test('purchase with legacy null funds leaves commerce.funds unchanged', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.commerce.funds, null, 'legacy null funds stay null');
+  assert.equal(shop.inventory[0].quantity, 8, 'stock decremented as before');
 });
 
 // ------------------------------------------------------------- fractional prices
@@ -1483,6 +2478,144 @@ test('catalog with an owned actor personalizes price, breakdown and relationship
   assert.ok(!('snapshot' in entry), 'snapshot still omitted');
   assert.ok(!('social' in entry), 'private shop social config omitted');
   assert.deepEqual(data.merchants, []);
+});
+
+test('personalized catalog exposes only still-valid GM-approved items for the owned actor', async () => {
+  const i1 = {
+    id: 'i1',
+    name: 'Sword',
+    system: { quantity: 1 },
+    toObject() {
+      return { _id: 'i1', name: 'Sword', type: 'weapon', system: { quantity: 1 }, flags: {} };
+    },
+  };
+  const i2 = {
+    id: 'i2',
+    name: 'Ring',
+    system: {},
+    toObject() {
+      return { _id: 'i2', name: 'Ring', type: 'gear', system: {}, flags: {} };
+    },
+  };
+  const fingerprint = fingerprintItem(i1);
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    inventory: [],
+    commerce: {
+      valuations: [
+        { id: 'v1', actorUuid: 'Actor.a1', itemId: 'i1', amount: 100, fingerprint },
+      ],
+    },
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async () => ({ uuid: 'Actor.a1', items: [i1, i2] }),
+    getSocial: async () => ({ score: 0, individual: 0, party: 0 }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-approve-1' }),
+    'user1',
+    ctx
+  );
+  assert.deepEqual(
+    data.shop.approvedItems,
+    [{ itemId: 'i1', amount: 100 }],
+    'only the matching, fingerprint-valid item is approved'
+  );
+  // The raw private valuation fields never leak (no `valuations`, no `actorUuid`,
+  // no `fingerprint`, no `id` on the projected allowlist entries).
+  assert.ok(!('valuations' in data.shop), 'raw commerce.valuations never leaks');
+  assert.equal(Object.keys(data.shop.approvedItems[0]).join(','), 'itemId,amount');
+});
+
+test('a catalog approval is dropped for a different actor or a mutated item', async () => {
+  const i1 = {
+    id: 'i1',
+    name: 'Sword',
+    system: { quantity: 1 },
+    toObject() {
+      return { _id: 'i1', name: 'Sword', type: 'weapon', system: { quantity: 1 }, flags: {} };
+    },
+  };
+  // A mutated version of the SAME item (a player changed the system price) whose
+  // fingerprint no longer matches the approval recorded at approve time.
+  const mutated = {
+    id: 'i1',
+    name: 'Sword',
+    system: { quantity: 1 },
+    toObject() {
+      return {
+        _id: 'i1',
+        name: 'Sword',
+        type: 'weapon',
+        system: { quantity: 1, price: 9999 },
+        flags: {},
+      };
+    },
+  };
+  const fingerprint = fingerprintItem(i1);
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    inventory: [],
+    commerce: {
+      valuations: [
+        { id: 'v1', actorUuid: 'Actor.a1', itemId: 'i1', amount: 100, fingerprint },
+        // A valuation for a DIFFERENT actor; the requester owns another actor.
+        { id: 'v2', actorUuid: 'Actor.a2', itemId: 'i2', amount: 50, fingerprint },
+      ],
+    },
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async () => ({ uuid: 'Actor.a1', items: [mutated] }),
+    getSocial: async () => ({ score: 0, individual: 0, party: 0 }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-approve-2' }),
+    'user1',
+    ctx
+  );
+  assert.deepEqual(
+    data.shop.approvedItems,
+    [],
+    'a mutated item and an other-actor valuation are both dropped'
+  );
+});
+
+test('a base (non-personalized) catalog carries an empty approvedItems allowlist', async () => {
+  const i1 = {
+    id: 'i1',
+    name: 'Sword',
+    toObject() {
+      return { _id: 'i1', name: 'Sword', type: 'weapon', flags: {} };
+    },
+  };
+  const fingerprint = fingerprintItem(i1);
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    inventory: [],
+    commerce: {
+      valuations: [
+        { id: 'v1', actorUuid: 'Actor.a1', itemId: 'i1', amount: 100, fingerprint },
+      ],
+    },
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({ store });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', requestId: 'cat-approve-base' }),
+    'user1',
+    ctx
+  );
+  assert.deepEqual(data.shop.approvedItems, [], 'base catalog exposes no approvals');
 });
 
 test('catalog with an unowned actor returns a correlated actor-not-owned error', async () => {
@@ -2317,4 +3450,887 @@ test('allowlist includes locationName and both catalog variants stay allowlisted
   assert.equal(persData.type, 'catalog');
   assert.equal(persData.shop.locationName, 'Alpha');
   assert.ok(Object.keys(persData.shop).every((k) => PUBLIC_SHOP_FIELDS.includes(k)));
+});
+
+// ------------------------------------------------------------ M5 catalog specials
+
+test('base catalog projects a sanitized specials list and cross-references exactly one eligible public offer', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        {
+          id: 'sp1',
+          title: 'Potion Sale',
+          description: 'Half price',
+          entryId: 'e1',
+          price: 60,
+          visible: true,
+          actorUuids: [],
+        },
+      ],
+    },
+  });
+  const catalog = buildCatalog(shop);
+  assert.ok(Object.keys(catalog.shop).every((k) => PUBLIC_SHOP_FIELDS.includes(k)));
+  assert.deepEqual(catalog.shop.specials, [
+    { id: 'sp1', title: 'Potion Sale', description: 'Half price', entryId: 'e1', price: 60 },
+  ]);
+  assert.equal(catalog.inventory[0].specialId, 'sp1');
+  assert.equal(catalog.inventory[0].specialPrice, 60);
+  // Never leaks the raw `visible`/`actorUuids`/commerce config into the entry.
+  assert.ok(!('actorUuids' in catalog.inventory[0]));
+});
+
+test('base catalog hides an actor-specific offer and omits its cross-reference even when the item is public', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'VIP', description: 'Only Alice', entryId: 'e1', price: 60, visible: true, actorUuids: ['Actor.alice'] },
+      ],
+    },
+  });
+  const catalog = buildCatalog(shop);
+  assert.deepEqual(catalog.shop.specials, []);
+  assert.ok(!('specialId' in catalog.inventory[0]), 'no cross-reference for a hidden actor-specific offer');
+  assert.ok(!('specialPrice' in catalog.inventory[0]));
+});
+
+test('base catalog omits a special whose reference entry is a backroom', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Backroom', price: 20, quantity: 1, visible: true, access: { mode: 'backroom', actorUuids: [], minReputation: 0 } }),
+      normalizeInventoryEntry({ id: 'e2', itemUuid: 'u2', name: 'Public', price: 10, quantity: 1, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'Backroom', description: '', entryId: 'e1', price: 15, visible: true, actorUuids: [] },
+        { id: 'sp2', title: 'Public', description: '', entryId: 'e2', price: 5, visible: true, actorUuids: [] },
+      ],
+    },
+  });
+  const catalog = buildCatalog(shop);
+  assert.deepEqual(catalog.inventory.map((e) => e.name), ['Public']);
+  assert.deepEqual(catalog.shop.specials.map((s) => s.id), ['sp2']);
+  assert.equal(catalog.inventory[0].specialId, 'sp2');
+});
+
+test('personalized catalog exposes an actor-allowlisted offer only to the eligible actor at a social-quoted price', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'VIP', description: 'Only Alice', entryId: 'e1', price: 60, visible: true, actorUuids: ['Actor.alice'] },
+      ],
+    },
+  });
+  const store = { findShop: async () => shop };
+
+  // Base: the actor-specific offer is hidden (actorUuid null).
+  const baseCatalog = buildCatalog(shop);
+  assert.deepEqual(baseCatalog.shop.specials, []);
+  assert.ok(!('specialId' in baseCatalog.inventory[0]));
+
+  // Personalized for Alice (in the allowlist): the offer appears and the entry
+  // is cross-referenced with a social quote of the special price.
+  const aliceCtx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.alice' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  const alice = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'alice-spec' }),
+    'user1',
+    aliceCtx
+  );
+  assert.equal(alice.type, 'catalog');
+  assert.deepEqual(alice.shop.specials, [
+    { id: 'sp1', title: 'VIP', description: 'Only Alice', entryId: 'e1', price: 60 },
+  ]);
+  assert.equal(alice.inventory[0].specialId, 'sp1');
+  assert.equal(alice.inventory[0].specialPrice, 60);
+  assert.ok(Object.keys(alice.shop).every((k) => PUBLIC_SHOP_FIELDS.includes(k)));
+
+  // Personalized for Bob (NOT in the allowlist): hidden, no cross-reference.
+  const bobCtx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a2' ? { uuid: 'Actor.bob' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  const bob = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a2', requestId: 'bob-spec' }),
+    'user1',
+    bobCtx
+  );
+  assert.equal(bob.type, 'catalog');
+  assert.deepEqual(bob.shop.specials, []);
+  assert.ok(!('specialId' in bob.inventory[0]));
+});
+
+test('personalized catalog social-quotes the cross-referenced special price', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    social: { shopMarkupBps: 1000 },
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'Sale', description: '', entryId: 'e1', price: 60, visible: true, actorUuids: [] },
+      ],
+    },
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'social-spec' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'catalog');
+  // 60 marked up 10% => 66 per unit. The offer price is quoted socially, not
+  // emitted verbatim, for BOTH the cross-referenced entry price and the public
+  // specials list - they must agree.
+  assert.equal(data.inventory[0].specialPrice, 66);
+  assert.equal(data.shop.specials[0].price, 66);
+});
+
+test('personalized special price agrees with the configured price for a neutral owned actor', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    // No markup / personality / reputation adjustments: the social quote must
+    // resolve to the special's own configured price for an owned neutral actor.
+    social: {},
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'Sale', description: '', entryId: 'e1', price: 60, visible: true, actorUuids: [] },
+      ],
+    },
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'agree-spec' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'catalog');
+  // For an owned actor with no price adjustment the personalized special price
+  // must AGREE with the configured special price (still produced by quoteSocial,
+  // never the raw number bypassing the social engine).
+  assert.equal(data.inventory[0].specialPrice, 60);
+  assert.equal(data.shop.specials[0].price, 60);
+});
+
+test('personalized catalog social-quotes EVERY eligible special price in the list, even with multiple offers', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    social: { shopMarkupBps: 1000 },
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'A', description: '', entryId: 'e1', price: 60, visible: true, actorUuids: [] },
+        { id: 'sp2', title: 'B', description: '', entryId: 'e1', price: 70, visible: true, actorUuids: [] },
+      ],
+    },
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'multi-spec' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'catalog');
+  // Both offers are exposed at their SOCIAL-QUOTED prices (60 -> 66, 70 -> 77),
+  // never the raw configured price, and each agrees with how the storefront would
+  // read them.
+  assert.deepEqual(data.shop.specials.map((s) => s.price), [66, 77]);
+  // An ambiguous multi-offer entry is never cross-referenced.
+  assert.ok(!('specialId' in data.inventory[0]));
+});
+
+test('a hidden (visible:false) special is omitted from the public list and not cross-referenced', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'Sale', description: '', entryId: 'e1', price: 60, visible: false, actorUuids: [] },
+      ],
+    },
+  });
+  const catalog = buildCatalog(shop);
+  assert.deepEqual(catalog.shop.specials, []);
+  assert.ok(!('specialId' in catalog.inventory[0]));
+});
+
+test('a special whose reference entry is not in the inventory (forged) is omitted', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'Ghost', description: '', entryId: 'missing', price: 60, visible: true, actorUuids: [] },
+      ],
+    },
+  });
+  const catalog = buildCatalog(shop);
+  assert.deepEqual(catalog.shop.specials, []);
+  assert.ok(!('specialId' in catalog.inventory[0]));
+});
+
+test('two eligible offers on one entry keep the separate list and do NOT cross-reference', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: {
+      specials: [
+        { id: 'sp1', title: 'A', description: '', entryId: 'e1', price: 60, visible: true, actorUuids: [] },
+        { id: 'sp2', title: 'B', description: '', entryId: 'e1', price: 70, visible: true, actorUuids: [] },
+      ],
+    },
+  });
+  const catalog = buildCatalog(shop);
+  assert.deepEqual(catalog.shop.specials.map((s) => s.id), ['sp1', 'sp2']);
+  assert.ok(!('specialId' in catalog.inventory[0]), 'an ambiguous entry is not cross-referenced');
+});
+
+// ------------------------------------------------------------ M5 backroom access
+
+test('base catalog omits backroom entries regardless of visible', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Public', price: 10, quantity: 1, visible: true }),
+      normalizeInventoryEntry({ id: 'e2', itemUuid: 'u2', name: 'Backroom', price: 20, quantity: 1, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.a1'], minReputation: -100 } }),
+      normalizeInventoryEntry({ id: 'e3', itemUuid: 'u3', name: 'HiddenBackroom', price: 30, quantity: 1, visible: false, access: { mode: 'backroom', actorUuids: [], minReputation: 0 } }),
+    ],
+  });
+  const catalog = buildCatalog(shop);
+  assert.deepEqual(catalog.inventory.map((e) => e.name), ['Public']);
+  for (const entry of catalog.inventory) {
+    assert.ok(!('access' in entry), 'access gate never leaks into the base catalog');
+  }
+});
+
+test('personalized catalog filters backroom entries by access (allowlist + reputation)', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    social: { primaryPersonality: 'honest', shopMarkupBps: 0 },
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Public', price: 10, quantity: 1, visible: true }),
+      normalizeInventoryEntry({ id: 'e2', itemUuid: 'u2', name: 'Allow', price: 20, quantity: 1, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.a1'], minReputation: -100 } }),
+      normalizeInventoryEntry({ id: 'e3', itemUuid: 'u3', name: 'Rep', price: 30, quantity: 1, visible: true, access: { mode: 'backroom', actorUuids: [], minReputation: 25 } }),
+      normalizeInventoryEntry({ id: 'e4', itemUuid: 'u4', name: 'Deny', price: 40, quantity: 1, visible: true, access: { mode: 'backroom', actorUuids: [], minReputation: 50 } }),
+    ],
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 30, band: { title: 'Friendly' }, individual: 30, party: 0, partyId: '' }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-m5-1' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'catalog');
+  assert.deepEqual(data.inventory.map((e) => e.name).sort(), ['Allow', 'Public', 'Rep']);
+  assert.ok(!data.inventory.some((e) => e.name === 'Deny'), 'reputation-denied backroom is omitted');
+  for (const entry of data.inventory) {
+    assert.ok(!('access' in entry), 'access gate never leaks into the personalized catalog');
+  }
+});
+
+test('an unowned actor cannot probe a backroom-only catalog (actor-not-owned, no leak)', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Secret', price: 10, quantity: 1, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.a1'], minReputation: -100 } }),
+    ],
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async () => ({ uuid: 'Actor.a1' }),
+    actorOwnedBy: () => false,
+    getSocial: async () => ({ score: 100, band: { title: 'Loved' }, individual: 100, party: 0, partyId: '' }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-m5-unowned' }),
+    'user2',
+    ctx
+  );
+  assert.equal(data.type, 'error');
+  assert.equal(data.error, 'actor-not-owned');
+  assert.ok(!('inventory' in data), 'no catalog inventory leaked for an unowned actor');
+});
+
+// ------------------------------------------------------ M5 availability flags
+
+test('public shop projects commerce services/flags without leaking the raw commerce object', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [],
+    commerce: {
+      funds: 500,
+      buyRateBps: 4000,
+      buybackRateBps: 9000,
+      services: [
+        { id: 'sv1', name: 'Repair', description: 'Fix gear', price: 50, enabled: true, visible: true, manualFulfillment: true },
+        { id: 'sv2', name: 'Disabled', description: 'Off', price: 10, enabled: false, visible: true },
+        { id: 'sv3', name: 'Hidden', description: 'Not shown', price: 5, enabled: true, visible: false },
+      ],
+      preorders: { enabled: true, depositBps: 1000, maxPerActor: 2 },
+      theft: { enabled: true },
+    },
+  });
+  const catalog = buildCatalog(shop);
+  const s = catalog.shop;
+  assert.equal(s.preordersEnabled, true);
+  assert.equal(s.theftEnabled, true);
+  assert.deepEqual(s.services, [{ id: 'sv1', name: 'Repair', description: 'Fix gear', price: 50 }]);
+  // The allowlisted projection never carries the private `commerce` config.
+  assert.ok(!('commerce' in s), 'raw commerce object never leaks');
+  assert.ok(!('funds' in s));
+  assert.ok(!('buyRateBps' in s));
+  assert.ok(!('buybackRateBps' in s));
+  assert.ok(!('depositBps' in s));
+  assert.ok(!('maxPerActor' in s));
+  assert.ok(!('manualFulfillment' in s.services[0]), 'manualFulfillment flag not leaked');
+  assert.ok(!('enabled' in s.services[0]), 'service enabled flag not leaked');
+  assert.ok(!('visible' in s.services[0]), 'service visible flag not leaked');
+});
+
+test('publicServices bounds oversized raw input and clamps an invalid price', () => {
+  const shop = makeShop({ price: 100, quantity: 5 });
+  // Bypass normalization to prove the projection is defensive on raw input.
+  shop.commerce.services = [
+    { id: 'sv1', name: 'A'.repeat(150), description: 'D'.repeat(500), price: -5, enabled: true, visible: true },
+    { id: 'sv2', name: 'Fine', description: 'OK', price: 7, enabled: true, visible: true },
+  ];
+  const catalog = buildCatalog(shop);
+  const [s1, s2] = catalog.shop.services;
+  assert.equal(s1.name, 'A'.repeat(100), 'service name bounded to SERVICE_NAME_MAX');
+  assert.equal(s1.description, 'D'.repeat(400), 'service description bounded to SERVICE_DESCRIPTION_MAX');
+  assert.equal(s1.price, 0, 'a non-finite/negative price collapses to 0');
+  assert.equal(s2.price, 7, 'a finite non-negative price is preserved');
+  assert.equal(catalog.shop.services.length, 2);
+});
+
+test('base catalog reflects preordersEnabled/theftEnabled and never leaks the config', () => {
+  const shop = makeShop({ price: 100, quantity: 5 });
+  shop.commerce.preorders.enabled = true;
+  shop.commerce.theft.enabled = true;
+  const catalog = buildCatalog(shop);
+  assert.equal(catalog.shop.preordersEnabled, true);
+  assert.equal(catalog.shop.theftEnabled, true);
+  assert.ok(!('commerce' in catalog.shop));
+  // Default shop has both flags false.
+  const plain = buildCatalog(makeShop({ price: 100, quantity: 5 }));
+  assert.equal(plain.shop.preordersEnabled, false);
+  assert.equal(plain.shop.theftEnabled, false);
+});
+
+test('base catalog marks a finite out-of-stock entry preorderable, never an in-stock/unlimited one', () => {
+  const oos = makeShop({ price: 100, quantity: 0 });
+  oos.commerce.preorders.enabled = true;
+  oos.commerce.theft.enabled = true;
+  const catalog = buildCatalog(oos);
+  const entry = catalog.inventory[0];
+  assert.equal(entry.canPreorder, true, 'a finite out-of-stock entry is preorderable');
+  assert.equal(entry.canAttemptTheft, false, 'an out-of-stock entry is not stealable');
+
+  const inStock = makeShop({ price: 100, quantity: 5 });
+  inStock.commerce.preorders.enabled = true;
+  inStock.commerce.theft.enabled = true;
+  const catalog2 = buildCatalog(inStock);
+  assert.equal(catalog2.inventory[0].canPreorder, false, 'an in-stock entry is not preorderable');
+  assert.equal(catalog2.inventory[0].canAttemptTheft, true, 'an in-stock public entry is stealable');
+
+  const unlimited = makeShop({ stockMode: 'unlimited', price: 100, quantity: 0 });
+  unlimited.commerce.preorders.enabled = true;
+  unlimited.commerce.theft.enabled = true;
+  const catalog3 = buildCatalog(unlimited);
+  assert.equal(catalog3.inventory[0].canPreorder, false, 'an unlimited entry is never preorderable');
+  assert.equal(catalog3.inventory[0].canAttemptTheft, true, 'an unlimited in-stock entry is stealable');
+});
+
+test('base catalog disables preorder/theft when the shop is closed', () => {
+  const shop = makeShop({ open: false, price: 100, quantity: 0 });
+  shop.commerce.preorders.enabled = true;
+  shop.commerce.theft.enabled = true;
+  const catalog = buildCatalog(shop);
+  assert.equal(catalog.shop.open, false);
+  assert.equal(catalog.inventory[0].canPreorder, false, 'a closed shop never offers preorder');
+  assert.equal(catalog.inventory[0].canAttemptTheft, false, 'a closed shop never offers theft');
+});
+
+test('a non-restocking out-of-stock entry is preorderable but not buyable', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Rare', price: 100, quantity: 0, stockMode: 'non-restocking', visible: true }),
+    ],
+    commerce: { preorders: { enabled: true } },
+  });
+  const catalog = buildCatalog(shop);
+  assert.equal(catalog.inventory[0].stockMode, 'non-restocking');
+  assert.equal(catalog.inventory[0].canPreorder, true, 'a non-restocking out-of-stock entry is preorderable');
+  assert.ok(!('canBuy' in catalog.inventory[0]), 'the base entry never carries the personalized canBuy');
+});
+
+test('personalized canPreorder is refused for a Hated quote and true for an eligible actor', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    social: { primaryPersonality: 'honest', shopMarkupBps: 0 },
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 0, visible: true }),
+    ],
+    commerce: { preorders: { enabled: true } },
+  });
+  const store = { findShop: async () => shop };
+
+  const hatedCtx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: -100, band: { title: 'Hated' }, individual: -100, party: 0, partyId: '' }),
+  });
+  const hated = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-preorder-hated' }),
+    'user1',
+    hatedCtx
+  );
+  assert.equal(hated.type, 'catalog');
+  assert.equal(hated.inventory[0].canPreorder, false, 'a Hated (refused) quote is not preorderable');
+  assert.equal(hated.inventory[0].canBuy, false, 'a refused quote is also not buyable');
+
+  const likedCtx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 50, band: { title: 'Liked' }, individual: 50, party: 0, partyId: '' }),
+  });
+  const liked = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-preorder-liked' }),
+    'user1',
+    likedCtx
+  );
+  assert.equal(liked.inventory[0].canPreorder, true, 'an eligible actor may preorder an out-of-stock entry');
+  assert.equal(liked.inventory[0].canBuy, false, 'an out-of-stock entry is still not buyable');
+});
+
+test('canAttemptTheft requires public access, in-stock availability and a trading shop', async () => {
+  // A backroom entry the actor CAN access: theft is withheld (not public access),
+  // while preorder may be offered (eligible).
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    social: { primaryPersonality: 'honest', shopMarkupBps: 0 },
+    inventory: [
+      normalizeInventoryEntry({ id: 'public', itemUuid: 'u1', name: 'Public', price: 10, quantity: 2, visible: true }),
+      normalizeInventoryEntry({ id: 'back', itemUuid: 'u2', name: 'Backroom', price: 20, quantity: 2, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.a1'], minReputation: -100 } }),
+    ],
+    commerce: { preorders: { enabled: true }, theft: { enabled: true } },
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-theft-1' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'catalog');
+  const byName = Object.fromEntries(data.inventory.map((e) => [e.name, e]));
+  assert.equal(byName.Public.canAttemptTheft, true, 'a public in-stock entry is stealable');
+  assert.equal(byName.Public.canPreorder, false, 'an in-stock public entry is not preorderable');
+  assert.equal(byName.Backroom.canAttemptTheft, false, 'a backroom entry (even eligible) is never stealable');
+  assert.equal(byName.Backroom.canPreorder, false, 'an in-stock backroom entry is not preorderable');
+
+  // Out of stock public entry: theft false, preorder true.
+  const oosShop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    social: { primaryPersonality: 'honest', shopMarkupBps: 0 },
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 0, visible: true }),
+    ],
+    commerce: { preorders: { enabled: true }, theft: { enabled: true } },
+  });
+  const oosStore = { findShop: async () => oosShop };
+  const oosCtx = makeSocialCatalogCtx({
+    store: oosStore,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  const oos = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-theft-2' }),
+    'user1',
+    oosCtx
+  );
+  assert.equal(oos.inventory[0].canAttemptTheft, false, 'an out-of-stock entry is not stealable');
+  assert.equal(oos.inventory[0].canPreorder, true, 'an out-of-stock entry is preorderable');
+
+  // A closed shop with an in-stock public entry: neither flag is set.
+  const closedShop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: false,
+    social: { primaryPersonality: 'honest', shopMarkupBps: 0 },
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Potion', price: 100, quantity: 5, visible: true }),
+    ],
+    commerce: { preorders: { enabled: true }, theft: { enabled: true } },
+  });
+  const closedStore = { findShop: async () => closedShop };
+  const closedCtx = makeSocialCatalogCtx({
+    store: closedStore,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({ score: 0, band: { title: 'Neutral' }, individual: 0, party: 0, partyId: '' }),
+  });
+  const closed = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat-theft-3' }),
+    'user1',
+    closedCtx
+  );
+  assert.equal(closed.shop.open, false);
+  assert.equal(closed.inventory[0].canAttemptTheft, false, 'a closed shop withholds theft');
+  assert.equal(closed.inventory[0].canPreorder, false, 'a closed shop withholds preorder');
+});
+
+test('base catalog hides a backroom entry (and via it preorder/theft), never leaking access', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'public', itemUuid: 'u1', name: 'Public', price: 10, quantity: 0, visible: true }),
+      normalizeInventoryEntry({ id: 'back', itemUuid: 'u2', name: 'Backroom', price: 20, quantity: 0, visible: true, access: { mode: 'backroom', actorUuids: [], minReputation: -100 } }),
+    ],
+    commerce: { preorders: { enabled: true }, theft: { enabled: true } },
+  });
+  const catalog = buildCatalog(shop);
+  assert.deepEqual(catalog.inventory.map((e) => e.name), ['Public']);
+  for (const entry of catalog.inventory) {
+    assert.ok(!('access' in entry), 'access gate never leaks into the base catalog');
+    assert.ok('canPreorder' in entry && 'canAttemptTheft' in entry, 'base entries carry the availability flags');
+  }
+  assert.equal(catalog.inventory[0].canPreorder, true, 'the public out-of-stock entry is preorderable');
+});
+
+test('catalog only exposes allowlisted public fields across all M5 flag projections', () => {
+  const shop = makeShop({ price: 100, quantity: 0 });
+  shop.commerce.preorders.enabled = true;
+  shop.commerce.theft.enabled = true;
+  shop.commerce.services = [{ id: 'sv1', name: 'Repair', description: 'Fix', price: 5, enabled: true, visible: true }];
+  const catalog = buildCatalog(shop);
+  assert.ok(Object.keys(catalog.shop).every((k) => PUBLIC_SHOP_FIELDS.includes(k)));
+  assert.ok(Object.keys(catalog.inventory[0]).every((k) => PUBLIC_ENTRY_FIELDS.includes(k)));
+});
+
+// -------------------------------------------------------- M5 backroom purchase
+
+test('purchase rejects an inaccessible backroom as entry-restricted before debit', async () => {
+  const store = createMockStore();
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Backroom', price: 100, quantity: 10, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.alice'], minReputation: -100 } }),
+    ],
+  });
+  store._shops.set('shop1', shop);
+  const actor = createMockActor({ currency: { gp: 5 } });
+  actor.uuid = 'Actor.bob';
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    getSocial: async () => ({ score: 0, individual: 0, party: 0 }),
+  });
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'e1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error, 'entry-restricted');
+  assert.equal(actor.system.currency.gp, 5, 'no debit for an inaccessible backroom');
+  assert.equal(actor.items.length, 0, 'no delivery for an inaccessible backroom');
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'failed');
+  assert.equal(ledger.error, 'entry-restricted');
+});
+
+test('purchase commits for a backroom entry when the actor uuid is allowlisted', async () => {
+  const store = createMockStore();
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Backroom', price: 100, quantity: 10, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.alice'], minReputation: 25 } }),
+    ],
+  });
+  store._shops.set('shop1', shop);
+  const actor = createMockActor({ currency: { gp: 5 } });
+  actor.uuid = 'Actor.alice';
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    getSocial: async () => ({ score: 0, individual: 0, party: 0 }),
+  });
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'e1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+  assert.equal(result.total, 100);
+  assert.equal(actor.system.currency.gp, 4, 'debit applied');
+  assert.equal(actor.items.length, 1, 'item delivered');
+});
+
+test('purchase commits for a backroom entry when the actor meets the reputation threshold', async () => {
+  const store = createMockStore();
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Backroom', price: 100, quantity: 10, visible: true, access: { mode: 'backroom', actorUuids: [], minReputation: 25 } }),
+    ],
+  });
+  store._shops.set('shop1', shop);
+  const actor = createMockActor({ currency: { gp: 5 } });
+  actor.uuid = 'Actor.bob';
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    getSocial: async () => ({ score: 30, individual: 30, party: 0 }),
+  });
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'e1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+  assert.equal(actor.system.currency.gp, 4, 'debit applied');
+  assert.equal(actor.items.length, 1, 'item delivered');
+});
+
+test('legacy commerce fails closed for a backroom when getSocial is absent and the uuid is not allowlisted', async () => {
+  const store = createMockStore();
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Backroom', price: 100, quantity: 10, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.alice'], minReputation: 25 } }),
+    ],
+  });
+  store._shops.set('shop1', shop);
+  const actor = createMockActor({ currency: { gp: 5 } });
+  actor.uuid = 'Actor.bob';
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'e1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error, 'entry-restricted');
+  assert.equal(actor.system.currency.gp, 5, 'no debit on a legacy backroom denial');
+});
+
+test('legacy commerce allows a backroom when the uuid is allowlisted even without getSocial', async () => {
+  const store = createMockStore();
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'Backroom', price: 100, quantity: 10, visible: true, access: { mode: 'backroom', actorUuids: ['Actor.alice'], minReputation: 25 } }),
+    ],
+  });
+  store._shops.set('shop1', shop);
+  const actor = createMockActor({ currency: { gp: 5 } });
+  actor.uuid = 'Actor.alice';
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'e1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+  assert.equal(actor.system.currency.gp, 4, 'debit applied');
+  assert.equal(actor.items.length, 1, 'item delivered');
+});
+
+// ----------------------------------------------- terminal commit re-read (M1)
+
+test('a committed ledger write that applies then throws is reported committed and never compensated', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  // The terminal `committed` ledger write APPLIES the state then throws: the
+  // purchase may STILL have committed, so it must re-read rather than assume
+  // failed (which used to refund currency, remove the item and restore stock).
+  const originalUpdateLedger = store.updateLedger;
+  store.updateLedger = async (id, patch) => {
+    if (patch.status === 'committed') {
+      const res = await originalUpdateLedger(id, patch);
+      throw new Error('commit write exploded after apply');
+    }
+    return originalUpdateLedger(id, patch);
+  };
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+
+  // No compensation: the stock decrement, the debit and the delivery all stay.
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.inventory[0].quantity, 8, 'stock not restored');
+  assert.equal(actor.system.currency.gp, 3, 'currency not refunded');
+  assert.equal(actor.items.length, 1, 'delivered item not removed');
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'committed', 'ledger recorded as committed');
+});
+
+test('a committed ledger write whose re-read is unavailable is needsRecovery without refunding', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  // The terminal `committed` write throws (does not apply).
+  const originalUpdateLedger = store.updateLedger;
+  store.updateLedger = async (id, patch) => {
+    if (patch.status === 'committed') throw new Error('commit write failed');
+    return originalUpdateLedger(id, patch);
+  };
+  // The post-commit re-read is unavailable (lost read): the pending record cannot
+  // be confirmed, so it must escalate WITHOUT refunding/removing/restoring.
+  const originalFindLedger = store.findLedgerByKey.bind(store);
+  let reads = 0;
+  store.findLedgerByKey = async (key) => {
+    reads += 1;
+    if (reads >= 2) throw new Error('ledger read failed');
+    return originalFindLedger(key);
+  };
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'needsRecovery');
+  assert.equal(result.error, 'commit write failed');
+  assert.deepEqual(result.compensation, []);
+
+  // No compensation: the stock decrement, the debit and the delivery all stay.
+  const shop = store._shops.get('shop1');
+  assert.equal(shop.inventory[0].quantity, 8, 'stock not restored');
+  assert.equal(actor.system.currency.gp, 3, 'currency not refunded');
+  assert.equal(actor.items.length, 1, 'delivered item not removed');
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'pending', 'ledger left pending for a replay');
 });

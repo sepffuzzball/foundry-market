@@ -13,9 +13,12 @@ import { shopDragData } from '../canvas/placements.js';
 import {
   ACCENT_COLOR_RE,
   MAX_AUTOMATION_EVENTS,
+  MAX_COMMERCE_SERVICES,
+  MAX_COMMERCE_SPECIALS,
   MAX_SHOP_NPCS,
   makeId,
   normalizeAutomation,
+  normalizeCommerce,
   normalizeInventoryEntry,
   normalizeNpc,
   normalizeShopSocial,
@@ -123,6 +126,24 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       'save-events': this._action('_onSaveEvents'),
       'run-automation': this._action('_onRunAutomation'),
       'generate-inventory': this._action('_onGenerateInventory'),
+      // M5: GM-only commerce settings (funds/rates), service & special editor, and
+      // advanced-order manual adjudication.
+      'save-commerce': this._action('_onSaveCommerce'),
+      'add-service': this._action('_onAddService'),
+      'save-services': this._action('_onSaveServices'),
+      'remove-service': this._action('_onRemoveService'),
+      'add-special': this._action('_onAddSpecial'),
+      'save-specials': this._action('_onSaveSpecials'),
+      'remove-special': this._action('_onRemoveSpecial'),
+      'fulfill-service': this._action('_onFulfillService'),
+      'fulfill-preorder': this._action('_onFulfillPreorder'),
+      'cancel-preorder': this._action('_onCancelPreorder'),
+      'resolve-theft-success': this._action('_onResolveTheftSuccess'),
+      'resolve-theft-failure': this._action('_onResolveTheftFailure'),
+      'next-orders': this._action('_onNextOrders'),
+      'prev-orders': this._action('_onPrevOrders'),
+      // M6: GM-only per-Item valuation approval for sell/barter.
+      'approve-valuation': this._action('_onApproveValuation'),
     },
   };
 
@@ -163,6 +184,24 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       // raw path; the remaining automation context (weekdays, travel options,
       // event rows, diagnostics) is derived fresh in `_prepareContext`.
       drawTables: [],
+      // M5 GM-only advanced order list for the selected shop. Populated
+      // asynchronously on each refresh (see `_listAdvancedOrders`); a non-active GM
+      // or an unselected shop yields an empty list. `orderPage` is the current
+      // 100-record page index and the paging flags drive the next/previous controls.
+      advancedOrders: [],
+      orderPage: 0,
+      hasPreviousOrders: false,
+      hasNextOrders: false,
+      // M6 GM-authored per-Item valuation context for the selected shop/actor.
+      // `valuationActorId` mirrors the reputation Character selector (the valuation
+      // panel reuses that very selector), `valuationItems` lists the selected
+      // actor's embedded Items (each `{id,name}`) so the GM can pick one to value,
+      // and `approvedValuations` projects the private `shop.commerce.valuations`
+      // list (never the raw fingerprint) for the selected shop. GM-only.
+      valuationItems: [],
+      approvedValuations: [],
+      valuationActorId: null,
+      valuationActorName: '',
       notice: '',
     };
   }
@@ -367,6 +406,49 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     return this._api()?.reputation?.adjust?.(params);
   }
 
+  // ---- M5 advanced-commerce lazy accessors ------------------------------------
+
+  /**
+   * Invoke a GM-only advanced-order adjudication method. Prefers the injected
+   * `deps[method]` (tests) and otherwise defers to the `api.advanced[method]`
+   * wrapper, which re-checks the active GM before any store read/write. The method
+   * names map 1:1 between the injected deps and the api surface
+   * (`fulfillService`/`fulfillPreorder`/`cancelPreorder`/`resolveTheft`).
+   */
+  _advancedCall(method, params) {
+    if (typeof this._deps[method] === 'function') return this._deps[method](params);
+    return this._api()?.advanced?.[method]?.(params);
+  }
+
+  /**
+   * List the GM-visible advanced orders for a shop. Prefers the injected
+   * `deps.listAdvancedOrders` (tests, returns an array) and otherwise defers to
+   * `api.advanced.listOrders`, which is active-GM gated and projects each record
+   * through the scalar public sanitizer (`publicAdvancedOrder`) so no private
+   * snapshot leaks to the manager UI. A non-active GM or a read failure yields an
+   * empty list - the manager still renders context for viewing. `opts` carries the
+   * paging/filter parameters (`{ shopId, status, limit, offset }`) so the caller
+   * can page through the advanced-order list rather than always fetching the whole
+   * 100-record cap.
+   */
+  async _listAdvancedOrders({ shopId, status, limit, offset } = {}) {
+    if (typeof this._deps.listAdvancedOrders === 'function') {
+      const orders = await this._deps.listAdvancedOrders({ shopId, status, limit, offset });
+      return Array.isArray(orders) ? orders : [];
+    }
+    const api = this._api();
+    if (api?.advanced?.listOrders) {
+      const res = await api.advanced.listOrders({ shopId, status, limit, offset });
+      if (res?.status === 'ok' && Array.isArray(res.orders)) return res.orders;
+      return [];
+    }
+    if (typeof this._store?.listAdvancedOrders === 'function') {
+      const orders = await this._store.listAdvancedOrders({ shopId, status, limit, offset });
+      return Array.isArray(orders) ? orders : [];
+    }
+    return [];
+  }
+
   _formatDate(ts) {
     const d = new Date(Number(ts));
     if (Number.isNaN(d.getTime())) return '';
@@ -416,6 +498,21 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     this._data.travelLocationOptions = this._buildTravelLocationOptions();
     this._data.eventRows = this._buildEventRows();
     this._data.automationDiagnostics = this._sanitizeDiagnostics();
+    // M5: derive the commerce editor context (services/specials) fresh from the
+    // selected shop so a re-render never carries a stale row set. `advancedOrders`
+    // is populated asynchronously on each refresh; here it is only defaulted to an
+    // array so an unset value can never crash the render.
+    this._data.serviceRows = this._buildServiceRows();
+    this._data.specialRows = this._buildSpecialRows();
+    if (!Array.isArray(this._data.advancedOrders)) this._data.advancedOrders = [];
+    this._data.orderPage = this._data.orderPage || 0;
+    this._data.hasPreviousOrders = !!this._data.hasPreviousOrders;
+    this._data.hasNextOrders = !!this._data.hasNextOrders;
+    // M6: derive the GM-only approved-valuations list fresh from the selected shop
+    // so a re-render never carries a stale set, and default the valuation item list
+    // to an array so an unset value can never crash the render.
+    this._data.approvedValuations = this._buildApprovedValuations();
+    if (!Array.isArray(this._data.valuationItems)) this._data.valuationItems = [];
     this._data.isActiveGM = this._isActiveGM();
     if (!Array.isArray(this._data.drawTables)) this._data.drawTables = [];
     return this._data;
@@ -545,6 +642,48 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     return d.toISOString().slice(0, 16).replace('T', ' ');
   }
 
+  // ---- M5 commerce editor context derivation ----------------------------------
+
+  /**
+   * Build the service editor rows from the selected shop's commerce.services. Each
+   * row is a plain copy of the persisted service exposing only the fields the
+   * template reads - never a raw record with internal fields.
+   */
+  _buildServiceRows() {
+    const services = Array.isArray(this._data.selectedShop?.commerce?.services)
+      ? this._data.selectedShop.commerce.services
+      : [];
+    return services.map((s) => ({
+      id: s.id,
+      name: s.name,
+      description: s.description,
+      price: s.price,
+      visible: s.visible,
+      enabled: s.enabled,
+    }));
+  }
+
+  /**
+   * Build the special editor rows from the selected shop's commerce.specials. Each
+   * row projects the bounded fields plus a comma-joined `actorUuidsText` string
+   * (the template binds the actor-UUID input to `special.actorUuidsText`), so the
+   * GM sees a human-editable list rather than a raw array.
+   */
+  _buildSpecialRows() {
+    const specials = Array.isArray(this._data.selectedShop?.commerce?.specials)
+      ? this._data.selectedShop.commerce.specials
+      : [];
+    return specials.map((s) => ({
+      id: s.id,
+      title: s.title,
+      description: s.description,
+      price: s.price,
+      visible: s.visible,
+      entryId: s.entryId,
+      actorUuidsText: Array.isArray(s.actorUuids) ? s.actorUuids.join(', ') : '',
+    }));
+  }
+
   async _onRender(event) {
     if (!this._loaded) {
       await this._refreshData();
@@ -598,13 +737,20 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       selectedShopId = shopsView[0]?.id || null;
     }
     const selectedShop = shopsView.find((s) => s.id === selectedShopId) || null;
+    // Project `accessActorUuidsText` onto the selected shop's inventory entries so
+    // the GM editable access-UUID input binds to a comma-joined string, never a raw
+    // array. Only the selected shop's table needs this projection; the rail list
+    // only reads name/count.
+    const selectedShopView = selectedShop
+      ? { ...selectedShop, inventory: this._projectInventoryAccess(selectedShop.inventory) }
+      : null;
     this._data = {
       ...this._data,
       locations,
       shops: shopsView,
       selectedLocationId,
       selectedShopId,
-      selectedShop,
+      selectedShop: selectedShopView,
       currencyLabel: this._currencyLabel(),
       stockModes: ['finite', 'unlimited', 'non-restocking'],
       previewShop: null,
@@ -631,6 +777,75 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     } else {
       this._data.selectedReputation = null;
       this._data.reputationHistory = [];
+    }
+    // M6: refresh the GM-only item-valuation context for the same selected actor.
+    // The valuation panel reuses the reputation Character selector, so it must
+    // stay in sync with the actor selection whenever the data is refreshed.
+    await this._loadValuationContext(selectedReputationActorId);
+    // M5: refresh the GM-only advanced order list for the selected shop. Start at
+    // the first page and recompute the paging flags. Best-effort and active-GM
+    // gated (a non-active GM yields an empty list); a read failure leaves the list
+    // empty rather than blocking the manager.
+    this._data.orderPage = 0;
+    await this._refreshOrdersOnly();
+  }
+
+  /**
+   * Project a comma-joined `accessActorUuidsText` onto each inventory entry (from
+   * the entry's access.actorUuids array) so the GM-facing access-UUID input binds
+   * to a human-editable string. Other fields are carried through untouched.
+   */
+  _projectInventoryAccess(inventory) {
+    if (!Array.isArray(inventory)) return [];
+    return inventory.map((entry) => {
+      const actorUuids = Array.isArray(entry.access?.actorUuids)
+        ? entry.access.actorUuids
+        : [];
+      return {
+        ...entry,
+        accessActorUuidsText: actorUuids.join(', '),
+      };
+    });
+  }
+
+  /**
+   * Refresh ONLY the advanced order list for the selected shop, without reloading
+   * the shop. A GM order action (fulfill/cancel/resolve) must never reset the GM's
+   * unsaved appearance draft or in-progress inventory row edits, so this narrow
+   * refresh leaves `selectedShop`/`draftShop`/`previewShop` untouched.
+   *
+   * It pages through `status: 'booked'` records (the only state a GM can act on)
+   * at the 100-record page size, tracking the current `orderPage` so a GM can step
+   * back and forward through a large backlog, and exposes `hasPreviousOrders`/
+   * `hasNextOrders` to gate the template's next/previous controls. If resolving an
+   * order empties the current page the manager steps back to the prior non-empty
+   * page rather than stranding the GM on an empty page with no controls.
+   */
+  async _refreshOrdersOnly() {
+    const shopId = this._data.selectedShopId;
+    const PAGE_SIZE = 100;
+    const page = Math.max(0, this._data.orderPage || 0);
+    let orders = [];
+    let hasNext = false;
+    if (shopId) {
+      try {
+        orders = await this._listAdvancedOrders({
+          shopId,
+          status: 'booked',
+          limit: PAGE_SIZE,
+          offset: page * PAGE_SIZE,
+        });
+        hasNext = orders.length === PAGE_SIZE;
+      } catch (err) {
+        orders = [];
+      }
+    }
+    this._data.advancedOrders = Array.isArray(orders) ? orders : [];
+    this._data.hasPreviousOrders = page > 0;
+    this._data.hasNextOrders = hasNext;
+    if (this._data.advancedOrders.length === 0 && page > 0) {
+      this._data.orderPage = page - 1;
+      return this._refreshOrdersOnly();
     }
   }
 
@@ -821,6 +1036,30 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       }
       if (identityChanged) restock.lastCycle = -1;
       if (hasRestockControls) nextEntry.restock = restock;
+      // M5 per-entry access gate (public/backroom + actor UUIDs + min reputation).
+      // Captured ONLY when the row actually carries the controls; otherwise the
+      // persisted access (already spread into `nextEntry` from `existing`) is
+      // preserved, so an inventory row without backroom controls can never reset a
+      // saved gate. The actor UUIDs are comma-split and trimmed, and the persisted
+      // `minReputation` is kept when the row omits the field.
+      let hasAccessControls = false;
+      let entryAccess;
+      if (this._hasField(tr, 'accessMode')) {
+        hasAccessControls = true;
+        const existingAccess = existing.access || {};
+        const rawUuids = this._readFieldIn(tr, 'accessActorUuids') || '';
+        const actorUuids = rawUuids
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s !== '');
+        const minReputation = this._readNumber(tr, 'accessMinReputation');
+        entryAccess = {
+          mode: this._readFieldIn(tr, 'accessMode') || 'public',
+          actorUuids,
+          minReputation: minReputation != null ? minReputation : existingAccess.minReputation,
+        };
+      }
+      if (hasAccessControls) nextEntry.access = entryAccess;
       let normalized;
       try {
         normalized = normalizeInventoryEntry(nextEntry);
@@ -1294,6 +1533,619 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     const shopId = this._data.selectedShopId;
     if (!shopId) return;
     await this._openShop(shopId);
+  }
+
+  // ---- M5 commerce settings + service/special editor ---------------------------
+
+  /**
+   * Save the commerce settings read from the `.commerce-panel` top fields only
+   * (funds, buy/buyback rates, preorders and theft toggles). The `unlimitedFunds`
+   * checkbox maps `funds` to null; otherwise a strict safe integer is required
+   * (empty falls back to the existing funds, then 0). The existing services and
+   * specials (edited via their own add/save/remove actions) are merged from the
+   * freshly re-read shop under the shared per-shop lock, then the whole
+   * `commerce` object is validated by `normalizeCommerce` - an invalid rate
+   * (e.g. buyback < buy) fails closed with a notice and no write.
+   */
+  async _onSaveCommerce(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    const panel = this.element?.querySelector?.('.commerce-panel');
+    if (!panel || typeof panel.querySelector !== 'function') return;
+    const merchantFunds = this._readNumber(panel, 'merchantFunds');
+    const unlimitedFunds = this._readChecked(panel, 'unlimitedFunds');
+    const buyRateBps = this._readNumber(panel, 'buyRateBps');
+    const buybackRateBps = this._readNumber(panel, 'buybackRateBps');
+    const preordersEnabled = this._readChecked(panel, 'preordersEnabled');
+    const depositBps = this._readNumber(panel, 'depositBps');
+    const maxPerActor = this._readNumber(panel, 'maxPerActor');
+    const theftEnabled = this._readChecked(panel, 'theftEnabled');
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when saving commerce.';
+        return;
+      }
+      const existing = shop.commerce || {};
+      let funds;
+      if (unlimitedFunds) {
+        funds = null;
+      } else if (merchantFunds != null) {
+        funds = merchantFunds;
+      } else if (existing.funds != null) {
+        funds = existing.funds;
+      } else {
+        funds = 0;
+      }
+      const rawCommerce = {
+        ...existing,
+        funds,
+        buyRateBps,
+        buybackRateBps,
+        preorders: { enabled: preordersEnabled, depositBps, maxPerActor },
+        theft: { enabled: theftEnabled },
+      };
+      let nextCommerce;
+      try {
+        nextCommerce = normalizeCommerce(rawCommerce);
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Invalid commerce settings.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { commerce: nextCommerce });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Add a new service with safe defaults. The row is persisted immediately under
+   * the shared per-shop lock (capped at MAX_COMMERCE_SERVICES) and validated via
+   * `normalizeCommerce`, so a just-added blank row never fails normalization.
+   */
+  async _onAddService(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when adding a service.';
+        return;
+      }
+      const services = Array.isArray(shop.commerce?.services) ? shop.commerce.services : [];
+      if (services.length >= MAX_COMMERCE_SERVICES) {
+        message = 'A shop can have at most twenty services.';
+        return;
+      }
+      const defaultService = {
+        id: makeId(),
+        name: 'New service',
+        description: '',
+        price: 0,
+        visible: true,
+        enabled: true,
+      };
+      let nextCommerce;
+      try {
+        nextCommerce = normalizeCommerce({
+          ...(shop.commerce || {}),
+          services: [...services, defaultService],
+        });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Could not add the service.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { commerce: nextCommerce });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Save every service editor row. Each `[data-service-id]` fieldset is read for
+   * name/description/price/visibility/enabled, validated via `normalizeCommerce`,
+   * then patched as `commerce.services` only - the rest of commerce (funds, rates,
+   * specials, preorders, theft) is preserved. Edits are merged by id into the
+   * freshly re-read persisted list, so a service added concurrently (or otherwise
+   * absent from the DOM) is never dropped. A DOM row whose id is not in the
+   * persisted list fails closed (a notice, no write). On a validation error the
+   * notice is shown and the unsaved form is left intact (no data refresh, no write).
+   */
+  async _onSaveServices(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    const root = this.element;
+    const rows =
+      root && typeof root.querySelectorAll === 'function'
+        ? Array.from(root.querySelectorAll('[data-service-id]'))
+        : [];
+    const rawServices = rows.map((row) => ({
+      id: row.dataset.serviceId,
+      name: row.querySelector('[name="serviceName"]')?.value ?? '',
+      description: row.querySelector('[name="serviceDescription"]')?.value ?? '',
+      price: this._readNumber(row, 'servicePrice'),
+      visible: !!row.querySelector('[name="serviceVisible"]')?.checked,
+      enabled: !!row.querySelector('[name="serviceEnabled"]')?.checked,
+    }));
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when saving services.';
+        return;
+      }
+      const persisted = Array.isArray(shop.commerce?.services) ? shop.commerce.services : [];
+      const persistedIds = new Set(persisted.map((s) => s.id));
+      const unknown = rawServices.find((s) => !persistedIds.has(s.id));
+      if (unknown) {
+        failed = true;
+        this._data.notice =
+          'One of the service rows no longer matches a saved service, so nothing was saved.';
+        this.render({ force: true });
+        return;
+      }
+      const editsById = new Map(rawServices.map((s) => [s.id, s]));
+      // Merge edits by id into the freshly re-read persisted list, so a service
+      // added concurrently (or otherwise absent from the DOM) is never dropped.
+      const merged = persisted.map((s) =>
+        editsById.has(s.id) ? { ...s, ...editsById.get(s.id) } : { ...s }
+      );
+      let nextCommerce;
+      try {
+        nextCommerce = normalizeCommerce({ ...(shop.commerce || {}), services: merged });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Invalid service data.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { commerce: nextCommerce });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Remove a single service by id, under the shared per-shop lock. Only the
+   * matching service is dropped; all other commerce fields are carried through.
+   */
+  async _onRemoveService(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const serviceId = target?.dataset?.serviceId || data?.dataset?.serviceId;
+    if (!serviceId) return;
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when removing a service.';
+        return;
+      }
+      const services = Array.isArray(shop.commerce?.services) ? shop.commerce.services : [];
+      const nextCommerce = normalizeCommerce({
+        ...(shop.commerce || {}),
+        services: services.filter((s) => s.id !== serviceId),
+      });
+      await this._store.updateShop(shopId, { commerce: nextCommerce });
+    });
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Add a new special with safe defaults (`New special`, price 0, no inventory
+   * link, no actor gate, hidden-visible). Persisted immediately under the shared
+   * per-shop lock and capped at MAX_COMMERCE_SPECIALS; an empty `entryId` passes
+   * normalization, so a just-added special never links to a bogus item.
+   */
+  async _onAddSpecial(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when adding a special.';
+        return;
+      }
+      const specials = Array.isArray(shop.commerce?.specials) ? shop.commerce.specials : [];
+      if (specials.length >= MAX_COMMERCE_SPECIALS) {
+        message = 'A shop can have at most twenty specials.';
+        return;
+      }
+      const defaultSpecial = {
+        id: makeId(),
+        title: 'New special',
+        description: '',
+        price: 0,
+        visible: true,
+        entryId: '',
+        actorUuids: [],
+      };
+      let nextCommerce;
+      try {
+        nextCommerce = normalizeCommerce({
+          ...(shop.commerce || {}),
+          specials: [...specials, defaultSpecial],
+        });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Could not add the special.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { commerce: nextCommerce });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Save every special editor row. Each `[data-special-id]` fieldset is read for
+   * title/description/price/inventory link/actor UUIDs/visibility. A non-empty
+   * `entryId` must exist in the CURRENT inventory (fail closed otherwise); actor
+   * UUIDs are comma-split and trimmed then validated by `normalizeCommerce`. Edits
+   * are merged by id into the freshly re-read persisted list - a special added
+   * concurrently (or otherwise absent from the DOM) is never dropped, and a DOM row
+   * whose id is not in the persisted list fails closed. On any validation error the
+   * notice is shown and the unsaved form is left intact (no write, no refresh).
+   */
+  async _onSaveSpecials(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    const root = this.element;
+    const rows =
+      root && typeof root.querySelectorAll === 'function'
+        ? Array.from(root.querySelectorAll('[data-special-id]'))
+        : [];
+    const rawSpecials = rows.map((row) => {
+      const actorUuids = (row.querySelector('[name="specialActorUuids"]')?.value ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s !== '');
+      return {
+        id: row.dataset.specialId,
+        title: row.querySelector('[name="specialTitle"]')?.value ?? '',
+        description: row.querySelector('[name="specialDescription"]')?.value ?? '',
+        price: this._readNumber(row, 'specialPrice'),
+        visible: !!row.querySelector('[name="specialVisible"]')?.checked,
+        entryId: row.querySelector('[name="specialEntryId"]')?.value ?? '',
+        actorUuids,
+      };
+    });
+    let failed = false;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when saving specials.';
+        return;
+      }
+      const inventoryIds = new Set((shop.inventory || []).map((e) => e.id));
+      const missingEntry = rawSpecials.find(
+        (sp) => sp.entryId !== '' && !inventoryIds.has(sp.entryId)
+      );
+      if (missingEntry) {
+        failed = true;
+        this._data.notice =
+          'One of the specials references an inventory item that is no longer available, so nothing was saved.';
+        this.render({ force: true });
+        return;
+      }
+      const persisted = Array.isArray(shop.commerce?.specials) ? shop.commerce.specials : [];
+      const persistedIds = new Set(persisted.map((s) => s.id));
+      const unknownRow = rawSpecials.find((s) => !persistedIds.has(s.id));
+      if (unknownRow) {
+        failed = true;
+        this._data.notice =
+          'One of the special rows no longer matches a saved special, so nothing was saved.';
+        this.render({ force: true });
+        return;
+      }
+      const editsById = new Map(rawSpecials.map((s) => [s.id, s]));
+      const merged = persisted.map((s) =>
+        editsById.has(s.id) ? { ...s, ...editsById.get(s.id) } : { ...s }
+      );
+      let nextCommerce;
+      try {
+        nextCommerce = normalizeCommerce({ ...(shop.commerce || {}), specials: merged });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Invalid special data.';
+        this.render({ force: true });
+        return;
+      }
+      await this._store.updateShop(shopId, { commerce: nextCommerce });
+    });
+    if (failed) return;
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Remove a single special by id, under the shared per-shop lock. Only the
+   * matching special is dropped; all other commerce fields are carried through.
+   */
+  async _onRemoveSpecial(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const specialId = target?.dataset?.specialId || data?.dataset?.specialId;
+    if (!specialId) return;
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when removing a special.';
+        return;
+      }
+      const specials = Array.isArray(shop.commerce?.specials) ? shop.commerce.specials : [];
+      const nextCommerce = normalizeCommerce({
+        ...(shop.commerce || {}),
+        specials: specials.filter((s) => s.id !== specialId),
+      });
+      await this._store.updateShop(shopId, { commerce: nextCommerce });
+    });
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  // ---- M5 advanced-order manual adjudication -----------------------------------
+
+  /**
+   * Report the outcome of a GM advanced-order action truthfully. A replay/fulfilled/
+   * committed/cancelled status is a success; a needsRecovery/pending status surfaces
+   * a recovery warning; an error status surfaces the error. The notice is set on
+   * `_data` by the caller, which always follows with an orders-only refresh.
+   */
+  _noticeForAdvancedAction(action, result) {
+    const status = result?.status;
+    if (!result) {
+      this._data.notice = 'The action returned no result.';
+    } else if (status === 'replay') {
+      this._data.notice = 'Already processed.';
+    } else if (status === 'fulfilled') {
+      this._data.notice = 'Order marked fulfilled.';
+    } else if (status === 'cancelled') {
+      this._data.notice = 'Order cancelled.';
+    } else if (status === 'committed') {
+      this._data.notice = 'Order resolved.';
+    } else if (status === 'needsRecovery' || status === 'pending') {
+      this._data.notice = `The action needs recovery${result?.error ? ` (${result.error})` : ''}.`;
+    } else if (status === 'error') {
+      this._data.notice = `Action failed: ${result?.error || 'unknown'}.`;
+    } else {
+      this._data.notice = `Action result: ${status || 'unknown'}.`;
+    }
+  }
+
+  /**
+   * Mark a booked service order fulfilled (manual adjudication). Guarded on the
+   * active GM, passes a fresh idempotency `requestId` so a double-click never runs
+   * the fulfillment twice, then refreshes orders ONLY (never the shop, so unsaved
+   * appearance/inventory edits survive).
+   */
+  async _onFulfillService(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const orderId = target?.dataset?.orderId || data?.dataset?.orderId;
+    if (!orderId) return;
+    let result;
+    try {
+      result = await this._advancedCall('fulfillService', { orderId, requestId: makeId() });
+    } catch (err) {
+      this._data.notice = `Fulfill failed: ${(err && err.message) || err}`;
+      await this._refreshOrdersOnly();
+      this.render({ force: true });
+      return;
+    }
+    this._noticeForAdvancedAction('fulfill', result);
+    await this._refreshOrdersOnly();
+    this.render({ force: true });
+  }
+
+  /**
+   * Fulfill a booked preorder (charge the remaining balance, deliver, decrement).
+   * Guarded on the active GM, idempotent via a fresh `requestId`, and refreshes
+   * orders ONLY so in-progress manager edits are not reset.
+   */
+  async _onFulfillPreorder(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const orderId = target?.dataset?.orderId || data?.dataset?.orderId;
+    if (!orderId) return;
+    let result;
+    try {
+      result = await this._advancedCall('fulfillPreorder', { orderId, requestId: makeId() });
+    } catch (err) {
+      this._data.notice = `Preorder fulfill failed: ${(err && err.message) || err}`;
+      await this._refreshOrdersOnly();
+      this.render({ force: true });
+      return;
+    }
+    this._noticeForAdvancedAction('fulfill-preorder', result);
+    await this._refreshOrdersOnly();
+    this.render({ force: true });
+  }
+
+  /**
+   * Cancel a booked preorder (refund the deposit). Guarded on the active GM,
+   * idempotent via a fresh `requestId`, and refreshes orders ONLY.
+   */
+  async _onCancelPreorder(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const orderId = target?.dataset?.orderId || data?.dataset?.orderId;
+    if (!orderId) return;
+    let result;
+    try {
+      result = await this._advancedCall('cancelPreorder', { orderId, requestId: makeId() });
+    } catch (err) {
+      this._data.notice = `Preorder cancel failed: ${(err && err.message) || err}`;
+      await this._refreshOrdersOnly();
+      this.render({ force: true });
+      return;
+    }
+    this._noticeForAdvancedAction('cancel-preorder', result);
+    await this._refreshOrdersOnly();
+    this.render({ force: true });
+  }
+
+  /**
+   * Grant a theft (the active GM decides the player kept the item). `resolveTheft`
+   * REQUIRES a typed boolean `success`, so this passes `true`. Refreshes orders only.
+   */
+  async _onResolveTheftSuccess(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const orderId = target?.dataset?.orderId || data?.dataset?.orderId;
+    if (!orderId) return;
+    let result;
+    try {
+      result = await this._advancedCall('resolveTheft', {
+        orderId,
+        success: true,
+        requestId: makeId(),
+      });
+    } catch (err) {
+      this._data.notice = `Theft resolve failed: ${(err && err.message) || err}`;
+      await this._refreshOrdersOnly();
+      this.render({ force: true });
+      return;
+    }
+    this._noticeForAdvancedAction('resolve-theft', result);
+    await this._refreshOrdersOnly();
+    this.render({ force: true });
+  }
+
+  /**
+   * Refuse a theft (the active GM decides the player failed to keep the item).
+   * `resolveTheft` requires a typed boolean `success`, so this passes `false`.
+   * Refreshes orders only.
+   */
+  async _onResolveTheftFailure(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const orderId = target?.dataset?.orderId || data?.dataset?.orderId;
+    if (!orderId) return;
+    let result;
+    try {
+      result = await this._advancedCall('resolveTheft', {
+        orderId,
+        success: false,
+        requestId: makeId(),
+      });
+    } catch (err) {
+      this._data.notice = `Theft resolve failed: ${(err && err.message) || err}`;
+      await this._refreshOrdersOnly();
+      this.render({ force: true });
+      return;
+    }
+    this._noticeForAdvancedAction('resolve-theft', result);
+    await this._refreshOrdersOnly();
+    this.render({ force: true });
+  }
+
+  /**
+   * `next-orders`. Advance to the next page of the advanced-order list (100-record
+   * pages) and re-render the manager, leaving the shop itself untouched.
+   */
+  async _onNextOrders() {
+    const page = Math.max(0, this._data.orderPage || 0);
+    this._data.orderPage = page + 1;
+    await this._refreshOrdersOnly();
+    this.render({ force: true });
+  }
+
+  /**
+   * `prev-orders`. Step back to the previous page of the advanced-order list,
+   * never below the first page, and re-render without touching the shop.
+   */
+  async _onPrevOrders() {
+    const page = Math.max(0, this._data.orderPage || 0);
+    this._data.orderPage = Math.max(0, page - 1);
+    await this._refreshOrdersOnly();
+    this.render({ force: true });
   }
 
   // ---- appearance preview / media browse --------------------------------------
@@ -1854,6 +2706,7 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     const id = target?.value ?? target?.dataset?.reputationActorId;
     this._data.selectedReputationActorId = id || null;
     await this._loadReputation(id || null);
+    await this._loadValuationContext(id || null);
     this.render({ force: true });
   }
 
@@ -1953,6 +2806,129 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       this._data.notice = `Reputation adjustment failed (${result?.error || 'unknown'}).`;
     }
     this.render({ force: true });
+  }
+
+  /**
+   * Load the GM-only item-valuation context for `actorId`. Reads the selected
+   * actor's embedded Items (each projected to `{id, name}`) so the GM can pick
+   * which Item to value, and records the actor's display name for the panel. A
+   * missing actor or an absent `.items` yields an empty item list - never a
+   * throw. Called alongside `_loadReputation` (they share the same selector).
+   */
+  async _loadValuationContext(actorId) {
+    if (!actorId) {
+      this._data.valuationActorId = null;
+      this._data.valuationActorName = '';
+      this._data.valuationItems = [];
+      return;
+    }
+    const actor = await this._getActor(actorId);
+    this._data.valuationActorId = actorId || null;
+    if (!actor) {
+      this._data.valuationActorName = '';
+      this._data.valuationItems = [];
+      return;
+    }
+    const items = Array.isArray(actor.items)
+      ? actor.items
+      : actor.items && typeof actor.items.values === 'function'
+        ? Array.from(actor.items.values())
+        : actor.items && typeof actor.items[Symbol.iterator] === 'function'
+          ? Array.from(actor.items)
+          : [];
+    this._data.valuationActorName = actor.name ? String(actor.name) : '';
+    this._data.valuationItems = items.map((item) => ({
+      id: item.id ?? item._id,
+      name: item.name ?? '',
+    }));
+  }
+
+  /**
+   * Project the private `selectedShop.commerce.valuations` list to the bounded
+   * shape the template reads (`{id, actorUuid, itemId, amount}`). The raw
+   * valuation entries carry a tamper-detecting `fingerprint` that is never
+   * exposed to the GM UI; only these scalar fields are. Derived fresh each render
+   * so the list always reflects the current selected shop.
+   */
+  _buildApprovedValuations() {
+    const valuations = Array.isArray(this._data.selectedShop?.commerce?.valuations)
+      ? this._data.selectedShop.commerce.valuations
+      : [];
+    return valuations.map((v) => ({
+      id: v.id,
+      actorUuid: v.actorUuid,
+      itemId: v.itemId,
+      amount: v.amount,
+    }));
+  }
+
+  /**
+   * `approve-valuation`. Guarded on the active GM, validates a selected
+   * character, a chosen Item and a positive whole-number amount, then invokes the
+   * GM-only `approveValuation` mutation (via the injected `deps.approveValuation`
+   * or the `api.advanced.approveValuation` wrapper, which re-checks the active GM
+   * before any store read). On success the shop is refreshed so the newly approved
+   * valuation appears in the private list and, on the next catalog request, in the
+   * player-facing `approvedItems` allowlist.
+   */
+  async _onApproveValuation(event, target, data) {
+    if (!this._isActiveGM()) {
+      this._data.notice = ACTIVE_GM_MESSAGE;
+      this.render({ force: true });
+      return;
+    }
+    const shopId = this._data.selectedShopId;
+    const actorId = this._data.selectedReputationActorId;
+    if (!shopId) return;
+    if (!actorId) {
+      this._data.notice = 'Choose a character to value an item for.';
+      this.render({ force: true });
+      return;
+    }
+    const itemId = (this._readField('valuationItemId') || '').trim();
+    if (!itemId) {
+      this._data.notice = 'Choose an item to value.';
+      this.render({ force: true });
+      return;
+    }
+    const amount = this._readNumber(this.element, 'valuationAmount');
+    if (amount == null || !Number.isSafeInteger(amount) || amount < 1) {
+      this._data.notice = 'The valuation must be a positive whole number.';
+      this.render({ force: true });
+      return;
+    }
+    let result;
+    try {
+      result = await this._advancedCall('approveValuation', {
+        shopId,
+        actorId,
+        itemId,
+        amount,
+      });
+    } catch (err) {
+      this._data.notice = `Valuation failed: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    this._noticeForValuation(result);
+    await this._refreshData();
+    this.render({ force: true });
+  }
+
+  _noticeForValuation(result) {
+    const status = result?.status;
+    if (status === 'approved') {
+      const name = typeof result.itemName === 'string' && result.itemName !== ''
+        ? ` for ${result.itemName}`
+        : '';
+      this._data.notice = `Valuation approved${name}.`;
+    } else if (status === 'replay') {
+      this._data.notice = 'Already approved.';
+    } else if (status === 'error') {
+      this._data.notice = `Valuation failed: ${result?.error || 'unknown'}.`;
+    } else {
+      this._data.notice = `Valuation result: ${status || 'unknown'}.`;
+    }
   }
 
   // ---- drag / drop wiring -----------------------------------------------------

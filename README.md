@@ -6,16 +6,23 @@ by the active GM through an idempotent, compensating ledger; and requests flow
 over ChatMessage (no raw socket).
 
 This is a **prerelease developer preview** covering **Milestone 1 (M1)** through
-**Milestone 4 (M4)**, with **Milestone 3 (M3, social data & reputation/pricing)**
-still **in progress**: the functional core plus the M1 end-to-end UI wiring
-(market manager, player storefront, canvas shop markers), the M2 shop
-theming/appearance and storefront interactions, the in-progress M3
-social/NPC/reputation engine and wiring, and the M4 shop automation - scheduled
-business hours, finite periodic restock, travel rotation among locations,
-exact/low/hidden stock visibility, time-window display-only market events, GM
-automation diagnostics, and GM-only RollTable inventory generation. The runtime
-has **not** been executed against a live Foundry VTT 14 install yet - it is wired
-and unit-tested in Node only, and M4 is likewise Node-tested only.
+**Milestone 5 (M5)**, all **implemented locally and unit-tested in Node but not
+yet verified against a live Foundry VTT 14 install**. It delivers the functional
+core plus the M1 end-to-end UI wiring (market manager, player storefront, canvas
+shop markers), the M2 shop theming/appearance and storefront interactions, the M3
+social/NPC/reputation engine and wiring (user-reported as tested successfully,
+though its deferred items remain), the M4 shop automation (scheduled business
+hours, finite periodic restock, travel rotation among locations, exact/low/hidden
+stock visibility, time-window display-only market events, GM automation
+diagnostics, and GM-only RollTable inventory generation), and the M5 advanced
+commerce configuration and GM-authoritative trade services - whole-item
+sell/buyback, manual service booking, single-payer multi-line carts with an
+optional whole embedded barter Item, finite merchant funds, backroom
+actor/reputation access, deposit-backed out-of-stock pre-orders, GM-adjudicated
+theft, and actor special offers. The runtime has **not** been executed against a
+live Foundry VTT 14 install yet - it is wired and unit-tested in Node only, and
+M5 is likewise Node-tested only (see "Risks" for what is still deferred and what
+a real v14 runtime must confirm).
 
 ## Requirements
 
@@ -40,21 +47,22 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.3`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.4`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.3/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.4/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
 
-> **The `0.1.3` `download` URL is live only once the `0.1.3` release has been
+> **The `0.1.4` `download` URL is live only once the `0.1.4` release has been
 > published** - the release action must upload `module.zip` and `module.json` to
-> the GitHub release for tag `0.1.3`. Until that release is published, install
-> the module by pointing Foundry at this repository directory as a module source
-> (the manifest and `src/core/main.js` are unchanged), or download the zip from
-> the published release once it is available.
+> the GitHub release for tag `0.1.4`. The `0.1.3` release is published and
+> installable; until the `0.1.4` release is published, install the module by
+> pointing Foundry at this repository directory as a module source (the manifest
+> and `src/core/main.js` are unchanged), or download the zip from the published
+> release once it is available.
 
 ### Enable in a world
 
@@ -114,16 +122,17 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 
 ### Risks
 
-- **Live Foundry VTT 14 runtime is not yet tested.** M1/M2/M3/M4 are wired and
+- **Live Foundry VTT 14 runtime is not yet tested.** M1/M2/M3/M4/M5 are wired and
   unit-tested in Node only (the mocks install `game`/`Hooks`/`CONST`,
   `JournalEntry` and the actor document API), so the exact
   `ApplicationV2`/`HandlebarsApplicationMixin` UI, the `dropCanvasData` hook
   shapes, the v14 `FilePicker` constructor, the
-  `foundry.audio.AudioHelper.play` call, the `updateWorldTime` automation sweep
-  and the RollTable `drawMany` call should be re-checked against a real v14
-  install. Run `docs/smoke-test.md` before trusting a live economy. The M2 CSS
-  themes and interactions are Node-tested only, and the themes ship no bundled
-  audio.
+  `foundry.audio.AudioHelper.play` call, the `updateWorldTime` automation sweep,
+  the RollTable `drawMany` call and the M5 advanced-order request/response flow
+  should be re-checked against a real v14 install. Run `docs/smoke-test.md`
+  before trusting a live economy. The M2 CSS themes and interactions are
+  Node-tested only, and the themes ship no bundled audio. **No live M5
+  verification has been done yet** - the M5 services and UI are Node-tested only.
 - **Concurrency across GMs is best-effort.** The per-shop lock serializes
   purchases within one client only; across multiple GM clients the ledger is the
   only cross-client guard and it is a read-then-create, not a server-side CAS.
@@ -131,7 +140,32 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 - **No live use yet.** The module has been exercised in tests only; the smoke
   checklist is the intended first real-runtime check.
 
-## What works (M1/M2/M3/M4)
+### Explicit limitations
+
+- **The "group cart" is one payer.** There are no shared participant
+  contributions and no split payments: only the request `actorId` is ever
+  debited, a group cart is a single payer accumulating a shared selection, and
+  no other contributor is charged.
+- **Services are fulfilled manually.** Booking a service debits the player once
+  and grants finite merchant funds the price, then records a `booked` order; it
+  never delivers/creates an `Item` and never auto-completes - the GM must call
+  `fulfill` to mark it `fulfilled` (an acknowledgement only).
+- **Theft is GM-adjudicated.** A theft claim records an `awaiting-gm` order with
+  no effects; there is no automatic system-skill roll, no automatic reputation
+  penalty, and no item is granted until the GM's `resolve` decides success.
+- **No map marker travel relocation.** M4 travel rotation changes only the shop's
+  logical `locationId`; the Scene Note / canvas marker stays where the GM placed
+  it.
+- **Generic path-delivery item selling/barter is unsupported.** An item sale and a
+  cart barter tender both delete an embedded `Item`, so a GenericAdapter
+  configured for non-embedded path delivery is refused
+  (`delivery-mode-unsupported`).
+- **No live M5 verification.** See the first Risks bullet.
+- **The local shop lock is not cross-GM atomic.** Cross-GM atomicity is
+  best-effort; verifying and hardening it against two live GM clients is deferred
+  to M6.
+
+## What works (M1/M2/M3/M4/M5)
 
 - **UI (wired, not system-tested)**:
   - **Market Manager** (`MarketManager`, GM-only): create/select locations and
@@ -282,6 +316,54 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
     it is finite. An invalid clock (NaN/Infinity/non-safe) fails closed as
     `invalid-world-time` rather than collapsing to week zero, and no schedule
     executes.
+- **M5 advanced commerce** (GM-only, opt-in; `api.sellItem` / `api.advanced` plus
+  the manager commerce editor and the storefront advanced trade controls). The
+  validated `commerce` config (finite/`null` merchant `funds`, `buyRateBps`,
+  `buybackRateBps`, `services`, `specials`, `preorders`, `theft`) and the
+  per-entry `access` gate are normalized by the schema; the advanced order
+  record and the pure access/quotation policies live in `src/advanced/*`:
+  - **Whole-item sell/buyback** (`src/advanced/selling.js`): a GM-authoritative,
+    idempotent `sell` takes ONE whole embedded `Item` the player owns back to a
+    shop, prices the payout at `quoteSell`, appends a `non-restocking` buyback
+    listing and decrements finite merchant funds. A stacked (quantity != 1) item
+    is refused.
+  - **Manual service booking** (`src/advanced/services.js`): `book` debits the
+    player once and grants finite merchant funds the price, persisting a `booked`
+    order; the service has NO automatic effect - a GM later calls `fulfill`,
+    which only records the acknowledgement (no `Item` is created/delivered).
+  - **Single-payer multi-line cart checkout** (`src/advanced/cart.js`): a
+    `checkout` executes a safe multi-item, single-payer cart - only the request
+    `actorId` is debited (only the cash remainder is ever debited), each line is
+    re-read from the store, merchant specials are honored per-line, and finite
+    merchant funds gain only the cash remainder. An optional `barterItemId`
+    tenders ONE whole embedded `Item` as credit capped at the cart gross total
+    (a tender worth more than the cart never pays cash out).
+  - **Merchant funds** (`commerce.funds`): `null` is unlimited; a finite integer
+    is the shop's available buying currency, gained by direct-Buy revenue,
+    services, preorder deposits, cart cash remainders and sell payouts, and
+    decremented by buybacks and refunds. Overflow is guarded (`funds-overflow`).
+  - **Backroom actor/reputation access** (`access` + `src/advanced/policy.js`):
+    a per-entry `mode: 'public' | 'backroom'` gate, an optional actor allowlist
+    and a `minReputation` are enforced on the catalog, purchase and quote
+    surfaces (a `backroom` entry is omitted from the base catalog and only
+    appears to an allowlisted or reputation-qualified actor).
+  - **Preorders with paid deposit** (`src/advanced/preorders.js`): `place`
+    charges a deposit (no stock is reserved), `fulfill` charges the remaining
+    balance and delivers, `cancel` refunds the deposit. All three are
+    GM-authoritative and idempotent.
+  - **GM-adjudicated theft** (`src/advanced/theft.js`): `attempt` records an
+    `awaiting-gm` order with no effects; the GM's `resolve` (a typed `success`
+    boolean) grants or refuses one unit. There is no automatic system-skill roll
+    and no automatic reputation penalty.
+  - **Actor special offers** (`specials`): GM-configured price offers on an
+    existing inventory `entryId`, each with an optional `actorUuids` allowlist,
+    are projected into the catalog and can be quoted/charged per-line; an offer
+    is exposed only to an eligible actor and never leaks the raw config.
+- **M5 request routing** (`src/core/requests.js`, `src/core/main.js`): the
+  request channel recognizes `sell`, `cart`, `service`, `preorder` and `theft`
+  request types and projects each through a bounded public sanitizer - never the
+  raw advanced-order record, the idempotency carrybacks, or the private
+  `details`/`compensation`/`outcome`.
 
 ## Extending themes
 

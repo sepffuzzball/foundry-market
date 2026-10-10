@@ -550,13 +550,357 @@ client is the one that exercises the storefront.
 - The GM-only automation config (raw days/hours, travel, restock control,
   private event list) is never exposed to the player.
 
-## 18. Summary / verdict
+## 18. M5 - Storefront cart, services, preorders, theft and selling
 
-Record a pass/fail + notes row for each section. Take **all** sections (1-17) as
-the minimum signal for M1/M2/M3/M4 - do not claim completion on the strength of
+> **Status: Node-tested only.** The M5 storefront controls (cart lines, barter
+> checkout, service booking, preorders, theft claims and whole-item selling) are
+> verified by the automated `npm test` suite in Node. This section is the
+> intended real-runtime check for the ApplicationV2 action dispatch of the new
+> `data-action` controls, the owned-Actor embedded-Item reads for the sell/barter
+> selects, and the GM-correlated advanced responses.
+
+### 18.1 GM enables the M5 commerce configuration
+
+1. As the **GM**, open the Market Manager, select a shop, and configure the
+   advanced commerce options: enable **preorders** (set a deposit basis-points
+   and per-actor max), enable **theft**, add at least one **service** and one
+   **special**, and set finite merchant **funds** if desired.
+2. Ensure at least one inventory entry is **out of stock** (finite/non-restocking
+   with quantity 0) so a preorder-eligible option appears, and another is **in
+   stock** so a theft-eligible option appears.
+
+**Expected**
+
+- The storefront now shows "Services & special offers", a "Sell an item" /
+  "Optional barter item" form (only when the selected Actor owns sellable
+  whole Items), and a cart panel after items are added.
+- Only entries the catalog flags `canPreorder` / `canAttemptTheft` appear in the
+  preorder / theft dropdowns; an ineligible entry never appears there.
+
+### 18.2 Player adds and removes cart lines, then checks out with barter
+
+1. As the **player**, open the storefront, select an owned Actor with funds, set a
+   quantity in the Qty field, and click **Add to cart** on an entry. Repeat with a
+   different entry and (if configured) an **Add special** on a special offer.
+2. Confirm the cart panel lists each line (name, quantity, per-line total) and a
+   cart total.
+3. Remove one line with **Remove**.
+4. Select a whole owned Item in the **Optional barter item** select, then click
+   **Checkout cart**.
+
+**Expected**
+
+- Adding a line never sends a request (no GM counter-request appears), lines
+  merge by entry+special, at most 20 distinct lines fit, and each line quantity is
+  1..100 (an out-of-range quantity surfaces a message and is not sent).
+- The cart panel total is a safe client-side pre-computation; the GM's checkout
+  is authoritative.
+- Removing a line removes only that line.
+- Checkout sends a `cart` request with the `lines` and (when chosen) a
+  `barterItemId`; the player is debited only the cash remainder and the bartered
+  whole Item is taken. On success the cart clears and the catalog refreshes; the
+  checkout response never carries a client price.
+
+### 18.3 Player books a service
+
+1. In the **Services & special offers** area, click **Request service** on a
+   configured service.
+2. Confirm the GM processes the `service` whisper.
+
+**Expected**
+
+- The player is debited the service price once, the service is reported as
+  **booked** (not "fulfilled"), and the catalog refreshes. A `booked` response is
+  never reported as fulfilled; fulfillment is a separate GM action.
+
+### 18.4 Player places a preorder and a theft claim
+
+1. From a preorder-eligible (out-of-stock) entry, click **Place preorder** (or
+   pick it in the preorder select) and confirm a deposit is charged.
+2. From a theft-eligible (in-stock) entry, click **Submit theft attempt** (or pick
+   it in the theft select).
+
+**Expected**
+
+- The preorder request carries `entryId` + `quantity` and never a client price; a
+  `booked` preorder response is reported as "Preorder placed", never fulfilled.
+- The theft request claims only (`type: 'theft'`), never a client `success`; the
+  response reports "claim submitted; awaiting the GM" and never pre-resolves the
+  outcome. No item is delivered, no stock decremented and no currency moves at
+  claim time.
+
+### 18.5 Player sells a whole owned Item
+
+1. In the **Sell an item** form, choose a whole owned Item and click **Sell item**.
+2. Confirm the GM buys it back.
+
+**Expected**
+
+- The request carries `type: 'sell'` + `itemId` (never a price); the shop pays the
+  quoted payout and the Item leaves the Actor. A stacked (quantity != 1) Item is
+  not offered in the select.
+- On success the catalog refreshes and the feedback reports the sold Item name and
+  payout. A Hated/refused or no-offer sale reports the documented bounded error.
+- **A GM approval is required first.** The runtime `main.js` now wires the
+  valuation service's `getApprovedValuation` into the sell path, so the sale is
+  priced by a GM-approved valuation, never the Item's own `price`. If no
+  still-valid approval is recorded for the Item, the sell refuses closed
+  `gm-approval-required` and the Item stays put; record one first via
+  `api.advanced.approveValuation` (a `0` amount is legitimate).
+
+### 18.6 Actor switch / stale responses
+
+1. Switch the actor select and confirm the cart clears, any pending request is
+   abandoned, and the catalog re-quotes for the new actor.
+2. (Harder to trigger manually) Confirm an advanced response quoted for a
+   different actor or a different shop is ignored - it must never mutate the
+   current cart/catalog.
+
+### 18.7 Player sells/barters only GM-approved items
+
+1. As the **GM**, approve a valuation for ONE whole owned Item on the player's
+   Actor (see section 19.4), and intentionally leave another whole owned Item on
+   that Actor without an approval.
+2. As the **player**, open the storefront, select that Actor, and inspect the
+   **Sell an item** and **Optional barter item** selects.
+
+**Expected**
+
+- Only the Item with a GM-approved valuation appears in the sell/barter selects;
+   the unapproved Item is never offered, and the request never carries a client
+   price (the GM-approved amount is applied server-side).
+- When the selected Actor owns whole Items but none has an approval, the form shows
+   the helpful message `Ask the GM to value an item before selling or bartering it.`
+   instead of an unexplained empty dropdown.
+- The message appears only when a character IS selected - with no character chosen
+   the base form is shown, never the "ask the GM" message.
+
+## 19. M5 - GM manager commerce editor and advanced-order adjudication
+
+> **Status: Node-tested only.** The M5 GM manager commerce controls (funds, buy/
+> buyback rates, preorders, theft, service/special editor) and the advanced-order
+> adjudication methods (fulfill-service, fulfill-preorder, cancel-preorder,
+> resolve-theft-success/failure) are verified by the automated `npm test` suite in
+> Node. This section is the intended real-runtime check for the manager
+> `.commerce-panel`, the service/special row editors, and the GM adjudication of
+> the advanced orders that the storefront (section 18) raises.
+
+### 19.1 GM configures commerce settings
+
+1. As the **GM**, open the Market Manager, select a shop, and in the "Commerce
+   controls" panel set a finite **Merchant funds**, a **Buy rate**, a **Buyback
+   rate**, enable **Accept preorders** (set a deposit and a per-actor max), enable
+   **theft**, and click **Save commerce**.
+
+**Expected**
+
+- The values persist after reopening the shop. Entering a **Buyback rate below the
+  Buy rate** shows a notice and does NOT write.
+- Checking **Unlimited funds** maps **Merchant funds** to an unlimited (null) value;
+  unchecking it and leaving **Merchant funds** empty falls back to the previous
+  value (or 0).
+
+### 19.2 GM manages services and specials
+
+1. Click **Add service**; confirm a "New service" row appears. Edit the name, price,
+   description, visibility and enabled state, then click **Save services**.
+2. Click **Add special**; confirm a "New special" row appears. Link it to an
+   inventory item, set a price and (optionally) character UUIDs, then click **Save
+   specials**.
+
+**Expected**
+
+- A shop holds at most twenty services and twenty specials; adding a twenty-first
+  shows a notice.
+- Removing a service/special removes only that row.
+- A special whose linked inventory item no longer exists shows a notice and does NOT
+  write; an invalid character UUID (not matching `Actor.<id>`) fails closed.
+- Saving services/specials never deletes a row that is absent from the DOM (e.g.
+  added concurrently).
+
+### 19.3 GM adjudicates an advanced order
+
+1. Enable preorders/theft (or add a service) in a shop, then as the **player**
+   (section 18) place a service, preorder or theft claim.
+2. As the **active GM**, in the Market Manager select that shop and open the
+   "Advanced orders" panel. For a **booked** service order click **Mark fulfilled**;
+   for a **booked** preorder click **Fulfill** or **Cancel**; for a **booked** theft
+   claim click **Resolve success** or **Resolve failure**.
+
+**Expected**
+
+- The order buttons appear only for a `booked` order (a `fulfilled`/`cancelled`/
+  `committed`/`failed` order shows no action button).
+- The action is reported truthfully in the notice (fulfilled/cancelled/resolved, or
+  needs recovery / an error), and the order list refreshes WITHOUT reloading the
+  shop, so any unsaved appearance or inventory-row edits are preserved.
+- Only the active GM can act: a non-active GM sees the buttons disabled and pressing
+  them shows the "Only the active Game Master..." notice with no store read.
+
+### 19.4 GM approves an item valuation (sell/barter)
+
+1. As the **active GM**, open the Market Manager, select a shop, and in the social
+   panel's "Item valuations" sub-panel reuse the **Character** selector to choose
+   the player Actor whose whole Item is to be valued.
+2. Pick the Item, set a positive whole-number approved amount, and click **Approve
+   valuation**.
+
+**Expected**
+
+- The action is active-GM gated: a non-active GM sees **Approve valuation** disabled
+  and pressing it shows the "Only the active Game Master..." notice with no store
+  read.
+- Without a chosen character, or without a chosen item, or with an amount that is
+  not a positive whole number (`min 1`), a notice is shown and the GM-only
+  `approveValuation` is not called.
+- On success the shop refresh shows the new valuation in the private list, and the
+  next catalog request includes it in the player-facing `approvedItems` allowlist
+  so that character can sell/barter the item. Re-approving the same
+  `(actorUuid, itemId)` pair replaces the existing entry rather than duplicating
+  it.
+- Only the active GM can act (a player watching the app never triggers a read or a
+  write).
+
+## 20. M5 - GM config, order adjudication, buyback funds/balance, cart/barter/backroom/specials and the recovery checklist
+
+> **Status: Node-tested only.** The M5 advanced services and the manager/
+> storefront controls exercised here are verified by the automated `npm test`
+> suite in Node. This section is the intended real-runtime check for the
+> GM-authoritative advanced trade services - whole-item sell/buyback, manual
+> service booking, single-payer cart checkout with optional barter,
+> deposit-backed pre-orders, GM-adjudicated theft and actor special offers - and
+> for the recovery surfaces.
+
+### 20.1 GM configures advanced commerce and a backroom entry
+
+1. As the **GM**, open the Market Manager, select a shop, and in the "Commerce
+   controls" panel set a finite **Merchant funds**, a **Buy rate** and a
+   **Buyback rate**, enable **Accept preorders** (deposit basis points + per-actor
+   max), enable **theft**, and add a **service** and a **special**. Click **Save
+   commerce**.
+2. In an inventory row, set the per-entry **Access** to `backroom`, add an owned
+   Actor UUID to the allowlist and (optionally) set a `minReputation`.
+
+**Expected**
+
+- The commerce values persist after reopening; an inverted **Buyback rate below
+  the Buy rate** shows a notice and does NOT write.
+- A `backroom` entry no longer appears in the base (unpersonalized) catalog, and
+  appears in a personalized catalog only for an allowlisted actor or one meeting
+  `minReputation`. An actor who is neither allowlisted nor above the threshold
+  never sees it.
+- An invalid character UUID (not matching `Actor.<id>`) or an out-of-range
+  `minReputation`/`depositBps`/`maxPerActor` fails closed with a notice and no
+  write.
+
+### 20.2 GM resolves a service / preorder / theft order
+
+1. As the **player**, book a service, place a preorder (deposit charged), and
+   submit a theft claim (from sections 18.3/18.4).
+2. As the **active GM**, open the same shop's "Advanced orders" panel and act:
+   a **booked** service -> **Mark fulfilled**; a **booked** preorder ->
+   **Fulfill** or **Cancel**; a **booked** theft claim -> **Resolve success** or
+   **Resolve failure**.
+
+**Expected**
+
+- The action buttons appear only for a `booked` order (a `fulfilled`/`cancelled`/
+  `committed`/`failed` order shows no action button).
+- Fulfilling a service only records the acknowledgement: the order moves to
+  `fulfilled` and no `Item` is created or delivered.
+- Fulfilling a preorder charges only the **remaining** balance (never the deposit
+  again), delivers the items and decrements finite stock; cancelling refunds the
+  deposit and decrements finite merchant funds.
+- Resolving a theft as success grants ONE item and decrements finite stock; as
+  failure it grants nothing. No currency moves either way.
+- Only the active GM can act: a non-active GM sees the buttons disabled and
+  pressing them shows the "Only the active Game Master..." notice with no store
+  read.
+
+### 20.3 Buyback sale: merchant funds / player balance
+
+1. As the **player**, open a shop whose GM set finite **Merchant funds**, select
+   an owned Actor with a whole Item, and **Sell item**.
+2. Confirm the payout, the Item leaving the Actor, and the shop gaining a
+   `non-restocking` buyback listing.
+
+**Expected**
+
+- The player's balance increases by exactly the quoted payout; the Item leaves the
+  Actor (a stacked, quantity != 1 Item is not offered).
+- Finite merchant funds DECREASE by the payout; with unlimited (`null`) funds the
+  shop is never limited. If the finite funds are below the payout the sale is
+  refused `insufficient-merchant-funds` with no item removal and no credit.
+- Re-running the identical sell (same `requestId`) replays with no second credit,
+  no second delete and no second listing.
+
+### 20.4 Cart + barter + backroom + specials
+
+1. As the **player**, in a shop that carries a special on an entry, add that
+   special to the cart and confirm the special line uses the offer price (never
+   a client-supplied price).
+2. Select a whole owned Item in the **Optional barter item** select and
+   **Checkout cart**.
+
+**Expected**
+
+- Only the paying `actorId` is debited - a group cart is a single payer, and no
+  other contributor is charged.
+- Only the CASH remainder (total minus barter credit) is ever debited, never the
+  bartered credit; finite merchant funds gain only that cash remainder.
+- A tender worth more than the cart gross total never pays cash out (the credit is
+  capped at the total).
+- A `backroom` entry included in the cart is quoted/charged only when the actor
+  may access it; an inaccessible line fails closed `entry-restricted`.
+- A forged/hidden/wrong-entry/not-allowlisted `specialId` fails the checkout
+  closed `special-unavailable` before any debit.
+- **A GM approval is required first.** The runtime `main.js` now wires the
+  valuation service's `getApprovedValuation` into the cart path, so the tender is
+  priced by a GM-approved valuation. A checkout with a `barterItemId` that has no
+  still-valid GM approval refuses closed `gm-approval-required` and nothing is
+  debited/removed/delivered; record the approval first via
+  `api.advanced.approveValuation`.
+
+### 20.5 Recovery checklist
+
+1. Make a deliberately failing operation (e.g. set finite merchant funds to 0 and
+   sell an item; or cancel a preorder whose finite funds no longer cover the
+   deposit) and confirm the advanced order is marked `failed` or `needsRecovery`,
+   never a false success.
+2. Confirm the affected funds/item are not double-applied, and use the recorded
+   markers in `details.compensation` to reconcile.
+
+**Expected**
+
+- A `needsRecovery` order is reported as needing manual reconciliation; nothing is
+  silently double-credited or double-debited.
+- A replay of a failed/pending original surfaces
+  `originalStatus: 'failed'`/`'needsRecovery'` and is never reported as complete.
+
+### 20.6 No false automatic effects
+
+**Expected**
+
+- A booked service is reported **booked**, never fulfilled; fulfillment is only the
+  GM's manual acknowledgement.
+- A theft claim is reported **awaiting the GM**; no item is delivered, no stock
+  decremented and no currency moves at claim time - success/failure comes only
+  from the GM's `resolve`.
+- A preorder `place` charges only the deposit and reserves NO stock; the entry
+  quantity is untouched until fulfillment.
+- The storefront never reports a plain request (cart add, service/preorder/theft
+  submission) as a completed sale - only a committed checkout, a fulfilled
+  service, or a resolved theft are reported complete.
+
+## 21. Summary / verdict
+
+Record a pass/fail + notes row for each section. Take **all** sections (1-20) as
+the minimum signal for M1/M2/M3/M4/M5 - do not claim completion on the strength of
 `npm test` alone (that only mocks the Foundry boundaries). If you are about to
 run a real economy, treat sections 1, 4 (UI/hook shapes), 12 (last-item
 contention), 15.3/15.4 (M2 action dispatch), 16.4 (M3 personalized quote), 17.5
-(M4 active-GM automation) and the multi-GM concurrency note as mandatory, and
-confirm the two blockers in the intro are addressed before you trust a live
-economy to the module.
+(M4 active-GM automation), 18.2/18.5 (M5 cart checkout and whole-item selling),
+19.3 (M5 GM advanced-order adjudication), 20.2/20.3 (M5 order adjudication and
+buyback funds/balance), 20.5 (M5 recovery) and
+the multi-GM concurrency note as mandatory, and confirm the two blockers in the
+intro are addressed before you trust a live economy to the module.

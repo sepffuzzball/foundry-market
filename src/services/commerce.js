@@ -2,11 +2,14 @@
 //
 // `purchase()` is GM-only: it re-reads shop/actor/source data at transaction
 // time, serializes purchases per shop, records an idempotency ledger entry
-// BEFORE charging (status `pending`), then charges -> delivers -> decrements
-// stock -> commits. Failures are compensated best-effort (refund currency,
-// remove a delivered item); if compensation itself fails the ledger is marked
-// `needsRecovery`. The core does NOT claim transactional atomicity - it is a
-// compensating ledger, and the docs explain the recovery boundary.
+// BEFORE charging (status `pending`), then charges -> delivers -> writes the
+// shop (decrement finite/non-restocking stock and, when merchant funds are
+// finite, gain the ordinary direct-Buy revenue in the same patch) -> commits.
+// Failures are compensated best-effort (refund currency, remove a delivered
+// item, restore the shop by re-reading entry quantity and funds); if
+// compensation itself fails the ledger is marked `needsRecovery`. The core does
+// NOT claim transactional atomicity - it is a compensating ledger, and the docs
+// explain the recovery boundary.
 //
 // No Foundry globals are referenced at import time.
 
@@ -19,6 +22,7 @@ import {
 import { quote } from './pricing.js';
 import { quoteSocial as defaultQuoteSocial } from '../social/pricing.js';
 import { isShopTrading } from '../automation/policy.js';
+import { canAccessEntry } from '../advanced/policy.js';
 
 export function fnv1a(str) {
   let hash = 0x811c9dc5;
@@ -198,6 +202,75 @@ export function createCommerce(deps) {
   }
 
   /**
+   * Resolve a terminal `committed` ledger write that threw or returned null. The
+   * write may STILL have applied, so the ledger is re-read by key BEFORE any
+   * compensation:
+   *   - a `committed` ledger carrying the same purchase outcome => the commit
+   *     landed; report success (never refund the currency, remove the delivered
+   *     item or restore stock/funds).
+   *   - a reliably `pending` ledger => the write never landed; return the
+   *     'compensate' sentinel so the caller reruns the existing compensation.
+   *   - the re-read throws, or the ledger is missing / in an ambiguous state =>
+   *     needsRecovery WITHOUT refunding/removing the delivered goods or
+   *     restoring stock/funds (a possibly-delivered purchase must never be
+   *     undone).
+   */
+  async function resolveLedgerCommit({ recId, key, outcome, err, total, quantity, priceBreakdown }) {
+    let current;
+    try {
+      current = await store.findLedgerByKey(key);
+    } catch (e) {
+      return {
+        status: 'needsRecovery',
+        ledgerId: recId,
+        error: String((err && err.message) || err),
+        compensation: [],
+        total,
+        quantity,
+        priceBreakdown,
+      };
+    }
+    if (!current) {
+      return {
+        status: 'needsRecovery',
+        ledgerId: recId,
+        error: String((err && err.message) || err),
+        compensation: [],
+        total,
+        quantity,
+        priceBreakdown,
+      };
+    }
+    const landed =
+      current.status === 'committed' &&
+      !!current.outcome &&
+      current.outcome.unitPrice === outcome.unitPrice &&
+      current.outcome.total === outcome.total &&
+      current.outcome.quantity === outcome.quantity;
+    if (landed) {
+      return {
+        status: 'committed',
+        ledgerId: recId,
+        createdItemId: current.outcome.createdItemId ?? outcome.createdItemId ?? null,
+        unitPrice: current.outcome.unitPrice,
+        total: current.outcome.total,
+        quantity: current.outcome.quantity,
+        priceBreakdown: current.outcome.priceBreakdown ?? priceBreakdown,
+      };
+    }
+    if (current.status === 'pending') return 'compensate';
+    return {
+      status: 'needsRecovery',
+      ledgerId: recId,
+      error: String((err && err.message) || err),
+      compensation: [],
+      total,
+      quantity,
+      priceBreakdown,
+    };
+  }
+
+  /**
    * Execute a purchase. `authenticatedUserId` is the GM user id executing the
    * transaction (the active GM). The request's owning user is `payload.userId`,
    * which is used both for the idempotency key and for the actor ownership check.
@@ -325,6 +398,19 @@ export function createCommerce(deps) {
           detail: (err && err.message) || String(err),
         });
       }
+      // M5 backroom gate. After actor ownership AND the effective-reputation
+      // lookup, enforce `canAccessEntry` for a `backroom` entry and record
+      // `entry-restricted` before any debit - even when a request forges an
+      // entryId the actor cannot access. A `public` entry is unaffected.
+      if (!canAccessEntry(entry, { actorUuid: actor?.uuid, score: effective?.score })) {
+        return recordFailure({
+          key,
+          userId,
+          payload: requestPayload,
+          error: 'entry-restricted',
+          detail: 'backroom entry not accessible to the actor',
+        });
+      }
       try {
         const q = quoteSocial(entry, qty, {
           shop,
@@ -357,6 +443,20 @@ export function createCommerce(deps) {
         });
       }
     } else {
+      // M5 backroom gate on the legacy / un-wired runtime (no `getSocial`).
+      // Fail closed for a `backroom` entry unless the actor's UUID is already
+      // allowlisted: with no effective reputation the score defaults to -100,
+      // which can never satisfy a `minReputation` above -100, so only a UUID
+      // allowlist match grants access. A `public` entry is unaffected.
+      if (!canAccessEntry(entry, { actorUuid: actor?.uuid, score: -100 })) {
+        return recordFailure({
+          key,
+          userId,
+          payload: requestPayload,
+          error: 'entry-restricted',
+          detail: 'backroom entry not accessible to the actor',
+        });
+      }
       try {
         total = quote(entry, qty);
       } catch (err) {
@@ -415,6 +515,26 @@ export function createCommerce(deps) {
       });
     }
 
+    // Optional finite merchant funds GAIN the total (ordinary direct Buy
+    // revenue). Refuse on a safe-integer overflow BEFORE any effect rather than
+    // wrapping. `null` funds stay unlimited (no funds patch is written).
+    const funds = shop.commerce ? shop.commerce.funds : null;
+    const finiteFunds = funds != null;
+    const fundsBefore = funds;
+    if (finiteFunds) {
+      const gained = Number(BigInt(funds) + BigInt(total));
+      if (!Number.isSafeInteger(gained)) {
+        return recordFailure({
+          key,
+          userId,
+          payload: requestPayload,
+          error: 'merchant-funds-overflow',
+          detail: `merchant funds ${funds} + total ${total} overflow`,
+          extra: { totalPrice: total, funds, unitPrice, priceBreakdown },
+        });
+      }
+    }
+
     // 4. Persist PENDING record BEFORE charging.
     let ledgerResult;
     try {
@@ -465,7 +585,7 @@ export function createCommerce(deps) {
     // what was actually applied (and never double-compensate).
     let debited = false;
     let created = null;
-    let stockUpdated = false;
+    let shopWriteAttempted = false;
     try {
       await adapter.debit(actor, total);
       debited = true;
@@ -479,16 +599,34 @@ export function createCommerce(deps) {
       const delivered = await adapter.deliverItem(actor, source, { quantity: qty });
       created = delivered;
 
+      // ONE shop write inside the lock: decrement finite/non-restocking stock and,
+      // when funds are finite, gain the total (ordinary direct Buy revenue) in the
+      // SAME patch so stock and funds never diverge. Never overwrite other fields.
+      // When funds are unlimited keep the legacy stock-only behavior; when both
+      // stock and funds are unlimited there is no write at all.
+      let inventory;
       if (entry.stockMode !== 'unlimited') {
         const remaining = entry.quantity - qty;
         if (remaining < 0) {
           throw new Error('insufficient-stock-after-reserve');
         }
-        const inventory = shop.inventory.map((e) =>
+        inventory = shop.inventory.map((e) =>
           e.id === entryId ? { ...e, quantity: remaining } : e
         );
-        await store.updateShop(shopId, { inventory });
-        stockUpdated = true;
+      } else {
+        inventory = shop.inventory;
+      }
+
+      if (finiteFunds || entry.stockMode !== 'unlimited') {
+        const patch = { inventory };
+        if (finiteFunds) {
+          patch.commerce = { ...shop.commerce, funds: fundsBefore + total };
+        }
+        shopWriteAttempted = true;
+        const updatedShop = await store.updateShop(shopId, patch);
+        if (updatedShop == null) {
+          throw new Error('shop-update-missing');
+        }
       }
 
       const outcome = {
@@ -498,11 +636,45 @@ export function createCommerce(deps) {
         quantity: qty,
         priceBreakdown,
       };
-      await store.updateLedger(rec.id, {
-        status: 'committed',
-        updatedAt: now(),
-        outcome,
-      });
+      let committedRecord;
+      try {
+        committedRecord = await store.updateLedger(rec.id, {
+          status: 'committed',
+          updatedAt: now(),
+          outcome,
+        });
+      } catch (err) {
+        // A throwing terminal write may STILL have applied. Re-read the ledger by
+        // key before compensating: a landed `committed` is success, a pending
+        // ledger is compensated (rethrow to run the existing block), and an
+        // unavailable/missing/ambiguous ledger is needsRecovery WITHOUT
+        // refunding the currency, removing the delivered item or restoring
+        // stock/funds.
+        const resolution = await resolveLedgerCommit({
+          recId: rec.id,
+          key,
+          outcome,
+          err,
+          total,
+          quantity: qty,
+          priceBreakdown,
+        });
+        if (resolution === 'compensate') throw err;
+        return resolution;
+      }
+      if (committedRecord == null) {
+        const resolution = await resolveLedgerCommit({
+          recId: rec.id,
+          key,
+          outcome,
+          err: new Error('ledger-commit-missing'),
+          total,
+          quantity: qty,
+          priceBreakdown,
+        });
+        if (resolution === 'compensate') throw new Error('ledger-commit-missing');
+        return resolution;
+      }
       return { status: 'committed', ledgerId: rec.id, ...outcome };
     } catch (err) {
       // Best-effort compensation. No atomicity is claimed.
@@ -526,16 +698,94 @@ export function createCommerce(deps) {
           needsRecovery = true;
         }
       }
-      if (stockUpdated) {
-        // Stock was already decremented, so restore it to the original count.
+      if (shopWriteAttempted) {
+        // Shop compensation. Instead of best-effort guessing, re-read the current
+        // shop and compare the entry quantity and funds to the recorded
+        // before/after values, so a known no-write never falsely claims a restore
+        // and a mixed/unknown state is escalated to needsRecovery - never falsely
+        // marked failed. Unrelated inventory entries/commerce fields are untouched.
         try {
-          const restored = shop.inventory.map((e) =>
-            e.id === entryId ? { ...e, quantity: entry.quantity } : e
-          );
-          await store.updateShop(shopId, { inventory: restored });
-          compensation.push('stock-restored');
+          const current = await store.findShop(shopId);
+          if (!current) {
+            compensation.push('shop-missing');
+            needsRecovery = true;
+          } else {
+            const finiteStock = entry.stockMode !== 'unlimited';
+            const expectedQtyAfter = entry.quantity - qty;
+            const fundsChange = finiteFunds && total !== 0;
+
+            let anyApplied = false;
+            let anyNotApplied = false;
+            let mixed = false;
+
+            if (finiteStock) {
+              const currEntry = current.inventory.find((e) => e.id === entryId);
+              if (!currEntry) {
+                mixed = true;
+              } else if (currEntry.quantity === expectedQtyAfter) {
+                anyApplied = true;
+              } else if (currEntry.quantity === entry.quantity) {
+                anyNotApplied = true;
+              } else {
+                mixed = true;
+              }
+            }
+            if (fundsChange) {
+              const currFunds = current.commerce ? current.commerce.funds : null;
+              if (currFunds === fundsBefore + total) {
+                anyApplied = true;
+              } else if (currFunds === fundsBefore) {
+                anyNotApplied = true;
+              } else {
+                mixed = true;
+              }
+            }
+
+            if (mixed) {
+              compensation.push('shop-state-mixed');
+              needsRecovery = true;
+            } else if (anyApplied && anyNotApplied) {
+              compensation.push('shop-state-mixed');
+              needsRecovery = true;
+            } else if (anyApplied) {
+              // Known complete write: restore exactly the old stock and old funds
+              // in a SINGLE update, leaving every unrelated entry/commerce field
+              // untouched. Then verify the persisted shop before claiming success.
+              const restoredInventory = current.inventory.map((e) =>
+                e.id === entryId ? { ...e, quantity: entry.quantity } : e
+              );
+              const patch = { inventory: restoredInventory };
+              if (finiteFunds) {
+                patch.commerce = { ...current.commerce, funds: fundsBefore };
+              }
+              const returned = await store.updateShop(shopId, patch);
+              const verified =
+                returned != null &&
+                (!finiteStock ||
+                  (returned.inventory.find((e) => e.id === entryId) || {})
+                    .quantity === entry.quantity) &&
+                (!finiteFunds ||
+                  (returned.commerce && returned.commerce.funds === fundsBefore));
+              if (verified) {
+                compensation.push(finiteFunds ? 'shop-restored' : 'stock-restored');
+              } else {
+                compensation.push(
+                  finiteFunds
+                    ? 'shop-restore-verify-failed'
+                    : 'stock-restore-verify-failed'
+                );
+                needsRecovery = true;
+              }
+            } else {
+              // No observable change: the write never landed (or wrote nothing
+              // different), so there is nothing to undo for the shop.
+              compensation.push('shop-unwritten');
+            }
+          }
         } catch (e) {
-          compensation.push('stock-restore-failed');
+          compensation.push(
+            finiteFunds ? 'shop-restore-failed' : 'stock-restore-failed'
+          );
           needsRecovery = true;
         }
       }

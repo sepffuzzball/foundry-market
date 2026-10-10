@@ -73,6 +73,18 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       'close-detail': this._action('_onCloseDetail'),
       'toggle-sound': this._action('_onToggleSound'),
       'sort-items': this._action('_onSortItems'),
+      // M5 storefront controls. `add-to-cart`/`add-special-to-cart`/
+      // `remove-from-cart` mutate local cart state only; `checkout-cart`,
+      // `book-service`, `place-preorder`, `attempt-theft` and `sell-item` send an
+      // authenticated advanced request through `_requestAdvanced`.
+      'add-to-cart': this._action('_onAddToCart'),
+      'add-special-to-cart': this._action('_onAddSpecialToCart'),
+      'remove-from-cart': this._action('_onRemoveFromCart'),
+      'checkout-cart': this._action('_onCheckoutCart'),
+      'book-service': this._action('_onBookService'),
+      'place-preorder': this._action('_onPlacePreorder'),
+      'attempt-theft': this._action('_onAttemptTheft'),
+      'sell-item': this._action('_onSellItem'),
     },
   };
 
@@ -89,6 +101,8 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     this._pendingCatalogRequestId = null;
     this._pendingPurchaseRequestId = null;
     this._pendingPurchaseEntryId = null;
+    this._pendingAdvancedRequestId = null;
+    this._pendingAdvancedType = null;
     this._data = this._initialData();
     this._bindChat = this._onChatMessage.bind(this);
     if (typeof Hooks !== 'undefined') Hooks.on('createChatMessage', this._bindChat);
@@ -136,6 +150,11 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       // without a re-render so search/sort/filter/inspect re-renders never reset
       // the player's in-progress quantity. Defaults to '1'.
       quantity: '1',
+      // M5 cart state. `cartLines` is the raw `{entryId, quantity, specialId}`
+      // list; the display projection is derived in `_prepareContext` (never
+      // mutated here). Cleared on actor switch, on successful cart checkout and
+      // when a catalog refresh removes an entry's line.
+      cartLines: [],
     };
   }
 
@@ -160,6 +179,27 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       // it with the display `modifierText` and never expose a private record.
       relationship: this._prepareRelationship(),
       merchants: this._data.merchants || [],
+      // M5 storefront derivations. These are display/request-hint projections
+      // built fresh each render; `_data.inventory` and `_data.cartLines` stay
+      // raw and untouched. `sellItems`/`barterItems` read the locally selected
+      // OWNED Actor's embedded Items (never the private store), `cartLines`/
+      // `cartTotal` come from the sanitized catalog + shop specials (the
+      // personalized `shop.specials[].price` when a character is selected), and
+      // the preorder/theft selects expose only eligible entries. `cartEstimate`
+      // is true when NO character is selected, so the cart totals are a base
+      // (non-personalized) estimate and checkout is disabled - the template
+      // annotates it rather than presenting the total as a firm quote.
+      cartLines: this._cartDisplay(),
+      cartTotal: this._cartTotal(),
+      cartEstimate: !this._data.selectedActorId,
+      sellItems: this._sellableItems(),
+      barterItems: this._sellableItems(),
+      // `sellEmpty` is true only when a character IS selected but the GM has not
+      // approved a valuation for any whole item on it, so the template can show a
+      // helpful "ask the GM" message rather than an unexplained empty dropdown.
+      sellEmpty: !!this._data.selectedActorId && this._sellableItems().length === 0,
+      preorderEntries: (this._data.inventory || []).filter((e) => e.canPreorder),
+      theftEntries: (this._data.inventory || []).filter((e) => e.canAttemptTheft),
     };
   }
 
@@ -437,6 +477,66 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     });
   }
 
+  /**
+   * Send an M5 advanced request (cart/service/preorder/theft/sell) through the
+   * same request channel as a purchase, sharing the `_data.pending` flag so a
+   * player can never fire a second request while one is in flight. Guards on an
+   * active GM, a selected actor, an open shop and no pending request, then builds
+   * the request with ONLY the server-allowlisted payload fields (never a client
+   * `price`/`success`/`roll`), correlates the response by the generated
+   * `requestId`, and records the pending advanced id/type so a stale or
+   * wrong-actor response can be rejected. The payload is spread verbatim after the
+   * correlation fields, so each caller supplies exactly the fields the server
+   * allowlists for its request type.
+   * @param {string} type one of 'cart' | 'service' | 'preorder' | 'theft' | 'sell'
+   * @param {object} [payload] server-allowlisted request body (minus type/requestId)
+   * @returns {boolean} true when a request was sent (and pending set)
+   */
+  _requestAdvanced(type, payload = {}) {
+    const actorId = this._data.selectedActorId;
+    if (!actorId) {
+      this._data.feedback = 'Choose a character to shop as.';
+      this.render({ force: true });
+      return false;
+    }
+    if (!this._hasActiveGM()) {
+      this._data.feedback = 'A Game Master is not currently connected.';
+      this.render({ force: true });
+      return false;
+    }
+    if (!this._data.shop?.open) {
+      this._data.feedback = 'The shop is closed.';
+      this.render({ force: true });
+      return false;
+    }
+    if (this._data.pending) return false;
+    const requestId = newRequestId(type);
+    this._pendingAdvancedRequestId = requestId;
+    this._pendingAdvancedType = type;
+    this._data.pending = true;
+    this._data.feedback = '';
+    this.render({ force: true });
+    this._request({
+      type,
+      shopId: this._storefrontShopId,
+      actorId,
+      requestId,
+      ...payload,
+    }).catch(() => {
+      this._data.pending = false;
+      this._pendingAdvancedRequestId = null;
+      this._pendingAdvancedType = null;
+      this._data.feedback = `${this._advancedTypeLabel(type)} request failed to send.`;
+      this.render({ force: true });
+    });
+    return true;
+  }
+
+  _advancedTypeLabel(type) {
+    const map = { cart: 'Cart', service: 'Service', preorder: 'Preorder', theft: 'Theft', sell: 'Sell' };
+    return map[type] || 'Request';
+  }
+
   // ---- chat response correlation -------------------------------------------
 
   async _onChatMessage(message, options, userId) {
@@ -453,7 +553,28 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       }
     } else if (requestId && requestId === this._pendingPurchaseRequestId) {
       await this._onPurchaseResponse(response);
+    } else if (requestId && requestId === this._pendingAdvancedRequestId) {
+      // An advanced response must be correlated on the actor AND the shop id (and
+      // is already correlated on requestId above). A response quoted for a
+      // different actor or a different shop is discarded so a stale request never
+      // mutates the current storefront.
+      if (this._advancedResponseMatches(response)) {
+        await this._onAdvancedResponse(response);
+      }
     }
+  }
+
+  /**
+   * Correlation guard for an advanced (cart/service/preorder/theft/sell)
+   * response. The server echoes the request's `actorId` and `shopId`; both must
+   * match the CURRENT selected actor and shop, otherwise the response is stale
+   * and ignored (the pending flag stays set until the matching response arrives).
+   */
+  _advancedResponseMatches(response) {
+    const selected = this._data.selectedActorId ?? null;
+    const responseActor = response?.actorId ?? null;
+    const shopMatch = (response?.shopId ?? null) === this._storefrontShopId;
+    return (responseActor ?? null) === selected && shopMatch;
   }
 
   /**
@@ -495,10 +616,24 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       this._data.error = null;
       this._data.notice = '';
     }
+    // A catalog refresh (or an error that emptied the catalog) prunes any cart
+    // line whose entry is no longer on display, so a stale line can never be
+    // checked out against a missing entry.
+    this._pruneCart();
     // Stop any playing loop on a catalog change/error; restart it only if the
     // player explicitly opted in and the new catalog has a valid music path.
     this._syncSound();
     this.render({ force: true });
+  }
+
+  /**
+   * Drop any cart line whose `entryId` is not present in the current public
+   * catalog. Called after every catalog response so a refresh that removes an
+   * entry also removes its pending cart line.
+   */
+  _pruneCart() {
+    const present = new Set((this._data.inventory || []).map((e) => e.id));
+    this._data.cartLines = (this._data.cartLines || []).filter((l) => present.has(l.entryId));
   }
 
   _onPurchaseResponse(response) {
@@ -516,6 +651,179 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       this._data.feedback = this._purchaseErrorText(result);
       this.render({ force: true });
     }
+  }
+
+  /**
+   * Handle a correlated M5 advanced response. Clears the shared pending flag and
+   * the advanced correlation ids, then routes on the echoed `response.type` (or
+   * the recorded pending type as a fallback). Feedback is always bounded and
+   * truthful: a `booked` service/preorder/theft is reported as booked (never
+   * as delivered/fulfilled/resolved), a cart checkout clears the cart only on a
+   * committed/replay status, and the catalog is refreshed only after a status that
+   * actually moved stock/funds or completed a sale.
+   */
+  async _onAdvancedResponse(response) {
+    const type = response?.type || this._pendingAdvancedType;
+    const result = response?.result || { status: 'error' };
+    const status = result.status;
+    this._data.pending = false;
+    this._pendingAdvancedRequestId = null;
+    this._pendingAdvancedType = null;
+    const clearCart =
+      type === 'cart' &&
+      (status === 'committed' ||
+        (status === 'replay' && result?.originalStatus === 'committed'));
+    if (clearCart) this._data.cartLines = [];
+    this._data.feedback = this._advancedFeedback(type, result);
+    const refresh = this._advancedShouldRefresh(type, result);
+    this.render({ force: true });
+    if (refresh) this._requestRefresh();
+  }
+
+  /**
+   * Whether an advanced result is a SUCCESSFUL replay for its type. A replay only
+   * means the order reached a terminal success state when its recorded
+   * `originalStatus` belongs to the type's success set (cart => committed;
+   * service => booked/fulfilled; preorder => booked/fulfilled/cancelled; theft
+   * and sell => committed). A replay of an original that persisted `failed`,
+   * `needsRecovery` or `pending` is NOT a success and must surface as a recovery
+   * failure, never a completed message.
+   */
+  _isSuccessfulAdvancedReplay(type, result) {
+    if (result?.status !== 'replay') return false;
+    const original = result?.originalStatus;
+    const allowed = {
+      cart: ['committed'],
+      service: ['booked', 'fulfilled'],
+      preorder: ['booked', 'fulfilled', 'cancelled'],
+      theft: ['committed'],
+      sell: ['committed'],
+    }[type];
+    return !!allowed && allowed.includes(original);
+  }
+
+  _advancedFeedback(type, result) {
+    const status = result?.status;
+    if (status === 'committed' || status === 'booked' || status === 'fulfilled') {
+      if (type === 'cart') return 'Cart checkout complete.';
+      if (type === 'service') {
+        return status === 'fulfilled' ? 'Service fulfilled.' : 'Service booked.';
+      }
+      if (type === 'preorder') {
+        if (status === 'fulfilled') return 'Preorder fulfilled.';
+        if (status === 'booked') return 'Preorder placed.';
+        return 'Preorder complete.';
+      }
+      if (type === 'theft') {
+        return status === 'committed' ? 'Theft succeeded!' : 'Theft claim submitted; awaiting the GM.';
+      }
+      if (type === 'sell') {
+        const name = result?.itemName || 'Item';
+        const payout = result?.payout;
+        const label = this._currencyLabel();
+        return typeof payout === 'number'
+          ? `Sold ${name} for ${payout} ${label}.`
+          : `Sold ${name}.`;
+      }
+    }
+    if (status === 'failed') {
+      if (type === 'theft') return 'Theft claim failed.';
+    }
+    if (status === 'cancelled' && type === 'preorder') return 'Preorder cancelled.';
+    if (status === 'replay') {
+      if (this._isSuccessfulAdvancedReplay(type, result)) {
+        if (type === 'cart') return 'Cart checkout complete.';
+        if (type === 'service') {
+          return result?.originalStatus === 'fulfilled' ? 'Service fulfilled.' : 'Service booked.';
+        }
+        if (type === 'preorder') {
+          if (result?.originalStatus === 'fulfilled') return 'Preorder fulfilled.';
+          if (result?.originalStatus === 'cancelled') return 'Preorder cancelled.';
+          return 'Preorder placed.';
+        }
+        if (type === 'theft') return 'Theft claim submitted; awaiting the GM.';
+        if (type === 'sell') {
+          const name = result?.itemName || 'Item';
+          const payout = result?.payout;
+          const label = this._currencyLabel();
+          return typeof payout === 'number'
+            ? `Sold ${name} for ${payout} ${label}.`
+            : `Sold ${name}.`;
+        }
+      }
+      // A replay whose original did not reach a success terminal state (failed /
+      // needsRecovery / pending) is a recovery surface, not a completion.
+      if (type === 'theft') return 'Theft claim needs recovery.';
+      return 'This request is pending recovery; please check the market ledger.';
+    }
+    if (status === 'conflict') return 'This request was already processed with different contents.';
+    if (status === 'needsRecovery') return 'This request is pending recovery; please check the market ledger.';
+    return this._advancedErrorText(result);
+  }
+
+  _advancedErrorText(result) {
+    const map = {
+      'insufficient-funds': 'Not enough gold on that character.',
+      'insufficient-stock': 'Not enough stock.',
+      'shop-closed': 'The shop just closed.',
+      'entry-hidden': 'That item is no longer on display.',
+      'entry-not-found': 'That item is no longer on display.',
+      'entry-restricted': 'You cannot access that item.',
+      'actor-not-owned': 'You do not own that character.',
+      'actor-not-found': 'Character not found.',
+      'adapter-unsupported': 'This system has no price adapter configured.',
+      'not-active-gm': 'No active Game Master.',
+      'service-refused': 'The shop refused this sale due to your standing.',
+      'special-unavailable': 'That offer is no longer available.',
+      'item-not-found': 'That item could not be found on your character.',
+      'item-not-an-item': 'That is not a valid item.',
+      'barter-item-not-found': 'The barter item could not be found on your character.',
+      'stacked-item': 'A sold or bartered item must be a single whole item.',
+      'no-offer': 'The shop offered nothing for that item.',
+      'preorders-disabled': 'Preorders are not enabled at this shop.',
+      'theft-disabled': 'Theft is not enabled at this shop.',
+      'service-not-found': 'That service is no longer available.',
+      'service-disabled': 'That service is not available right now.',
+      'server-error': 'The market server hit an error while processing the request.',
+      'shop-write-missing': 'The shop vanished while the order was processing, so its effects may need recovery.',
+      'gm-approval-required': 'This trade needs a GM-approved price; it is pending until a GM sets the value.',
+    };
+    return map[result.error] || `Request ${result.status || 'failed'} (${result.error || 'unknown'}).`;
+  }
+
+  /**
+   * Whether an advanced result should trigger a catalog refresh. Only a status
+   * that actually moved stock / funds, completed a sale, or (for a replayed
+   * terminal advanced order) may reflect a prior GM resolution should refresh; a
+   * fresh theft claim is deliberately a no-op.
+   */
+  _advancedShouldRefresh(type, result) {
+    const status = result?.status;
+    if (type === 'cart') {
+      return status === 'committed' || this._isSuccessfulAdvancedReplay('cart', result);
+    }
+    if (type === 'service') {
+      return (
+        status === 'booked' ||
+        status === 'fulfilled' ||
+        this._isSuccessfulAdvancedReplay('service', result)
+      );
+    }
+    if (type === 'preorder') {
+      return (
+        status === 'booked' ||
+        status === 'fulfilled' ||
+        status === 'cancelled' ||
+        this._isSuccessfulAdvancedReplay('preorder', result)
+      );
+    }
+    if (type === 'theft') {
+      return status === 'committed' || this._isSuccessfulAdvancedReplay('theft', result);
+    }
+    if (type === 'sell') {
+      return status === 'committed' || this._isSuccessfulAdvancedReplay('sell', result);
+    }
+    return false;
   }
 
   _catalogErrorText(error) {
@@ -566,6 +874,15 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     this._data.merchants = [];
     this._data.inventory = [];
     this._data.selectedEntryId = null;
+    // M5: an actor switch also clears the local cart (each actor shops its own
+    // basket) and abandons any in-flight request/purchase for the previous actor.
+    this._data.cartLines = [];
+    this._data.pending = false;
+    this._pendingCatalogRequestId = null;
+    this._pendingPurchaseRequestId = null;
+    this._pendingPurchaseEntryId = null;
+    this._pendingAdvancedRequestId = null;
+    this._pendingAdvancedType = null;
     this.render({ force: true });
     await this._requestRefresh();
   }
@@ -747,6 +1064,315 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       this._stopSound();
     }
     this.render({ force: true });
+  }
+
+  // ---- M5 cart / special / service / preorder / theft / sell ------------------
+
+  /**
+   * Project the raw `_data.cartLines` to the display shape used by the cart panel.
+   * Each line is joined against the sanitized public catalog and the shop specials
+   * (never a private price): `name` from the entry, `unitPrice` from the entry
+   * price or, for a special line, the offer price, and `total` is the safe
+   * unit-price * quantity. A line whose entry is no longer in the catalog is
+   * skipped (`_pruneCart` keeps the raw list clean, but this is the display guard).
+   */
+  _cartDisplay() {
+    const inventory = this._data.inventory || [];
+    const specials = this._data.shop?.specials || [];
+    const byEntry = new Map(inventory.map((e) => [e.id, e]));
+    const bySpecial = new Map(specials.map((s) => [s.id, s]));
+    const out = [];
+    for (const line of this._data.cartLines || []) {
+      const entry = byEntry.get(line.entryId);
+      if (!entry) continue;
+      const special = line.specialId ? bySpecial.get(line.specialId) : null;
+      const unitPrice =
+        typeof special?.price === 'number' ? special.price : typeof entry.price === 'number' ? entry.price : 0;
+      const qty = line.quantity;
+      out.push({
+        entryId: line.entryId,
+        name: entry.name || (special ? special.title : ''),
+        quantity: qty,
+        unitPrice,
+        total: unitPrice * qty,
+        specialId: line.specialId || '',
+      });
+    }
+    return out;
+  }
+
+  _cartTotal() {
+    let total = 0;
+    for (const line of this._cartDisplay()) {
+      if (Number.isFinite(line.total)) total += line.total;
+    }
+    return total;
+  }
+
+  /**
+   * The locally selected OWNED Actor's embedded Items that can be sold or offered
+   * as barter. Only an item the GM has approved a buyback valuation for - present
+   * in the catalog's `shop.approvedItems` allowlist - is ever offered, and only a
+   * WHOLE item qualifies: the server rejects a stacked item (`system.quantity`
+   * must be absent or exactly 1), so a stacked item is excluded here too. Never
+   * reads the private store, and never exposes a client price (the GM-approved
+   * amount is applied server-side).
+   */
+  _sellableItems() {
+    const actor = this._selectedActor();
+    if (!actor) return [];
+    const approved = this._approvedItemIds();
+    const out = [];
+    for (const item of this._itemList(actor)) {
+      const qty = item?.system?.quantity;
+      if (qty != null && qty !== 1) continue;
+      // Only an item the GM has approved a valuation for may be sold or bartered.
+      if (!approved.has(item.id || item._id)) continue;
+      out.push({ id: item.id || item._id, name: item.name });
+    }
+    return out;
+  }
+
+  /**
+   * The set of `itemId`s the current catalog allows for sell/barter. This is the
+   * public `shop.approvedItems` allowlist (each `{itemId, amount}` projected by
+   * the server for the selected actor), never a raw valuation or a client price.
+   * A missing/invalid `approvedItems` list yields an empty set, so nothing is
+   * offered until a GM has approved at least one item.
+   */
+  _approvedItemIds() {
+    const list = this._data.shop?.approvedItems || [];
+    if (!Array.isArray(list)) return new Set();
+    return new Set(list.map((a) => a?.itemId).filter((id) => id != null));
+  }
+
+  _selectedActor() {
+    const actorId = this._data.selectedActorId;
+    if (!actorId) return null;
+    if (typeof this._deps.getActor === 'function') return this._deps.getActor(actorId) || null;
+    const list = game?.actors;
+    if (list && typeof list.get === 'function') return list.get(actorId) || null;
+    return null;
+  }
+
+  _itemList(actor) {
+    const items = actor?.items;
+    if (!items) return [];
+    if (typeof items.values === 'function') return Array.from(items.values());
+    if (Array.isArray(items)) return items;
+    if (typeof items[Symbol.iterator] === 'function') return Array.from(items);
+    return [];
+  }
+
+  /**
+   * `add-to-cart` on a catalog card. Adds the entry at the player's current
+   * quantity to the local cart (merging with an identical non-special line),
+   * never sending a request (price is decided server-side at checkout).
+   */
+  async _onAddToCart(event, target, data) {
+    const entryId = target?.dataset?.entryId || data?.dataset?.entryId;
+    if (!entryId) return;
+    const entry = (this._data.inventory || []).find((e) => e.id === entryId);
+    if (!entry) {
+      this._data.feedback = 'That item is no longer on display.';
+      this.render({ force: true });
+      return;
+    }
+    if (entry.available === false) {
+      this._data.feedback = 'That item is currently out of stock.';
+      this.render({ force: true });
+      return;
+    }
+    const quantity = this._readCartQuantity();
+    if (quantity == null) {
+      this._data.feedback = 'Cart quantity must be a whole number between 1 and 100.';
+      this.render({ force: true });
+      return;
+    }
+    if (!this._mergeCartLine(entryId, '', quantity)) {
+      this._data.feedback = 'Your cart is full (up to 20 distinct items).';
+      this.render({ force: true });
+      return;
+    }
+    this._data.feedback = '';
+    this.render({ force: true });
+  }
+
+  /**
+   * `add-special-to-cart` on a special offer card. Resolves the offer to its
+   * reference inventory entry (the special must match a visible catalog entry),
+   * then adds the line at the player's quantity with the `specialId` so the
+   * server can quote the offer price.
+   */
+  async _onAddSpecialToCart(event, target, data) {
+    const specialId = target?.dataset?.specialId || data?.dataset?.specialId;
+    if (!specialId) return;
+    const special = (this._data.shop?.specials || []).find((s) => s.id === specialId);
+    if (!special) {
+      this._data.feedback = 'That offer is no longer available.';
+      this.render({ force: true });
+      return;
+    }
+    const entry = (this._data.inventory || []).find((e) => e.id === special.entryId);
+    if (!entry || entry.visible === false) {
+      this._data.feedback = 'That offer is no longer available.';
+      this.render({ force: true });
+      return;
+    }
+    const quantity = this._readCartQuantity();
+    if (quantity == null) {
+      this._data.feedback = 'Cart quantity must be a whole number between 1 and 100.';
+      this.render({ force: true });
+      return;
+    }
+    if (!this._mergeCartLine(entry.id, special.id, quantity)) {
+      this._data.feedback = 'Your cart is full (up to 20 distinct items).';
+      this.render({ force: true });
+      return;
+    }
+    this._data.feedback = '';
+    this.render({ force: true });
+  }
+
+  /**
+   * `remove-from-cart`. Removes the single line addressed by its entry id,
+   * leaving every other line intact. Because a cart line is uniquely keyed by
+   * `entryId` (a `specialId` only refines that single entry's price), removal is
+   * by `entryId` alone and ignores any `specialId`.
+   */
+  async _onRemoveFromCart(event, target, data) {
+    const entryId = target?.dataset?.entryId || data?.dataset?.entryId;
+    if (!entryId) return;
+    this._data.cartLines = (this._data.cartLines || []).filter((l) => l.entryId !== entryId);
+    this._data.feedback = '';
+    this.render({ force: true });
+  }
+
+  /**
+   * `checkout-cart`. Sends the local cart lines (mapped to the server-allowlisted
+   * `{entryId, quantity, specialId}` shape, never a client price) plus an optional
+   * barter tender. The cart is cleared only on a committed/replay reply, never
+   * optimistically before the GM confirms.
+   */
+  async _onCheckoutCart(event, target, data) {
+    const lines = this._data.cartLines || [];
+    if (!lines.length) {
+      this._data.feedback = 'Your cart is empty.';
+      this.render({ force: true });
+      return;
+    }
+    const barterItemId = (this._readField('barterItemId') || '').trim();
+    const payload = {
+      lines: lines.map((l) => ({ entryId: l.entryId, quantity: l.quantity, specialId: l.specialId || '' })),
+    };
+    if (barterItemId) payload.barterItemId = barterItemId;
+    this._requestAdvanced('cart', payload);
+  }
+
+  /**
+   * `book-service`. Requests to book a shop service; the GM authoritatively
+   * debits the player and the service stays `booked` until the GM fulfills it.
+   */
+  async _onBookService(event, target, data) {
+    const serviceId = target?.dataset?.serviceId || data?.dataset?.serviceId;
+    if (!serviceId) return;
+    this._requestAdvanced('service', { serviceId });
+  }
+
+  /**
+   * `place-preorder`. Preorder entry comes from the card's `data-entry-id` or the
+   * `preorderEntryId` select. The selected entry must be preorder-eligible.
+   */
+  async _onPlacePreorder(event, target, data) {
+    const entryId = target?.dataset?.entryId || this._readField('preorderEntryId') || data?.dataset?.entryId;
+    if (!entryId) {
+      this._data.feedback = 'Choose an item to preorder.';
+      this.render({ force: true });
+      return;
+    }
+    const entry = (this._data.inventory || []).find((e) => e.id === entryId);
+    if (!entry || !entry.canPreorder) {
+      this._data.feedback = 'That item cannot be preordered right now.';
+      this.render({ force: true });
+      return;
+    }
+    const quantity = this._readQuantity();
+    if (quantity == null) {
+      this._data.feedback = 'Quantity must be a positive whole number.';
+      this.render({ force: true });
+      return;
+    }
+    this._requestAdvanced('preorder', { entryId, quantity });
+  }
+
+  /**
+   * `attempt-theft`. Theft entry comes from the card's `data-entry-id` or the
+   * `theftEntryId` select. The selected entry must be theft-eligible, and only a
+   * claim is sent - never a client-supplied outcome.
+   */
+  async _onAttemptTheft(event, target, data) {
+    const entryId = target?.dataset?.entryId || this._readField('theftEntryId') || data?.dataset?.entryId;
+    if (!entryId) {
+      this._data.feedback = 'Choose an item to attempt.';
+      this.render({ force: true });
+      return;
+    }
+    const entry = (this._data.inventory || []).find((e) => e.id === entryId);
+    if (!entry || !entry.canAttemptTheft) {
+      this._data.feedback = 'That item cannot be stolen right now.';
+      this.render({ force: true });
+      return;
+    }
+    this._requestAdvanced('theft', { entryId });
+  }
+
+  /**
+   * `sell-item`. Reads the selected owned Item id from the `sellItemId` select and
+   * asks the GM to buy back one whole item.
+   */
+  async _onSellItem(event, target, data) {
+    const itemId = (this._readField('sellItemId') || '').trim();
+    if (!itemId) {
+      this._data.feedback = 'Choose an item to sell.';
+      this.render({ force: true });
+      return;
+    }
+    this._requestAdvanced('sell', { itemId });
+  }
+
+  /**
+   * Merge a cart line for `entryId`/`specialId` at `quantity`. A cart line is
+   * uniquely identified by its `entryId` - at most one line may ever carry a given
+   * entry, regardless of `specialId`. Adding a line for an entry that is already in
+   * the cart updates that existing line: its `specialId` is replaced by the
+   * incoming `specialId` (an empty string resets it to a regular line) and its
+   * quantity is raised by `quantity`, capped at 100. A brand-new distinct entry is
+   * only added while fewer than 20 lines are present. Returns false when the cart
+   * is full for a new distinct entry.
+   */
+  _mergeCartLine(entryId, specialId, quantity) {
+    const lines = this._data.cartLines || (this._data.cartLines = []);
+    const existing = lines.find((l) => l.entryId === entryId);
+    if (existing) {
+      existing.specialId = specialId || '';
+      existing.quantity = Math.min(100, existing.quantity + quantity);
+      return true;
+    }
+    if (lines.length >= 20) return false;
+    lines.push({ entryId, quantity, specialId: specialId || '' });
+    return true;
+  }
+
+  /**
+   * A cart quantity is a positive safe integer in 1..100, read through the same
+   * live-field/bound-state path as a purchase but capped at the cart maximum.
+   * Returns null on an out-of-range/blank-invalid value so the caller can surface
+   * validation feedback instead of silently sending a wrong quantity.
+   */
+  _readCartQuantity() {
+    const n = this._readQuantity();
+    if (n == null) return null;
+    return n <= 100 ? n : null;
   }
 
   // ---- sound -------------------------------------------------------------------

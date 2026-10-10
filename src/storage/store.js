@@ -18,12 +18,14 @@ import {
   LEDGER_KIND,
   REPUTATION_KIND,
   REPUTATION_EVENT_KIND,
+  ADVANCED_ORDER_KIND,
   normalizeLocation,
   normalizeShop,
   normalizeInventoryEntry,
   normalizeLedgerRecord,
   normalizeReputation,
   normalizeReputationEvent,
+  normalizeAdvancedOrder,
   makeId,
 } from '../services/model.js';
 
@@ -85,6 +87,8 @@ export function createStore(docAccess) {
         return normalizeReputation(record);
       case REPUTATION_EVENT_KIND:
         return normalizeReputationEvent(record);
+      case ADVANCED_ORDER_KIND:
+        return normalizeAdvancedOrder(record);
       default:
         return record;
     }
@@ -295,6 +299,80 @@ export function createStore(docAccess) {
     return events.sort((a, b) => b.createdAt - a.createdAt);
   }
 
+  // --- Advanced commerce orders (M5) ---------------------------------------
+  // GM-owned, idempotent order records for the later M5 operations (bookable
+  // services, preorder execution, theft, specials and funds-aware buying). Each
+  // order is stored in its OWN GM-only JournalEntry (mirroring the ledger and
+  // reputation records), never embedded in the shop record, with no schema
+  // version bump - `SCHEMA_VERSION` stays `1`. Orders are keyed by their
+  // idempotency `key`, so a replayed `createAdvancedOrder` for the same key
+  // never creates a second JournalEntry (a caller that replays is expected to
+  // verify the `intentHash` before applying any side effect). No cross-GM
+  // atomicity is claimed: this is a read-then-create, not a server-side CAS.
+
+  async function findAdvancedOrderByKey(key) {
+    const records = await listRecords(ADVANCED_ORDER_KIND);
+    return records.find((r) => r.key === key) || null;
+  }
+
+  async function findAdvancedOrder(id) {
+    return findRecordByKindAndId(ADVANCED_ORDER_KIND, id);
+  }
+
+  async function listAdvancedOrders(
+    { shopId, actorId, status, kind, limit = 100, offset = 0 } = {}
+  ) {
+    let records = await listRecords(ADVANCED_ORDER_KIND);
+    if (shopId != null) records = records.filter((r) => r.shopId === shopId);
+    if (actorId != null) records = records.filter((r) => r.actorId === actorId);
+    if (status != null) records = records.filter((r) => r.status === status);
+    if (kind != null) records = records.filter((r) => r.kind === kind);
+    records = records.sort((a, b) => b.createdAt - a.createdAt);
+    // Newest first, and the result set is always bounded to at most 100 records
+    // (the documented cap). Callers may optionally pass a `limit`/`offset` for
+    // paging, but `limit` is clamped to the 100-record ceiling and non-positive
+    // values collapse to an empty page rather than a runaway slice.
+    const safeLimit = Math.max(0, Math.min(limit, 100));
+    const safeOffset = Math.max(0, offset);
+    return records.slice(safeOffset, safeOffset + safeLimit);
+  }
+
+  async function createAdvancedOrder(record) {
+    const normalized = normalizeAdvancedOrder(record);
+    // Keyed by idempotency key; never create a second order for an existing key
+    // (prevents duplicate JournalEntries on a race). Returns `{ record, created }`
+    // so callers can tell whether their key already existed.
+    const existing = await findAdvancedOrderByKey(normalized.key);
+    if (existing) return { record: existing, created: false };
+    const created = await insertRecord(
+      ADVANCED_ORDER_KIND,
+      normalized,
+      `Advanced Order: ${normalized.key}`
+    );
+    return { record: created, created: true };
+  }
+
+  async function updateAdvancedOrder(id, patch = {}) {
+    const doc = await findJournalByKindAndId(ADVANCED_ORDER_KIND, id);
+    if (!doc) return null;
+    const current = normalizeAdvancedOrder(flagScope(doc).record);
+    const nextRaw = { ...current, ...patch };
+    // Immutable fields: a patch may not change key/kind/shopId/actorId/userId/
+    // intentHash/createdAt. They are forced back to the persisted values.
+    nextRaw.key = current.key;
+    nextRaw.kind = current.kind;
+    nextRaw.shopId = current.shopId;
+    nextRaw.actorId = current.actorId;
+    nextRaw.userId = current.userId;
+    nextRaw.intentHash = current.intentHash;
+    nextRaw.createdAt = current.createdAt;
+    nextRaw.updatedAt = patch.updatedAt ?? Date.now();
+    const next = normalizeAdvancedOrder(nextRaw);
+    const flags = { schemaVersion: SCHEMA_VERSION, kind: ADVANCED_ORDER_KIND, record: next };
+    await docAccess.updateJournalEntry(doc, { flags: { [SCOPE]: flags } });
+    return next;
+  }
+
   return {
     listLocations,
     createLocation,
@@ -314,6 +392,11 @@ export function createStore(docAccess) {
     createReputationEvent,
     updateReputationEvent,
     listReputationEvents,
+    findAdvancedOrderByKey,
+    findAdvancedOrder,
+    listAdvancedOrders,
+    createAdvancedOrder,
+    updateAdvancedOrder,
     // Utility used by tests and the runtime to create ids.
     makeId,
   };
