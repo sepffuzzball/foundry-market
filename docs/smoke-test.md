@@ -385,12 +385,77 @@ client is the one that exercises the storefront.
 - No browser Fullscreen API permission prompt is shown.
 - The window is sized against the available viewport and resizes with the window.
 
-## 16. Summary / verdict
+## 16. M3 - Social, NPC and reputation wiring
 
-Record a pass/fail + notes row for each section. Take **all** sections (1-15) as
-the minimum signal for M1/M2 - do not claim completion on the strength of
+> **Status: Node-tested only.** The M3 social/NPC/reputation editor wiring and the
+> personalized storefront quote are verified by the automated `npm test` suite in
+> Node. This section is the intended real-runtime check.
+
+### 16.1 GM configures the shop social settings
+
+1. As the **GM**, open the Market Manager, select a shop, and set the social
+   config (primary/secondary personality, weights that sum to 100, shop markup)
+   and click **Save social**.
+2. Confirm the values persist after reopening the shop.
+3. Enter weights that do NOT sum to 100 (e.g. 70 + 20) and save.
+
+**Expected**
+
+- A valid social config is persisted under the per-shop lock, and the primary
+  (first) NPC's personality is synchronized to the chosen social primary without
+  touching any still-unsaved appearance draft.
+- An invalid weight sum shows a notice and does NOT write to the store.
+
+### 16.2 GM manages the merchant roster
+
+1. Add, edit and remove NPCs in the merchant roster; try to add a fourth.
+
+**Expected**
+
+- At most three merchants; adding a fourth shows a notice.
+- Saving normalizes each row (a bad portrait or blank name shows a notice and
+  does NOT write), and the owner string + social primary sync from the first
+  merchant.
+- Removing a merchant never deletes the shop and reassigns the owner to the new
+  primary.
+
+### 16.3 GM adjusts a character's reputation
+
+1. As the **GM**, pick a character in the reputation editor, set a non-zero delta
+   and a reason, and adjust.
+
+**Expected**
+
+- The reputation record updates, the history shows the committed entry (most
+  recent first, capped at 10) and the UI reloads the new standing.
+- A zero delta or a missing reason shows a notice and does not call the API.
+
+### 16.4 Player gets a personalized, private-free quote
+
+1. As the **player** owning an Actor, open the storefront and select that Actor.
+   Confirm the catalog now shows per-actor prices, a relationship panel with a
+   modifier text, and (when browsing an entry) a price breakdown
+   (base/adjustments/final, basis points as signed percentages).
+2. Switch to a different owned Actor and confirm the previous actor's prices /
+   standing do NOT bleed over, and the new quote appears after the refresh.
+3. Set the actor's standing to Hated (via the GM reputation editor) and confirm
+   the Buy buttons disable and a purchase is refused with a readable message.
+4. Confirm the storefront never shows the GM-only party id or a raw reputation
+   record.
+
+**Expected**
+
+- No private store data is exposed; only the public merchants and a sanitized
+  relationship reach the player.
+- A stale actor's catalog response is discarded (correlation on `requestId` +
+  `actorId`).
+
+## 17. Summary / verdict
+
+Record a pass/fail + notes row for each section. Take **all** sections (1-16) as
+the minimum signal for M1/M2/M3 - do not claim completion on the strength of
 `npm test` alone (that only mocks the Foundry boundaries). If you are about to
 run a real economy, treat sections 1, 4 (UI/hook shapes), 12 (last-item
-contention), 15.3/15.4 (M2 action dispatch) and the multi-GM concurrency note as
-mandatory, and confirm the two blockers in the intro are addressed before you
-trust a live economy to the module.
+contention), 15.3/15.4 (M2 action dispatch), 16.4 (M3 personalized quote) and
+the multi-GM concurrency note as mandatory, and confirm the two blockers in the
+intro are addressed before you trust a live economy to the module.

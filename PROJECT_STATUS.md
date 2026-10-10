@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.1`).
+  `download` release pointers, with `version` `0.1.2`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -110,7 +110,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.1/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.2/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -128,12 +128,15 @@ was never published because that tag's CI preview failed: both `0.1.0` runs of t
 `Release` workflow died in the `build` job's `npm test` step with `crypto is
 undefined` at `src/services/model.js:24` (`crypto.getRandomValues`), because the
 workflow ran on Node 18 where the Web Crypto global is not available. No `0.1.0`
-GitHub release was created, so the `0.1.0` download URL is superseded by `0.1.1`.
-The `0.1.1` release URL is only functional once that tag's `release` job has
-completed and published the `0.1.1` GitHub release (the workflow now sets up
-Node 22, where `crypto.getRandomValues` is available). Until then, install by
-pointing Foundry at the repo directory as a module source, or from the published
-release once it exists.
+GitHub release was created, so the `0.1.0` download URL is superseded by `0.1.1`,
+which was published as a prerelease (the workflow now sets up Node 22, where
+`crypto.getRandomValues` is available).
+
+The **`0.1.2` release is being prepared but not yet published**: the `0.1.2`
+download URL is live only once that tag's `release` job completes and publishes
+the `0.1.2` GitHub release. Until then, install by pointing Foundry at the repo
+directory as a module source, or from the published `0.1.2` release once it
+exists.
 
 ### Known issues / caveats
 
@@ -286,3 +289,241 @@ restoring the exact built-in 8.
 - Restock policy distinction and inventory replenishment.
 - Generic adapter documentation templates and possibly per-system defaults.
 - Recovery tooling to reconcile `needsRecovery` ledger entries.
+
+---
+
+## Milestone 3 - Social data & reputation/pricing engine (in progress)
+
+M3 adds the social data model, a pure reputation/pricing engine, and wires it
+into the authoritative catalog and purchase pricing. The M1/M2 integer `quote`
+remains the fallback purchase path for an un-wired runtime, but once the runtime
+supplies a reputation service the catalog personalizes per-actor prices and the
+purchase path quotes through `quoteSocial`, refusing a Hated reputation and
+persisting a validated `priceBreakdown`. Critically, M2 shop shape is preserved
+and `SCHEMA_VERSION` stays `1` - the new `npcs` and `social` fields are
+backward-compatible additions, so no schema migration is required and existing
+M2 shops load unchanged.
+
+### Implemented (M3)
+
+- Social engine modules:
+  - `src/social/personalities.js`: the ten fixed personality presets
+    (`honest`, `greedy`, `generous`, `helpful`, `suspicious`, `scornful`,
+    `proud`, `desperate`, `shrewd`, `eccentric`), each with a `label`,
+    `description`, integer mechanics (`markupBps`, `haggleDifficulty`,
+    `deceptionPenalty`, `repeatBonus`) and at least two `greetings`. The
+    mechanical numbers are distinct across presets. `getPersonality(id)` falls
+    back to `honest`, `isValidPersonality(id)` rejects unknown and
+    prototype-chain names, and `effectivePersonality(primary, secondary?,
+    secondaryWeight)` blends the mechanics weighted by `secondaryWeight`
+    (rounded to the nearest integer). No D&D-only rolls: the numbers are
+    system-agnostic basis points / integers.
+  - `src/social/reputation.js`: the ordered reputation band table (11 thresholds
+    from -100 Hated to 100 Loved), each with a basis-point price modifier and a
+    `refused` flag (only Hated refuses). Exports `clampReputation`,
+    `reputationBand` and `effectiveReputation` (weighted individual/party blend,
+    100% individual with no party, missing record treated as 0).
+  - `src/social/pricing.js`: the pure `quoteSocial(entry, quantity, { shop,
+    scores, haggleBps })` engine. Price order is base item price -> additive
+    shop/personality/reputation/haggle bps **once** (no compounding) -> integer
+    rounding **up** at the unit minor unit -> quantity. All integer math uses
+    BigInt intermediates, a free base stays 0, a positive base is never rounded
+    below 1 minor unit, and the final total is checked against
+    `Number.MAX_SAFE_INTEGER`. Each bps component is bounded to [-9000, 50000],
+    but the combined `adjustmentBps` is validated against the full additive
+    envelope [-36000, 200000] (4 x -9000 up to 4 x 50000) and retains the actual
+    raw sum for a transparent breakdown. For a combined discount of 100% or more
+    (`adjustmentBps <= -10000`) the price factor is clamped to zero before the
+    min-1 rounding, so a positive base is never priced at zero or negative, while
+    a free base stays 0. Returns the full integer breakdown plus `band: { title,
+    threshold }` and `refused` (true for a Hated reputation, which reports the
+    refusal without throwing).
+- Schema/normalization (`src/services/model.js`): `normalizeShop` now also
+  returns `npcs[]` (at most `MAX_SHOP_NPCS` = 3, first NPC is the primary owner)
+  and `social` (personality weights, party id, shop markup, auto-purchase
+  settings), with strict bounds and a strict percent sum
+  (`individualWeight + partyWeight === 100` when both are supplied). The legacy
+  `owner` string is preserved: on a legacy shop the primary NPC is created from
+  `owner`, the returned `owner` stays synchronized from the first NPC, and an
+  owner change made through the manager's legacy owner field is applied to the
+  primary NPC so no existing owner edit is lost. `store.updateShop` derives the
+  owner from the new primary NPC when a caller patches `npcs` without an explicit
+  `owner` (an explicit `owner` always wins, and a non-array `npcs` patch is
+  rejected), so a primary-NPC rename through the store API is never overwritten by
+  a stale persisted owner. No schema version bump.
+- GM reputation persistence & service (`src/services/model.js`,
+  `src/storage/store.js`, `src/social/service.js`): two new record kinds are
+  added - `reputation` (a per-entity score keyed by `(shopId, scope, subjectId)`
+  with the score clamped to [-100, 100]) and `reputationEvent` (one event per
+  change, carrying `previous`/`delta`/`next`, a `reason` capped at 200, a
+  `source` of `gm`/`purchase`/`haggle`, and `pending`/`committed`/
+  `needsRecovery` status). Each record and each event is stored in its OWN
+  GM-only JournalEntry (`ownership: { default: 0 }`), so there is no unbounded
+  embedded history and **no schema version bump** (`SCHEMA_VERSION` stays 1).
+  `shopId`/`subjectId` are validated non-empty, max 120 chars, free of control
+  characters; an `actor` subject id must be a world Actor UUID
+  (`/^Actor\.[A-Za-z0-9]+$/`) and a `party`/`faction` id must be a safe slug.
+  The store exports `getReputation`, `upsertReputation` (upsert by the
+  `(shopId, scope, subjectId)` triple, preserving the persisted id),
+  `findReputationEventByKey`, `createReputationEvent` (returns `{record,
+  created}`, never duplicating an existing key - mirroring `createLedger`),
+  `updateReputationEvent` and `listReputationEvents` (latest first).
+  `createReputationService` exposes `getEffective(shop, actorUuid)` (loads the
+  actor record and, only when `shop.social.partyId` is non-empty, the party
+  record, then blends them via the pure `effectiveReputation` + `reputationBand`)
+  and a manual, GM-only `adjust({shopId, scope, subjectId, delta, reason,
+  requestId, source?}, gmUserId)`. `adjust` validates `isGM` before any
+  read/write, validates the shop exists, and runs inside `runShopExclusive` (the
+  SAME per-shop lock purchases / GM manager edits use). It persists a `pending`
+  event before changing the score, then updates the record and marks the event
+  `committed`. A matching replay is idempotent and never reapplies the delta; the
+  same key with a different subject/delta/reason is a `conflict`. A failed record
+  update marks the event `needsRecovery` (old score kept) and a failed commit
+  leaves the event `pending`; a retry resumes without re-adding the delta.
+  Pending replay is hardened against clobbering a newer score: a resumed event is
+  only auto-finalized when the current score still equals its intended `next`
+  (mark committed) or exactly its `previous` with no later committed event for
+  the same (shop, scope, subject) (apply `next` once); any other state returns
+  `needsRecovery` `score-diverged` without writing the record/event (manual GM
+  reconciliation), and a new event is refused (`needsRecovery`) while any
+  pending/needsRecovery event exists for the same triple. No distributed
+  atomicity is claimed - it is an event log plus a score.
+- Tests (`tests/social.test.js`): covers the 10 distinct presets and
+  fallback/blend, reputation tiers/clamp/weights, shop social + NPC
+  normalization and legacy owner migration, the NPC limit, invalid-parameter
+  rejection, and the pure quote (additive bps, round-up, free base, min-1,
+  overflow, refusal), plus the combined-adjustment envelope (a max shop markup +
+  greedy personality no longer fails, an extreme negative discount floors at 1
+  minor unit without a negative price, and a free base stays 0).
+- Tests (`tests/reputation-store.test.js`): covers GM-only journal privacy,
+  invalid shop/subject id rejection, score clamping, independent actor/party
+  records, create/find/update event + latest-first list ordering, idempotent
+  duplicate-request replay and conflict, unauthorized (non-GM) rejection, and
+  update-failure / commit-failure `needsRecovery` + retry recovery without
+  re-applying the delta.
+
+### Constraints honored
+
+- The M3 wiring is additive and opt-in: `commerce.purchase` gains an optional
+  async `getSocial` plus the social `quoteSocial` (used only when `getSocial` is
+  present). Without `getSocial` (legacy/un-wired runtime) the M1/M2 integer
+  `quote` path is byte-for-byte unchanged and `priceBreakdown` stays `null`.
+- The storage layer is extended add-only: the existing location/shop/ledger
+  helpers and the M1 `quote` path are untouched; only new `reputation` /
+  `reputationEvent` record kinds and their store methods are added. The ledger
+  records a validated `priceBreakdown` (or `null`) on social purchases.
+- The catalog request handler personalizes only when an owned `actorId` is
+  supplied; with no actor it returns the existing base public catalog. No raw
+  reputation record, private `social` config, or `actorUuid` is ever leaked.
+- No client writes: reputation is read by the GM-side handlers only, and the
+  `reputation.adjust` API wrapper is GM-gated (`!game.user.isGM`) and always
+  passes `game.user.id`.
+- The manager and storefront UI are now wired for social/NPC/reputation: the
+  manager edits the social settings, a capped merchant roster and the GM-only
+  reputation editor; the storefront requests a personalized per-actor catalog,
+  rejects a stale-actor response, and derives display-only `priceLines` and a
+  `relationship.modifierText` from the public response. The M1 purchase flow and
+  the M2 layout/themes are unchanged.
+- No raw socket; no coupling to the M1/M2 transaction semantics beyond the
+  opt-in social quote.
+- No unbounded embedded history - each reputation record/event is its own
+  GM-only JournalEntry.
+- No false distributed/transactional atomicity claim - reputation is an event log
+  plus a score, and the recovery boundary is inspectable on the event record.
+- No D&D-only rolls; all reputation and pricing numbers are system-agnostic.
+- No UI placeholders. `SCHEMA_VERSION` remains 1.
+
+### Implemented (M3 wiring)
+
+- Runtime wiring (`src/core/main.js`): `createReputationService` is constructed
+  with `{store, runShopExclusive, isGM, makeId, now}` and the request-handler
+  context is extended with `getActor`, `actorOwnedBy`, and `getSocial` (the
+  effective-reputation read). No auto-purchase reputation mutation is wired yet.
+- API surface (`src/core/main.js`): `api.reputation` exposes read `getEffective`
+  and a GM-only `adjust` wrapper (rejects `!game.user.isGM` before any read/write
+  and always passes `game.user.id`); `api.getReputation(shopId, actorId)` and
+  `api.quotePrice(shopId, entryId, actorId, qty)` are exposed for owned-actors
+  only.
+- Catalog personalization (`src/core/requests.js`): an optional
+  `request.actorId` is validated (exists and owned by the requester or a GM)
+  before any reputation read; with an owned actor the handler reads the effective
+  reputation, `quoteSocial`s each visible entry at quantity 1, and returns a
+  sanitized `relationship` plus per-entry personalized `price`, `basePrice`,
+  `priceBreakdown`, and `canBuy`. Hidden entries stay omitted and any quote
+  failure fails closed as a correlated `server-error`. Responses echo `actorId`
+  so a storefront rejects a stale-actor response.
+- Purchase pricing (`src/services/commerce.js`): with `getSocial` present the
+  purchase quotes through `quoteSocial` from the actor's live reputation (never a
+  client price), refuses a Hated reputation with `service-refused` before any
+  debit, and persists the validated `priceBreakdown` in the ledger pending/outcome
+  and the purchase response. Compensation uses the charged total.
+- Ledger modeling (`src/services/model.js`): `normalizePriceBreakdown` strictly
+  validates a breakdown (signed bps fields, non-negative monetary/total fields,
+  non-empty band title when a band is present, integer threshold, boolean
+  `refused`), bounding the combined `adjustmentBps` to the full additive envelope
+  [-36000, 200000] while each component bps field keeps its [-9000, 50000]/min
+  bound, and `normalizeLedgerRecord` preserves a validated `priceBreakdown` or
+  `null` - never raw arbitrary JSON.
+- Tests (`tests/core.test.js`): owned/unowned actor catalog personalization,
+  hidden-entry privacy, neutral legacy catalog + legacy-owner merchant projection,
+  quote-failure fail-closed, `normalizeLedgerRecord`/`normalizePriceBreakdown`
+  validation (including the combined `adjustmentBps` envelope [-36000, 200000]),
+  social-discount purchase (charged total + exact ledger breakdown),
+  Hated `service-refused` refusal, stale-catalog-not-trusted re-quote, and the
+  legacy (no `getSocial`) null-breakdown path.
+- UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
+  `templates/manager.hbs`, `templates/shop.hbs`): the manager persists social
+  settings from `.social-panel` via `normalizeShopSocial` under the per-shop lock
+  (weights must sum to 100, shop markup is a signed bps integer), merging the
+  existing shop's `autoPurchase` (not editable in the panel) back into the
+  normalized social before validating so a social save never resets it, and
+  leaving the unsaved form intact on a validation error, and adds/edits/removes
+  NPCs capped at `MAX_SHOP_NPCS`, syncs the `owner` string and social primary to the
+  first merchant on add/save, and on remove-npc reassigns the owner to the
+  promoted primary and syncs `social.primaryPersonality` to their personality
+  (leaving the shop's social primary unchanged when the roster empties), and
+  exposes a GM reputation editor that loads `reputationActors` and reads the
+  GM-only effective reputation plus committed history through the store.
+  `adjust-reputation` validates a non-zero integer delta and a non-empty
+  <=200-char reason before calling the GM-only `reputation.adjust`. The storefront
+  snapshots `_data.selectedActorId` (never the actor `<select>` DOM) into the
+  catalog request `actorId` (undefined/blank -> null, requesting the base public
+  catalog with no reputation leak), auto-selects the first owned actor exactly
+  once on open (only while no choice has been made), keeps an explicit
+  blank/null selection blank through re-renders, clears per-actor data on switch,
+  correlates responses on `requestId` + the echoed `actorId` against the same
+  `_data.selectedActorId` snapshot, refuses a `canBuy false` (Hated) entry in
+  `_requestPurchase`, maps a `service-refused` error to a readable message, and
+  derives display-only `priceLines`/`relationship.modifierText` from the public
+  response without leaking private store data.
+- Tests (`tests/ui.test.js`): the runtime GM API guard test plus coverage of the
+  M3 manager social save (weight-sum error, non-default `autoPurchase` retention,
+  and leaving the unsaved form intact on a validation error), NPC
+  cap/primary-sync/save-npcs normalization, remove-npc owner reassignment, manual
+  reputation adjust validation, and the storefront actor-switch personalized
+  quote, privacy, refusal, stale-actor rejection and the unchanged M1 purchase
+  flow.
+
+### Remaining M3
+
+M3 is **wired but not complete**. The reputation/pricing engine, the social/NPC
+model and the GM reputation/merchant editors are in place, but the following are
+still **not yet built**:
+
+- Haggling with a system-native/GM resolution. No haggle mechanic runs yet:
+  `haggleDifficulty`/`haggleBps` exist as data, but nothing performs a haggle
+  check or negotiates a price.
+- Automatic purchase reputation gains with cooldown/anti-farm. A purchase does not
+  yet change the buyer's reputation; there is no gain-on-purchase mutation and no
+  cooldown / repeat-purchase anti-farm guard.
+- Trait/faction reputation rules. Only actor and party records exist; there are no
+  faction records or trait-driven modifiers.
+- Configurable band thresholds. The 11-threshold reputation band table is fixed;
+  it is not yet GM-configurable.
+- Per-NPC relationships. NPC-level reputation records and their per-NPC personality
+  effect are not yet surfaced in the manager/storefront UI (the editor is wired,
+  but NPC-level records are not displayed).
+- Cross-system social roll verification. The social and pricing numbers are
+  system-agnostic basis points/integers, but no system-native social roll (e.g. a
+  D&D/DC20 check) is used or verified.
+- Auto-purchase settings surfaced in the storefront.

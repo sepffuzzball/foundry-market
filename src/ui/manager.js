@@ -10,14 +10,15 @@
 //     falls back to reading `game.modules.get('market').api` and Foundry globals.
 
 import { shopDragData } from '../canvas/placements.js';
-import { ACCENT_COLOR_RE } from '../services/model.js';
 import {
-  getTheme,
-  THEME_IDS,
-  normalizeTheme,
-  normalizeAppearance,
-  sanitizeMediaPath,
-} from '../themes/registry.js';
+  ACCENT_COLOR_RE,
+  MAX_SHOP_NPCS,
+  makeId,
+  normalizeNpc,
+  normalizeShopSocial,
+} from '../services/model.js';
+import { getTheme, THEME_IDS, normalizeTheme, normalizeAppearance, sanitizeMediaPath } from '../themes/registry.js';
+import { PERSONALITY_IDS, getPersonality } from '../social/personalities.js';
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 
@@ -88,6 +89,12 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       'preview-appearance': this._action('_onPreviewAppearance'),
       'reset-preview': this._action('_onResetPreview'),
       'browse-media': this._action('_onBrowseMedia'),
+      'save-social': this._action('_onSaveSocial'),
+      'add-npc': this._action('_onAddNpc'),
+      'save-npcs': this._action('_onSaveNpcs'),
+      'remove-npc': this._action('_onRemoveNpc'),
+      'select-reputation-actor': this._action('_onSelectReputationActor'),
+      'adjust-reputation': this._action('_onAdjustReputation'),
     },
   };
 
@@ -113,6 +120,15 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       // re-render never resets the GM's in-progress edits. Cleared on reset,
       // shop/location switch and a successful save.
       draftShop: null,
+      // M3 social context. `personalityOptions` drives the primary/secondary/NPC
+      // personality dropdowns from the canonical preset ids; the reputation editor
+      // loads its actors, selected actor, current record and recent history once a
+      // character is chosen (see `_loadReputation`).
+      personalityOptions: PERSONALITY_IDS.map((id) => ({ id, label: getPersonality(id).label })),
+      reputationActors: [],
+      selectedReputationActorId: null,
+      selectedReputation: null,
+      reputationHistory: [],
       notice: '',
     };
   }
@@ -198,6 +214,38 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     const run = this._runShopExclusive;
     if (typeof run === 'function') return run(shopId, fn);
     return fn();
+  }
+
+  // ---- M3 social / reputation lazy accessors ---------------------------------
+
+  _listActors() {
+    if (this._deps.listActors) return this._deps.listActors();
+    const out = [];
+    for (const actor of game?.actors ?? []) {
+      out.push({ id: actor.id, name: actor.name, uuid: actor.uuid });
+    }
+    return out;
+  }
+
+  _getActor(id) {
+    if (this._deps.getActor) return this._deps.getActor(id);
+    return game?.actors?.get?.(id) || null;
+  }
+
+  _getReputation(shopId, actorId) {
+    if (this._deps.getReputation) return this._deps.getReputation(shopId, actorId);
+    return this._api()?.getReputation?.(shopId, actorId);
+  }
+
+  _adjustReputation(params) {
+    if (this._deps.adjustReputation) return this._deps.adjustReputation(params);
+    return this._api()?.reputation?.adjust?.(params);
+  }
+
+  _formatDate(ts) {
+    const d = new Date(Number(ts));
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toISOString().slice(0, 10);
   }
 
   _getDragEventData(event) {
@@ -287,6 +335,7 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     }
     this._bindDnd();
     this._bindShopForm();
+    this._bindReputationActor();
     this._applyPreviewStyles();
   }
 
@@ -342,6 +391,20 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
       previewShop: null,
       notice: '',
     };
+    // M3: refresh the reputation-actor selector and, when a character is still
+    // selected, re-read their (GM-only) effective reputation and recent history
+    // so the editor never shows a stale record for a different actor/shop.
+    const actors = this._listActors();
+    const kept = this._data.selectedReputationActorId;
+    let selectedReputationActorId = actors.find((a) => a.id === kept) ? kept : actors[0]?.id || null;
+    this._data.reputationActors = actors;
+    this._data.selectedReputationActorId = selectedReputationActorId;
+    if (selectedReputationActorId) {
+      await this._loadReputation(selectedReputationActorId);
+    } else {
+      this._data.selectedReputation = null;
+      this._data.reputationHistory = [];
+    }
   }
 
   async _refreshPickerItems() {
@@ -770,6 +833,413 @@ export class MarketManager extends HandlebarsApplicationMixin(ApplicationV2) {
     // appearance value. Reads from the live DOM (used by callers that do not
     // capture a draft, e.g. the tests).
     return this._validateShopForm(this._captureShopForm());
+  }
+
+  // ---- M3 social settings -----------------------------------------------------
+
+  /**
+   * Read the RAW values of the social settings from the `.social-panel` ONLY.
+   * No validation is performed; the caller feeds the result to
+   * `normalizeShopSocial` and surfaces any error. Scope is deliberately limited to
+   * the social panel so an inventory row or shop-details input with the same name
+   * can never contaminate the read.
+   */
+  _readSocialPanel() {
+    const panel = this.element?.querySelector?.('.social-panel');
+    if (!panel || typeof panel.querySelector !== 'function') return {};
+    const val = (name) => panel.querySelector(`[name="${name}"]`)?.value;
+    const num = (name) => {
+      const v = val(name);
+      if (v === '' || v == null) return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    return {
+      primaryPersonality: val('primaryPersonality'),
+      secondaryPersonality: val('secondaryPersonality'),
+      secondaryWeight: num('secondaryWeight'),
+      individualWeight: num('individualWeight'),
+      partyWeight: num('partyWeight'),
+      partyId: val('partyId'),
+      shopMarkupBps: num('shopMarkupBps'),
+    };
+  }
+
+  /**
+   * Save the social settings read from the `.social-panel`. The values are
+   * normalized/validated (weights must sum to 100, the shop markup may be a signed
+   * basis-point integer), then written as a metadata patch under the shared
+   * per-shop lock. The existing shop's `autoPurchase` (not editable in the panel)
+   * is merged into the normalized social before validation, so a social save never
+   * resets it to defaults. The primary (first) NPC's personality is synchronized to
+   * the social primary personality, and any in-progress unsaved appearance draft is
+   * preserved (never cleared by a social save). On a validation error the notice is
+   * surfaced and the unsaved panel edit is left intact.
+   */
+  async _onSaveSocial(event, target, data) {
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    const raw = this._readSocialPanel();
+    let message = '';
+    let failed = false;
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when saving social settings.';
+        return;
+      }
+      // The social panel exposes only personality/weights/partyId/markup.
+      // `autoPurchase` is not editable in the panel, so merge the EXISTING shop's
+      // autoPurchase into the normalized social before validating, otherwise a
+      // social save silently resets it to defaults. The merged object is validated
+      // fresh via `normalizeShopSocial`; on a validation error the notice is shown
+      // and the unsaved panel edit is left intact (no data refresh).
+      let social;
+      try {
+        social = normalizeShopSocial({
+          ...raw,
+          autoPurchase: shop.social?.autoPurchase,
+        });
+      } catch (err) {
+        failed = true;
+        this._data.notice = err?.message
+          ? String(err.message).replace(/^\[market\]\s*/, '')
+          : 'Invalid social settings.';
+        this.render({ force: true });
+        return;
+      }
+      const npcs = (shop.npcs || []).map((n, i) =>
+        i === 0 ? { ...n, personality: social.primaryPersonality } : n
+      );
+      await this._store.updateShop(shopId, { social, npcs });
+    });
+    // The `return` above only exits the lock callback, so a validation failure must
+    // be flagged out of the lock: on failure we never refresh (which would reset the
+    // GM's unsaved panel edit) and we keep the already-shown validation notice.
+    if (failed) return;
+    // `_refreshData` is reached only after a successful write (or a shop-not-found
+    // message), so an error path never resets the GM's unsaved panel edit.
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  // ---- M3 merchant (NPC) editor -----------------------------------------------
+
+  /**
+   * Read every merchant row (`[data-npc-id]`) in the merchant roster. Each row
+   * carries the editable NPC inputs; this returns the raw values so the caller can
+   * validate and normalize them.
+   */
+  _readNpcRows() {
+    const root = this.element;
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    return Array.from(root.querySelectorAll('.npc-list [data-npc-id]')).map((row) => ({
+      id: row.dataset.npcId,
+      npcName: row.querySelector('[name="npcName"]')?.value ?? '',
+      npcRole: row.querySelector('[name="npcRole"]')?.value ?? '',
+      npcActorUuid: row.querySelector('[name="npcActorUuid"]')?.value ?? '',
+      npcPortrait: row.querySelector('[name="npcPortrait"]')?.value ?? '',
+      npcGreeting: row.querySelector('[name="npcGreeting"]')?.value ?? '',
+      npcPersonality: row.querySelector('[name="npcPersonality"]')?.value ?? '',
+      npcVisible: !!row.querySelector('[name="npcVisible"]')?.checked,
+    }));
+  }
+
+  _normalizeNpcRow(row) {
+    return normalizeNpc({
+      id: row.id,
+      name: row.npcName,
+      role: row.npcRole,
+      actorUuid: row.npcActorUuid,
+      portrait: row.npcPortrait,
+      greeting: row.npcGreeting,
+      personality: row.npcPersonality,
+      visible: row.npcVisible,
+    });
+  }
+
+  /**
+   * Add a new merchant row. The row is persisted immediately under the shared
+   * per-shop lock so it carries a generated id and survives a re-render; the name
+   * defaults to "New merchant" so the canonical NPC normalization (which requires a
+   * non-empty name) never rejects a just-added blank row. At most MAX_SHOP_NPCS
+   * merchants are allowed.
+   */
+  async _onAddNpc(event, target, data) {
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when adding a merchant.';
+        return;
+      }
+      if (shop.npcs.length >= MAX_SHOP_NPCS) {
+        message = 'A shop can have at most three merchants.';
+        return;
+      }
+      const social = shop.social || {};
+      const npc = normalizeNpc({
+        name: 'New merchant',
+        role: '',
+        actorUuid: '',
+        portrait: '',
+        greeting: '',
+        personality: social.primaryPersonality || 'honest',
+        visible: true,
+      });
+      const npcs = [...shop.npcs, npc];
+      await this._store.updateShop(shopId, { npcs, owner: npcs[0].name });
+    });
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Save the merchant roster read from the DOM. Each row is validated via
+   * `normalizeNpc` (an invalid portrait path or a blank name surfaces an error
+   * notice instead of writing), the list is capped at MAX_SHOP_NPCS, and the shop
+   * is updated under the shared per-shop lock with the synced owner string. The
+   * social primary personality is synchronized from the first merchant.
+   */
+  async _onSaveNpcs(event, target, data) {
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let npcs;
+    try {
+      npcs = this._readNpcRows().map((row) => this._normalizeNpcRow(row));
+    } catch (err) {
+      this._data.notice = err?.message
+        ? String(err.message).replace(/^\[market\]\s*/, '')
+        : 'Invalid merchant data.';
+      this.render({ force: true });
+      return;
+    }
+    npcs = npcs.slice(0, MAX_SHOP_NPCS);
+    const owner = npcs.length > 0 ? npcs[0].name : '';
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when saving merchants.';
+        return;
+      }
+      const social = shop.social || {};
+      const primaryPersonality = npcs.length > 0 ? npcs[0].personality : social.primaryPersonality;
+      await this._store.updateShop(shopId, {
+        npcs,
+        owner,
+        social: { ...social, primaryPersonality },
+      });
+    });
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  /**
+   * Remove a merchant (including the primary). The remaining merchants keep their
+   * order, and the `owner` string is reassigned to the new first merchant's name
+   * (or '' when the roster becomes empty). When the primary merchant was removed
+   * and merchants remain, the promoted first merchant's personality is
+   * synchronized into `social.primaryPersonality` within the same lock; when no
+   * merchants remain the shop's `social.primaryPersonality` is left unchanged.
+   * The shop itself is never deleted.
+   */
+  async _onRemoveNpc(event, target, data) {
+    const npcId = target?.dataset?.npcId || data?.dataset?.npcId;
+    if (!npcId) return;
+    const shopId = this._data.selectedShopId;
+    if (!shopId) return;
+    let message = '';
+    await this._withShopLock(shopId, async () => {
+      const shop = await this._store.findShop(shopId);
+      if (!shop) {
+        message = 'Shop not found when removing a merchant.';
+        return;
+      }
+      const npcs = shop.npcs.filter((n) => n.id !== npcId);
+      const owner = npcs.length > 0 ? npcs[0].name : '';
+      const patch = { npcs, owner };
+      // If the removed merchant was the primary, promote the new first NPC and
+      // keep the social primary personality in sync with it. When no merchants
+      // remain, leave the shop's social primary personality unchanged.
+      if (npcs.length > 0) {
+        patch.social = { ...(shop.social || {}), primaryPersonality: npcs[0].personality };
+      }
+      await this._store.updateShop(shopId, patch);
+    });
+    await this._refreshData();
+    this._data.notice = message;
+    this.render({ force: true });
+  }
+
+  // ---- M3 reputation editor ----------------------------------------------------
+
+  /**
+   * Load the GM-only reputation view for `actorId`. Obtains the actor's UUID,
+   * reads the effective reputation via the API (or injected `deps.getReputation`),
+   * and reads the committed/manual event history via the store. Defaults to a
+   * Neutral record when no record exists, and never throws - a read failure simply
+   * clears the selected record rather than blocking the editor.
+   */
+  async _loadReputation(actorId) {
+    const shopId = this._data.selectedShopId;
+    if (!actorId || !shopId) {
+      this._data.selectedReputation = null;
+      this._data.reputationHistory = [];
+      return;
+    }
+    const actor = await this._getActor(actorId);
+    if (!actor) {
+      this._data.selectedReputation = null;
+      this._data.reputationHistory = [];
+      return;
+    }
+    const uuid = actor.uuid;
+    let effective = null;
+    try {
+      effective = await this._getReputation(shopId, actor.id);
+    } catch (err) {
+      effective = null;
+    }
+    let events = [];
+    if (typeof this._store?.listReputationEvents === 'function') {
+      try {
+        events = await this._store.listReputationEvents({
+          shopId,
+          scope: 'actor',
+          subjectId: uuid,
+        });
+      } catch (err) {
+        events = [];
+      }
+    }
+    // Default neutral on a missing record.
+    const rep = effective || { score: 0, band: { title: 'Neutral' }, individual: 0, party: 0 };
+    this._data.selectedReputation = {
+      title: rep.band?.title || 'Neutral',
+      score: typeof rep.score === 'number' ? rep.score : 0,
+      individual: typeof rep.individual === 'number' ? rep.individual : 0,
+      party: typeof rep.party === 'number' ? rep.party : 0,
+    };
+    // History: only committed (manual/GM) records, most recent first, capped at 10.
+    this._data.reputationHistory = events
+      .filter((e) => e.status === 'committed')
+      .slice(0, 10)
+      .map((e) => ({
+        reason: String(e.reason ?? ''),
+        delta: e.delta,
+        createdAt: this._formatDate(e.createdAt),
+      }));
+  }
+
+  async _onSelectReputationActor(event, target, data) {
+    const id = target?.value ?? target?.dataset?.reputationActorId;
+    this._data.selectedReputationActorId = id || null;
+    await this._loadReputation(id || null);
+    this.render({ force: true });
+  }
+
+  /**
+   * Bind the `change` event on the reputation actor `<select>` so a character
+   * choice loads the GM-only reputation view. This replaces the previous
+   * `data-action="select-reputation-actor"` click action, which a `<select>` never
+   * fires as expected: ApplicationV2 dispatches data-action handlers on click, but
+   * a native `<select>` opening/choosing does not produce a click on the element
+   * itself, so the selection must drive through its native change event. A stable
+   * marker prevents a duplicate listener from stacking when the same DOM node
+   * survives a re-render.
+   */
+  _bindReputationActor() {
+    const root = this.element;
+    if (!root || typeof root.querySelector !== 'function') return;
+    const select = root.querySelector('[name="reputationActorId"]');
+    if (!select || typeof select.addEventListener !== 'function') return;
+    if (select.__marketReputationBound) return;
+    select.__marketReputationBound = true;
+    select.addEventListener('change', () => this._onSelectReputationActor(null, select, {}));
+  }
+
+  _readReputationAdjust() {
+    const root = this.element;
+    const deltaField = root?.querySelector?.('[name="reputationDelta"]');
+    const reasonField = root?.querySelector?.('[name="reputationReason"]');
+    let delta = undefined;
+    if (deltaField) {
+      const v = deltaField.value;
+      delta = v === '' || v == null ? undefined : Number(v);
+    }
+    return { delta, reason: String(reasonField?.value ?? '').trim() };
+  }
+
+  /**
+   * Apply a manual GM reputation adjustment for the selected actor. Validates a
+   * selected actor, a non-zero signed safe-integer delta and a non-empty reason of
+   * at most 200 chars, then invokes the GM-only `reputation.adjust` mutation with a
+   * fresh idempotency `requestId` and reloads the reputation view. A
+   * pending/recovery outcome surfaces in the notice; a committed or replayed one
+   * clears it.
+   */
+  async _onAdjustReputation(event, target, data) {
+    const shopId = this._data.selectedShopId;
+    const actorId = this._data.selectedReputationActorId;
+    if (!shopId || !actorId) {
+      this._data.notice = 'Select a character to adjust.';
+      this.render({ force: true });
+      return;
+    }
+    const { delta, reason } = this._readReputationAdjust();
+    if (!Number.isSafeInteger(delta) || delta === 0) {
+      this._data.notice = 'Adjustment must be a non-zero whole number.';
+      this.render({ force: true });
+      return;
+    }
+    if (!reason) {
+      this._data.notice = 'A reason is required for a reputation adjustment.';
+      this.render({ force: true });
+      return;
+    }
+    if (reason.length > 200) {
+      this._data.notice = 'The reason must be 200 characters or fewer.';
+      this.render({ force: true });
+      return;
+    }
+    const actor = await this._getActor(actorId);
+    if (!actor) {
+      this._data.notice = 'Character not found for the reputation adjustment.';
+      this.render({ force: true });
+      return;
+    }
+    let result;
+    try {
+      result = await this._adjustReputation({
+        shopId,
+        scope: 'actor',
+        subjectId: actor.uuid,
+        delta,
+        reason,
+        requestId: makeId(),
+      });
+    } catch (err) {
+      this._data.notice = `Reputation adjustment failed: ${(err && err.message) || err}`;
+      this.render({ force: true });
+      return;
+    }
+    const status = result?.status;
+    if (status === 'committed' || status === 'replay') {
+      this._data.notice = '';
+      await this._loadReputation(actorId);
+    } else if (status === 'needsRecovery' || status === 'pending') {
+      this._data.notice = `Reputation adjustment needs recovery (${result?.error || 'pending'}).`;
+      await this._loadReputation(actorId);
+    } else {
+      this._data.notice = `Reputation adjustment failed (${result?.error || 'unknown'}).`;
+    }
+    this.render({ force: true });
   }
 
   // ---- drag / drop wiring -----------------------------------------------------

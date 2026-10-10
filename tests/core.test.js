@@ -17,6 +17,7 @@ import {
   normalizeShop,
   normalizeInventoryEntry,
   normalizeLedgerRecord,
+  normalizePriceBreakdown,
   makeId,
   assertStockMode,
 } from '../src/services/model.js';
@@ -43,6 +44,7 @@ import {
 } from '../src/services/commerce.js';
 import {
   buildCatalog,
+  publicShop,
   publicPurchaseResult,
   handleMarketChatMessage,
   PUBLIC_ENTRY_FIELDS,
@@ -741,6 +743,7 @@ test('purchase response only exposes safe fields, never the raw ledger record', 
     total: 200,
     quantity: 2,
     compensation: undefined,
+    priceBreakdown: null,
   });
   assert.ok(!('record' in result), 'no raw record leaked');
   assert.ok(!('existing' in result), 'no raw conflict record leaked');
@@ -1148,6 +1151,67 @@ test('buildCatalog never supplies unvalidated raw input to the projection', () =
   assert.ok(Object.values(appearance).every((v) => typeof v === 'string'));
 });
 
+test('a hidden primary NPC never leaks its name in shop.owner or merchants', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'The Quiet Shop',
+    locationId: 'loc1',
+    owner: 'Borin the Smith',
+    npcs: [
+      { name: 'Borin the Smith', visible: false },
+      { name: 'Mira the Clerk', role: 'Clerk', visible: true },
+    ],
+    inventory: [],
+  });
+  const catalog = buildCatalog(shop);
+  assert.equal(catalog.shop.owner, '', 'hidden primary owner is blanked');
+  assert.ok(
+    !catalog.merchants.some((m) => m.name === 'Borin the Smith'),
+    'hidden primary not in merchants'
+  );
+  assert.equal(catalog.merchants.length, 1, 'only visible merchants project');
+  assert.equal(catalog.merchants[0].name, 'Mira the Clerk');
+});
+
+test('a hidden primary NPC never leaks its name or portrait through the public shop', () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'The Quiet Shop',
+    locationId: 'loc1',
+    owner: 'Borin the Smith',
+    appearance: {
+      backgroundImage: 'modules/apothecary/img/bg.png',
+      ownerPortrait: 'icons/borin.png',
+      welcomeMessage: 'Welcome to the quiet shop.',
+    },
+    npcs: [
+      { name: 'Borin the Smith', portrait: 'icons/borin.png', visible: false },
+      { name: 'Mira the Clerk', role: 'Clerk', portrait: 'icons/mira.png', visible: true },
+    ],
+    inventory: [],
+  });
+  // The catalog projection is the same as publicShop's output (publicShop is
+  // embedded in the catalog via buildCatalog), so assert both direct and catalog
+  // projections blank the hidden primary's name AND portrait.
+  const direct = publicShop(shop);
+  assert.equal(direct.owner, '', 'direct projection blanks the hidden primary owner');
+  assert.equal(direct.appearance.ownerPortrait, '', 'direct projection blanks the hidden primary portrait');
+
+  const catalog = buildCatalog(shop);
+  assert.equal(catalog.shop.owner, '', 'catalog blanks the hidden primary owner');
+  assert.equal(catalog.shop.appearance.ownerPortrait, '', 'catalog blanks the hidden primary portrait');
+  // Other appearance fields and visible-NPC behavior remain intact.
+  assert.equal(catalog.shop.appearance.backgroundImage, 'modules/apothecary/img/bg.png', 'background preserved');
+  assert.equal(catalog.shop.appearance.welcomeMessage, 'Welcome to the quiet shop.', 'welcomeMessage preserved');
+  assert.ok(
+    !catalog.merchants.some((m) => m.name === 'Borin the Smith'),
+    'hidden primary not in merchants'
+  );
+  assert.equal(catalog.merchants.length, 1, 'only visible merchants project');
+  assert.equal(catalog.merchants[0].name, 'Mira the Clerk');
+  assert.equal(catalog.merchants[0].portrait, 'icons/mira.png', 'visible merchant portrait preserved');
+});
+
 // ------------------------------------------------------------------- schema
 
 test('normalizeLedgerRecord enforces status and key', () => {
@@ -1244,6 +1308,57 @@ test('store shops, inventory and findShop round-trip', async () => {
   assert.equal(otherLoc.length, 0);
 });
 
+test('store updateShop derives owner from the new primary NPC when npcs are patched without an owner', async () => {
+  const store = createStore(createFakeDocAccess());
+  const shop = await store.createShop({
+    name: 'S',
+    locationId: 'loc1',
+    owner: 'Old Owner',
+    npcs: [
+      { name: 'Old Owner', personality: 'honest' },
+      { name: 'Tavi', personality: 'honest' },
+    ],
+  });
+  assert.equal(shop.owner, 'Old Owner');
+  assert.equal(shop.npcs[0].name, 'Old Owner');
+  // Patch the primary NPC's name (and roster) WITHOUT an explicit owner. The
+  // derived owner must come from the new primary, never the stale persisted
+  // owner string (which used to be re-applied onto npcs[0].name).
+  const updated = await store.updateShop(shop.id, {
+    npcs: [
+      { name: 'Renamed', personality: 'generous' },
+      { name: 'Tavi', personality: 'honest' },
+    ],
+  });
+  assert.equal(updated.npcs[0].name, 'Renamed', 'primary NPC name preserved through the patch');
+  assert.equal(updated.owner, 'Renamed', 'owner derived from the new primary NPC name');
+});
+
+test('store updateShop lets an explicit owner win over the derived primary NPC name', async () => {
+  const store = createStore(createFakeDocAccess());
+  const shop = await store.createShop({
+    name: 'S',
+    locationId: 'loc1',
+    owner: 'Old',
+    npcs: [{ name: 'Old', personality: 'honest' }],
+  });
+  const updated = await store.updateShop(shop.id, {
+    npcs: [{ name: 'Newly', personality: 'honest' }],
+    owner: 'Explicit Owner',
+  });
+  assert.equal(updated.owner, 'Explicit Owner', 'an explicit owner wins');
+  assert.equal(updated.npcs[0].name, 'Explicit Owner', 'the explicit owner is applied to the primary NPC');
+});
+
+test('store updateShop rejects a non-array npcs patch', async () => {
+  const store = createStore(createFakeDocAccess());
+  const shop = await store.createShop({ name: 'S', locationId: 'loc1' });
+  await assert.rejects(
+    () => store.updateShop(shop.id, { npcs: 'not-an-array' }),
+    /shop\.npcs must be an array/
+  );
+});
+
 test('store ledger create/find/update idempotency key', async () => {
   const store = createStore(createFakeDocAccess());
   const result = await store.createLedger({
@@ -1281,4 +1396,436 @@ test('store ledger create/find/update idempotency key', async () => {
 
   const missing = await store.findLedgerByKey('user1:nope');
   assert.equal(missing, null);
+});
+
+// ---------------------------------------------------------------- M3 social catalog
+
+function makeCatalogMessage(request) {
+  return {
+    flags: { market: { type: 'request', request: { type: 'catalog', ...request } } },
+  };
+}
+
+function makeSocialCatalogCtx({
+  store,
+  getActor,
+  actorOwnedBy = () => true,
+  getSocial,
+  commerce = {},
+}) {
+  const responses = [];
+  return {
+    activeGMId: () => 'gm1',
+    currentUserId: () => 'gm1',
+    gmIds: () => ['gm1'],
+    respond: async (data) => responses.push(data.flags.market.response),
+    commerce,
+    store,
+    getActor,
+    actorOwnedBy,
+    getSocial,
+    responses,
+  };
+}
+
+test('catalog with an owned actor personalizes price, breakdown and relationship only', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    social: { primaryPersonality: 'greedy', shopMarkupBps: 500 },
+    inventory: [
+      normalizeInventoryEntry({
+        id: 'e1',
+        itemUuid: 'Compendium.a.Item.x',
+        name: 'Potion',
+        price: 100,
+        quantity: 5,
+        visible: true,
+      }),
+    ],
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async (id) => (id === 'a1' ? { uuid: 'Actor.a1' } : null),
+    getSocial: async () => ({
+      score: 50,
+      band: { title: 'Liked' },
+      individual: 50,
+      party: 0,
+      partyId: 'party1',
+    }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat1' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'catalog');
+  assert.equal(data.actorId, 'a1', 'correlation echoes the actorId');
+  assert.ok(data.relationship, 'a sanitized relationship is present');
+  assert.equal(data.relationship.score, 50);
+  assert.equal(data.relationship.title, 'Liked');
+  assert.equal(data.relationship.individual, 50);
+  assert.equal(data.relationship.party, 0);
+  assert.equal('partyId' in data.relationship, false, 'partyId is always omitted');
+  assert.equal(data.inventory.length, 1);
+  const entry = data.inventory[0];
+  assert.ok('basePrice' in entry && 'priceBreakdown' in entry && 'canBuy' in entry);
+  assert.equal(entry.basePrice, 100);
+  assert.equal(entry.canBuy, true);
+  assert.ok(entry.price != null, 'personalized unit price present');
+  assert.ok(entry.priceBreakdown.band.title, 'breakdown carries the band title');
+  assert.equal(entry.priceBreakdown.quantity, 1);
+  // No raw reputation record or private social config leaks into the entry.
+  assert.ok(!('itemUuid' in entry), 'itemUuid still omitted');
+  assert.ok(!('snapshot' in entry), 'snapshot still omitted');
+  assert.ok(!('social' in entry), 'private shop social config omitted');
+  assert.deepEqual(data.merchants, []);
+});
+
+test('catalog with an unowned actor returns a correlated actor-not-owned error', async () => {
+  const shop = normalizeShop({ id: 'shop1', name: 'S', locationId: 'loc1', inventory: [] });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async () => ({ uuid: 'Actor.a1' }),
+    actorOwnedBy: () => false,
+    getSocial: async () => ({ score: 0 }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat2' }),
+    'user2',
+    ctx
+  );
+  assert.equal(data.type, 'error');
+  assert.equal(data.error, 'actor-not-owned');
+  assert.equal(data.actorId, 'a1');
+  assert.equal(data.requestId, 'cat2');
+});
+
+test('personalized catalog omits hidden entries and never leaks a raw rep record', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    inventory: [
+      normalizeInventoryEntry({
+        id: 'e1',
+        itemUuid: 'Compendium.a.Item.x',
+        name: 'Visible',
+        price: 100,
+        quantity: 5,
+        visible: true,
+      }),
+      normalizeInventoryEntry({
+        id: 'e2',
+        itemUuid: 'Compendium.a.Item.y',
+        name: 'Hidden',
+        price: 50,
+        quantity: 1,
+        visible: false,
+      }),
+    ],
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async () => ({ uuid: 'Actor.a1' }),
+    getSocial: async () => ({
+      score: 0,
+      band: { title: 'Neutral' },
+      individual: 0,
+      party: 0,
+      partyId: '',
+    }),
+  });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat3' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.inventory.length, 1, 'hidden entry omitted from the personalized catalog');
+  assert.equal(data.inventory[0].name, 'Visible');
+});
+
+test('a legacy shop still projects a base catalog and the legacy owner as a merchant', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'Legacy',
+    locationId: 'loc1',
+    owner: 'Bob',
+    open: true,
+    inventory: [
+      normalizeInventoryEntry({
+        id: 'e1',
+        itemUuid: 'Compendium.a.Item.x',
+        name: 'A',
+        price: 10,
+        quantity: 3,
+        visible: true,
+      }),
+    ],
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({ store, getActor: async () => null });
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', requestId: 'cat4' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'catalog');
+  const entry = data.inventory[0];
+  // No actor => base catalog: the base price is authoritative, no per-actor fields.
+  assert.equal(entry.price, 10);
+  assert.ok(!('priceBreakdown' in entry));
+  assert.ok(!('basePrice' in entry));
+  assert.ok(!('canBuy' in entry));
+  assert.ok(!('relationship' in data), 'no relationship without an actor');
+  // The legacy owner migrates to the primary NPC which is projected publicly.
+  assert.equal(data.merchants.length, 1);
+  assert.equal(data.merchants[0].name, 'Bob');
+  assert.equal(typeof data.merchants[0].personality.label, 'string');
+  assert.ok(!('actorUuid' in data.merchants[0]), 'actorUuid never leaked');
+  assert.ok(!('social' in data.merchants[0]));
+});
+
+test('a personalized catalog quote failure fails closed as a correlated server-error', async () => {
+  const shop = normalizeShop({
+    id: 'shop1',
+    name: 'S',
+    locationId: 'loc1',
+    inventory: [normalizeInventoryEntry({ id: 'e1', itemUuid: 'u1', name: 'A', price: 10, quantity: 1 })],
+  });
+  const store = { findShop: async () => shop };
+  const ctx = makeSocialCatalogCtx({
+    store,
+    getActor: async () => ({ uuid: 'Actor.a1' }),
+    getSocial: async () => ({ individual: 0, party: 0 }),
+    // Inject a bad quoteSocial by supplying a shop whose social markup pushes
+    // the total over a safe integer, so quoteSocial throws.
+  });
+  shop.social.shopMarkupBps = 50000;
+  shop.inventory[0].price = Number.MAX_SAFE_INTEGER;
+  const data = await handleMarketChatMessage(
+    makeCatalogMessage({ shopId: 'shop1', actorId: 'a1', requestId: 'cat5' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'error');
+  assert.equal(data.error, 'server-error');
+  assert.equal(data.requestId, 'cat5');
+  assert.equal(data.actorId, 'a1');
+});
+
+// ------------------------------------------------------------- ledger priceBreakdown
+
+test('normalizeLedgerRecord preserves a validated priceBreakdown and rejects a raw one', () => {
+  const ok = normalizeLedgerRecord({
+    key: 'u1:r1',
+    status: 'pending',
+    quantity: 2,
+    unitPrice: 85,
+    totalPrice: 170,
+    priceBreakdown: {
+      quantity: 2,
+      unitBase: 100,
+      baseTotal: 200,
+      shopBps: 0,
+      personalityBps: 0,
+      reputationBps: -1500,
+      haggleBps: 0,
+      adjustmentBps: -1500,
+      unitPrice: 85,
+      total: 170,
+      band: { title: 'Loved', threshold: 100 },
+      refused: false,
+    },
+  });
+  assert.deepEqual(ok.priceBreakdown, {
+    quantity: 2,
+    unitBase: 100,
+    baseTotal: 200,
+    shopBps: 0,
+    personalityBps: 0,
+    reputationBps: -1500,
+    haggleBps: 0,
+    adjustmentBps: -1500,
+    unitPrice: 85,
+    total: 170,
+    band: { title: 'Loved', threshold: 100 },
+    refused: false,
+  });
+
+  // A raw arbitrary breakdown is rejected (throws) instead of being persisted.
+  assert.throws(
+    () =>
+      normalizeLedgerRecord({
+        key: 'u1:r2',
+        status: 'pending',
+        quantity: 1,
+        unitPrice: 5,
+        totalPrice: 5,
+        priceBreakdown: { unitPrice: 'fifty', quantity: 1, total: 5 },
+      }),
+    /safe integer/
+  );
+  assert.throws(
+    () =>
+      normalizeLedgerRecord({
+        key: 'u1:r3',
+        status: 'pending',
+        quantity: 1,
+        unitPrice: 5,
+        totalPrice: 5,
+        priceBreakdown: { quantity: 1, unitPrice: 5, total: 5, band: { title: '' } },
+      }),
+    /must not be empty/
+  );
+
+  // A missing/legacy breakdown normalizes to null.
+  const legacy = normalizeLedgerRecord({ key: 'u1:r4', status: 'pending', quantity: 1, unitPrice: 5, totalPrice: 5 });
+  assert.equal(legacy.priceBreakdown, null);
+});
+
+test('normalizePriceBreakdown rejects a float, a negative total and a non-boolean refused', () => {
+  assert.throws(() => normalizePriceBreakdown({ quantity: 1, unitPrice: 1.5, total: 1 }), /safe integer/);
+  assert.throws(() => normalizePriceBreakdown({ quantity: 1, unitPrice: 5, total: -1 }), />= 0/);
+  assert.throws(() => normalizePriceBreakdown({ quantity: 1, unitPrice: 5, total: 5, refused: 'yes' }), /boolean/);
+  assert.equal(normalizePriceBreakdown(null), null);
+  assert.equal(normalizePriceBreakdown(undefined), null);
+});
+
+test('normalizePriceBreakdown validates the combined adjustment across the full sum range', () => {
+  // The combined adjustment is the additive sum of up to four [-9000, 50000]
+  // components, so it spans [-36000, 200000], not the per-component [-9000, 50000].
+  const low = normalizePriceBreakdown({ quantity: 1, unitBase: 100, baseTotal: 100, unitPrice: 1, total: 1, adjustmentBps: -36000 });
+  assert.equal(low.adjustmentBps, -36000);
+  const high = normalizePriceBreakdown({ quantity: 1, unitBase: 100, baseTotal: 100, unitPrice: 615, total: 615, adjustmentBps: 200000 });
+  assert.equal(high.adjustmentBps, 200000);
+  // A combined adjustment outside the envelope is rejected; the individual
+  // component fields still use the per-component bound (unchanged).
+  assert.throws(
+    () => normalizePriceBreakdown({ quantity: 1, unitPrice: 1, total: 1, adjustmentBps: -36001 }),
+    /between -36000 and 200000/
+  );
+  assert.throws(
+    () => normalizePriceBreakdown({ quantity: 1, unitPrice: 1, total: 1, adjustmentBps: 200001 }),
+    /between -36000 and 200000/
+  );
+  const components = normalizePriceBreakdown({
+    quantity: 1,
+    unitBase: 100,
+    baseTotal: 100,
+    shopBps: 50000,
+    personalityBps: 1500,
+    reputationBps: 4000,
+    haggleBps: 50000,
+    adjustmentBps: 105500,
+    unitPrice: 1155,
+    total: 1155,
+  });
+  assert.equal(components.adjustmentBps, 105500, 'the raw combined sum is retained');
+  assert.equal(components.shopBps, 50000, 'a max per-component shop bps is accepted');
+});
+
+// ------------------------------------------------------------- M3 social purchase
+
+test('a good reputation discounts the charged total and persists an exact priceBreakdown', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    // Loved reputation (-1500bps) on a neutral shop: unit price 100 -> 85.
+    getSocial: async () => ({ individual: 100, party: 0 }),
+  });
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+  assert.equal(result.unitPrice, 85, 'charged unit price comes from quoteSocial');
+  assert.equal(result.total, 170, 'charged total comes from quoteSocial');
+  assert.ok(result.priceBreakdown, 'priceBreakdown returned on the result');
+  assert.equal(result.priceBreakdown.unitPrice, 85);
+  assert.equal(result.priceBreakdown.total, 170);
+  assert.equal(result.priceBreakdown.band.title, 'Loved');
+  assert.equal(result.priceBreakdown.reputationBps, -1500);
+  assert.equal(result.priceBreakdown.refused, false);
+
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'committed');
+  assert.equal(ledger.unitPrice, 85);
+  assert.equal(ledger.totalPrice, 170);
+  assert.deepEqual(ledger.priceBreakdown, result.priceBreakdown, 'ledger persists the validated breakdown');
+  assert.deepEqual(ledger.outcome.priceBreakdown, result.priceBreakdown, 'outcome also persists the breakdown');
+  assert.equal(actor.items.length, 1);
+});
+
+test('a Hated reputation refuses with service-refused before any debit', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    getSocial: async () => ({ individual: -100, party: 0 }),
+  });
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error, 'service-refused');
+  assert.equal(actor.system.currency.gp, 5, 'no debit on a refusal');
+  assert.equal(actor.items.length, 0, 'no delivery on a refusal');
+
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'failed');
+  assert.equal(ledger.error, 'service-refused');
+  assert.ok(ledger.priceBreakdown, 'the refusal persists the Hated breakdown');
+  assert.equal(ledger.priceBreakdown.band.title, 'Hated');
+  assert.equal(ledger.priceBreakdown.refused, true);
+});
+
+test('purchase never trusts a stale catalog price: it re-quotes from live reputation', async () => {
+  // The storefront may have shown the base price (200 for 2 @ 100). The purchase
+  // must charge the server-quoted discounted total instead, proving it re-reads
+  // the shop + reputation rather than trusting any client-side price.
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce({
+    ...makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() }),
+    getSocial: async () => ({ individual: 100, party: 0 }),
+  });
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.total, 170, 'server-quoted total (85/unit) beats the stale base total of 200');
+  assert.equal(result.totalPrice ?? result.total, 170);
+});
+
+test('a legacy commerce (no getSocial) keeps the original integer quote and a null breakdown', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'committed');
+  assert.equal(result.total, 200, 'original integer quote path retained');
+  assert.equal(result.priceBreakdown, null, 'no social breakdown on the legacy path');
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.totalPrice, 200);
+  assert.equal(ledger.priceBreakdown, null);
 });

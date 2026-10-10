@@ -145,6 +145,25 @@
 .empty-shelf p { max-width: 350px; margin: 0 0 1rem; color: var(--mk-muted); font: .78rem/1.5 system-ui, sans-serif; }
 .manager-footer-actions { display: flex; justify-content: flex-end; gap: .6rem; padding-top: 1rem; }
 
+/* M3 social economy panels */
+.social-panel { border-color:#c9b993; background:linear-gradient(145deg,#fbf8f0,#f0e9da); box-shadow:0 8px 24px #51432b0c; }
+.social-settings { padding-bottom:.25rem; }
+.social-subsection { margin-top:1.25rem; padding-top:1rem; border-top:1px solid var(--mk-line); }
+.social-subheading { display:flex; align-items:center; justify-content:space-between; gap:1rem; margin-bottom:.75rem; }
+.social-subheading h4 { margin:0; font-size:1rem; font-weight:500; }
+.social-subheading .market-eyebrow { margin-bottom:.2rem; }
+.npc-list { display:grid; gap:.7rem; }
+.npc-editor { min-width:0; margin:0; padding:1rem; border:1px solid #d4c8b1; background:#fffdf8; }
+.npc-editor legend { padding:0 .4rem; color:#694b23; font:700 .75rem system-ui,sans-serif; }
+.npc-actions { display:flex; flex-wrap:wrap; gap:.5rem; justify-content:flex-end; margin-top:.8rem; }
+.reputation-select { max-width:30rem; }
+.reputation-summary { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem 1rem; margin-top:.8rem; padding:.75rem; color:#41392d; background:#e9e0d0; font:.74rem system-ui,sans-serif; }
+.reputation-summary strong { color:#694b23; }
+.reputation-history { display:grid; gap:.35rem; max-height:15rem; overflow:auto; margin:.75rem 0; padding:0; list-style:none; }
+.reputation-history li { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.8rem; align-items:center; padding:.55rem .7rem; border:1px solid #e0d7c7; background:#fffdf8; font:.7rem system-ui,sans-serif; }
+.reputation-history time { color:var(--mk-muted); font-size:.64rem; }
+.reputation-adjust { display:grid; grid-template-columns:minmax(100px,.5fr) minmax(180px,1fr) auto; align-items:end; gap:.7rem; }
+
 /* Editable inventory rows (M1 UI) */
 .inventory-table input, .inventory-table select { max-width: 6.5rem; padding: .35rem .4rem; border: 1px solid #d5cbb9; border-radius: 0; color: var(--mk-ink); background: #fffdf7; font: 400 .78rem system-ui, sans-serif; }
 .inventory-table input[type="number"] { width: 5.5rem; }
@@ -195,6 +214,30 @@
 .shop-welcome { max-width:540px; margin:.2rem auto .3rem; color:#ead7a9; font-style:italic; }
 .hero-status { display: inline-flex; align-items: center; gap: .45rem; margin-top: .75rem; color: #ddd3bf; font: 700 .62rem system-ui, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
 .hero-status.status-closed i { background: #bb786a; }
+.merchant-social { display:flex; flex-wrap:wrap; justify-content:center; gap:.5rem; margin:.8rem 0 .2rem; }
+.merchant-chip { display:flex; align-items:center; gap:.5rem; min-width:0; padding:.3rem .55rem .3rem .3rem; border:1px solid #796b50; border-radius:2rem; color:#eee3cd; background:#28292399; text-align:left; }
+.merchant-chip img,.merchant-avatar-fallback { display:grid; place-items:center; width:2rem; height:2rem; overflow:hidden; border:1px solid #c89a4e; border-radius:50%; color:#e0bd74; object-fit:cover; }
+.merchant-avatar-fallback { background:#494231; }
+.merchant-chip > span:last-child { display:grid; gap:.08rem; }
+.merchant-chip strong { font:600 .68rem system-ui,sans-serif; }
+.merchant-chip small { color:#c5b99f; font:.6rem system-ui,sans-serif; }
+.merchant-greeting { max-width:38rem; margin:.7rem auto; color:#e4d3ad; font:italic .9rem/1.5 Georgia,serif; }
+.relationship-panel { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:1rem; width:min(100%,660px); margin:1rem auto 0; padding:1rem 1.15rem; border:1px solid #957a4c; background:linear-gradient(115deg,#282a24,#3a3528); text-align:left; box-shadow:0 8px 25px #0003; }
+.relationship-copy h2 { margin:0; color:#f0d796; font-size:1.25rem; font-weight:500; }
+.relationship-copy > p:not(.market-eyebrow) { margin:.3rem 0 .6rem; color:#d0c5ad; font:.72rem/1.5 system-ui,sans-serif; }
+.relationship-meter { display:flex; align-items:center; gap:.7rem; }
+.relationship-meter meter { width:min(100%,350px); height:.8rem; accent-color:#c99a4e; }
+.relationship-score { color:#f1d694; font:700 .78rem system-ui,sans-serif; white-space:nowrap; }
+.relationship-score small { color:#c3b89f; font-weight:400; }
+.relationship-splits { display:grid; align-content:center; gap:.55rem; min-width:115px; padding-left:1rem; border-left:1px solid #655941; }
+.relationship-splits span { display:grid; gap:.15rem; }
+.relationship-splits small { color:#c3b89f; font: .58rem system-ui,sans-serif; }
+.relationship-splits strong { color:#f1e8d5; font:600 .75rem system-ui,sans-serif; }
+.product-price del { margin-left:.2rem; color:#a99d89; font: .68rem system-ui,sans-serif; }
+.buy-button:disabled { cursor:not-allowed; opacity:.5; }
+.price-breakdown { display:grid; gap:.3rem; margin:.75rem 0 0; padding:.65rem .75rem; border-top:1px solid #5a5140; color:#c7bca6; list-style:none; font:.7rem system-ui,sans-serif; }
+.price-breakdown li { display:flex; justify-content:space-between; gap:.7rem; }
+.price-breakdown strong { color:#e0bd74; }
 .catalog { padding-top: 2.5rem; }
 .catalog-toolbar { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1.2rem; }
 .catalog-filters { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:.8rem; }
@@ -363,6 +406,11 @@
   .buy-button { padding: .45rem .5rem; }
   .purchase-dock { flex-wrap: wrap; justify-content: flex-start; }
   .purchase-dock select { flex: 1 1 58%; min-width: 0; }
+  .relationship-panel { grid-template-columns:1fr; }
+  .relationship-splits { grid-template-columns:1fr 1fr; padding: .65rem 0 0; border-top:1px solid #655941; border-left:0; }
+  .reputation-adjust { grid-template-columns:1fr; }
+  .reputation-history li { grid-template-columns:minmax(0,1fr) auto; }
+  .reputation-history time { grid-column:1 / -1; }
 }
 @media (max-width: 360px) { .product-grid,.theme-general-store .product-grid { grid-template-columns:1fr; } }
 @media (prefers-reduced-motion: reduce) {

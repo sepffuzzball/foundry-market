@@ -12,10 +12,12 @@
 
 import {
   normalizeLedgerRecord,
+  normalizePriceBreakdown,
   assertPositiveInteger,
   parseItemData,
 } from './model.js';
 import { quote } from './pricing.js';
+import { quoteSocial as defaultQuoteSocial } from '../social/pricing.js';
 
 export function fnv1a(str) {
   let hash = 0x811c9dc5;
@@ -128,6 +130,8 @@ export function createCommerce(deps) {
     now = () => Date.now(),
     makeId,
     lockMap = defaultLockMap,
+    getSocial,
+    quoteSocial = defaultQuoteSocial,
   } = deps;
 
   /**
@@ -259,16 +263,83 @@ export function createCommerce(deps) {
       return recordFailure({ key, userId, payload: requestPayload, error: 'insufficient-stock' });
     }
 
+    // Quote. When the runtime supplies `getSocial` (M3 social pricing wired),
+    // quote through `quoteSocial` using the actor's effective reputation scores
+    // and record a validated priceBreakdown; a Hated reputation refuses the
+    // sale (`service-refused`) BEFORE any debit. Without `getSocial` (legacy /
+    // un-wired runtime) fall back to the original integer `quote`, which keeps
+    // the M1/M2 purchase path byte-for-byte unchanged.
+    let unitPrice;
     let total;
-    try {
-      total = quote(entry, qty);
-    } catch (err) {
+    let priceBreakdown = null;
+    let refused = false;
+    if (getSocial) {
+      let effective;
+      try {
+        effective = await getSocial(shop, actor);
+      } catch (err) {
+        return recordFailure({
+          key,
+          userId,
+          payload: requestPayload,
+          error: 'rep-read-failed',
+          detail: (err && err.message) || String(err),
+        });
+      }
+      try {
+        const q = quoteSocial(entry, qty, {
+          shop,
+          scores: { individual: effective?.individual, party: effective?.party },
+        });
+        unitPrice = q.unitPrice;
+        total = q.total;
+        priceBreakdown = normalizePriceBreakdown({
+          quantity: q.quantity,
+          unitBase: q.unitBase,
+          baseTotal: q.baseTotal,
+          shopBps: q.shopBps,
+          personalityBps: q.personalityBps,
+          reputationBps: q.reputationBps,
+          haggleBps: q.haggleBps,
+          adjustmentBps: q.adjustmentBps,
+          unitPrice: q.unitPrice,
+          total: q.total,
+          band: q.band,
+          refused: q.refused,
+        });
+        refused = q.refused;
+      } catch (err) {
+        return recordFailure({
+          key,
+          userId,
+          payload: requestPayload,
+          error: 'total-overflow',
+          detail: (err && err.message) || String(err),
+        });
+      }
+    } else {
+      try {
+        total = quote(entry, qty);
+      } catch (err) {
+        return recordFailure({
+          key,
+          userId,
+          payload: requestPayload,
+          error: 'total-overflow',
+          detail: (err && err.message) || String(err),
+        });
+      }
+      unitPrice = entry.price;
+      priceBreakdown = null;
+    }
+    if (refused) {
       return recordFailure({
         key,
         userId,
         payload: requestPayload,
-        error: 'total-overflow',
-        detail: (err && err.message) || String(err),
+        error: 'service-refused',
+        detail: 'shop reputation is Hated',
+        extra: { totalPrice: total, unitPrice, priceBreakdown },
       });
     }
     const adapter = getAdapter(systemId());
@@ -301,7 +372,7 @@ export function createCommerce(deps) {
         payload: requestPayload,
         error: 'insufficient-funds',
         detail: `need ${total}, have ${balance}`,
-        extra: { totalPrice: total, balance },
+        extra: { totalPrice: total, balance, unitPrice, priceBreakdown },
       });
     }
 
@@ -319,8 +390,9 @@ export function createCommerce(deps) {
           entryId,
           actorId,
           quantity: qty,
-          unitPrice: entry.price,
+          unitPrice,
           totalPrice: total,
+          priceBreakdown,
         })
       );
     } catch (err) {
@@ -382,9 +454,10 @@ export function createCommerce(deps) {
 
       const outcome = {
         createdItemId: created?.id ?? null,
-        unitPrice: entry.price,
+        unitPrice,
         total,
         quantity: qty,
+        priceBreakdown,
       };
       await store.updateLedger(rec.id, {
         status: 'committed',
@@ -436,9 +509,10 @@ export function createCommerce(deps) {
           compensation,
           outcome: {
             createdItemId: created?.id ?? null,
-            unitPrice: entry.price,
+            unitPrice,
             total,
             quantity: qty,
+            priceBreakdown,
           },
         });
       } catch (e) {
@@ -453,6 +527,7 @@ export function createCommerce(deps) {
         compensation,
         total,
         quantity: qty,
+        priceBreakdown,
       };
     }
   }

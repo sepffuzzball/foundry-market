@@ -5,12 +5,13 @@ inventory are stored in GM-only JournalEntry flags; purchases are executed only
 by the active GM through an idempotent, compensating ledger; and requests flow
 over ChatMessage (no raw socket).
 
-This is **Milestone 1 (M1)** and a **prerelease developer preview**: the
-functional core plus the first end-to-end UI wiring. The market manager (GM),
-the player storefront and the canvas shop markers are all wired to the working
-core through the request channel and the GM-only store. The runtime has **not**
-been executed against a live Foundry VTT 14 install yet - it is wired and
-unit-tested in Node only.
+This is a **prerelease developer preview** covering **Milestone 1 (M1)** through
+**Milestone 2 (M2)**, with **Milestone 3 (M3, social data & reputation/pricing)**
+**in progress**: the functional core plus the M1 end-to-end UI wiring (market
+manager, player storefront, canvas shop markers), the M2 shop theming/appearance
+and storefront interactions, and the in-progress M3 social/NPC/reputation engine
+and wiring. The runtime has **not** been executed against a live Foundry VTT 14
+install yet - it is wired and unit-tested in Node only.
 
 ## Requirements
 
@@ -35,21 +36,21 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.1`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.2`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.1/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.2/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
 
-> **The `download` URL is not live until the `0.1.1` tag's release action has
-> completed** - it must upload `module.zip` and `module.json` to a GitHub release
-> for tag `0.1.1`. Until that release exists, install the module by pointing
-> Foundry at this repository directory as a module source (the manifest and
-> `src/core/main.js` are unchanged), or download the zip from the release once
-> it is published.
+> **The `0.1.2` `download` URL is live only once the `0.1.2` release has been
+> published** - the release action must upload `module.zip` and `module.json` to
+> the GitHub release for tag `0.1.2`. Until that release is published, install
+> the module by pointing Foundry at this repository directory as a module source
+> (the manifest and `src/core/main.js` are unchanged), or download the zip from
+> the published release once it is available.
 
 ### Enable in a world
 
@@ -125,7 +126,7 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
 - **No live use yet.** The module has been exercised in tests only; the smoke
   checklist is the intended first real-runtime check.
 
-## What works (M1/M2)
+## What works (M1/M2/M3)
 
 - **UI (wired, not system-tested)**:
   - **Market Manager** (`MarketManager`, GM-only): create/select locations and
@@ -170,6 +171,22 @@ game.settings.set('market', 'genericDeliveryMode', 'embedded');
     storefront sizes itself to the full viewport after first render (no browser
     Fullscreen API permission request) and cleans up its resize handler on close.
     The M1 purchase flow is unchanged.
+  - **M3 UI additions (manager + storefront)**: the social/NPC/reputation wiring.
+    The manager persists shop social settings from `.social-panel`
+    (`normalizeShopSocial`, weights must sum to 100, shop markup is a signed
+    basis-point integer), manages a merchant roster capped at three (add persists
+    immediately under the per-shop lock; save validates each row; remove never
+    deletes the shop), and exposes a GM-only reputation editor that loads the
+    selected actor's effective reputation plus committed history and calls the
+    GM-only `reputation.adjust` with a fresh idempotency `requestId`. The
+    storefront requests a personalized per-actor catalog (sending `actorId`,
+    auto-selecting the initial actor, clearing per-actor data on switch,
+    correlating the response by `requestId` + echoed `actorId` so a stale-actor
+    response is discarded), refuses a `canBuy false` (Hated) entry in
+    `_requestPurchase`, maps a `service-refused` error to a readable message, and
+    derives display-only `priceLines` and a `relationship.modifierText` from the
+    public response - never leaking private store data. The M1 purchase flow and
+    the M2 layout/themes are unchanged.
   - **Canvas markers** (`src/canvas/placements.js`): dragging a shop element
     onto the canvas (or clicking "Place shop") creates a public marker
     JournalEntry (default OBSERVER) plus a Scene Note with no private store

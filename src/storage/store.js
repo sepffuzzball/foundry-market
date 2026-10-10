@@ -16,10 +16,14 @@ import {
   LOCATION_KIND,
   SHOP_KIND,
   LEDGER_KIND,
+  REPUTATION_KIND,
+  REPUTATION_EVENT_KIND,
   normalizeLocation,
   normalizeShop,
   normalizeInventoryEntry,
   normalizeLedgerRecord,
+  normalizeReputation,
+  normalizeReputationEvent,
   makeId,
 } from '../services/model.js';
 
@@ -77,6 +81,10 @@ export function createStore(docAccess) {
         return normalizeShop(record);
       case LEDGER_KIND:
         return normalizeLedgerRecord(record);
+      case REPUTATION_KIND:
+        return normalizeReputation(record);
+      case REPUTATION_EVENT_KIND:
+        return normalizeReputationEvent(record);
       default:
         return record;
     }
@@ -150,7 +158,22 @@ export function createStore(docAccess) {
   async function updateShop(id, patch = {}) {
     const existing = await findShop(id);
     if (!existing) return null;
-    const record = normalizeShop({ ...existing, ...patch });
+    const next = { ...existing, ...patch };
+    // A supplied `npcs` array must be a real array before `normalizeShop` can
+    // consume it; reject a scalar instead of silently treating it as empty.
+    if (patch.npcs !== undefined && !Array.isArray(patch.npcs)) {
+      throw new Error('[market] shop.npcs must be an array');
+    }
+    // When a caller supplies a new `npcs` array without an explicit `owner`,
+    // derive the owner from the new primary NPC BEFORE `normalizeShop`. Without
+    // this, `resolveNpcs` re-applies the stale persisted `owner` string onto
+    // `npcs[0].name`, silently overwriting a primary-NPC rename made through the
+    // store API when the persisted owner still carries the old name. An explicit
+    // `patch.owner` always wins.
+    if (patch.npcs !== undefined && patch.owner === undefined) {
+      next.owner = patch.npcs.length > 0 ? String(patch.npcs[0]?.name || '') : '';
+    }
+    const record = normalizeShop(next);
     return updateRecord(SHOP_KIND, id, record, record.name);
   }
 
@@ -199,6 +222,79 @@ export function createStore(docAccess) {
     return next;
   }
 
+  // --- Reputation --------------------------------------------------------------
+  // GM-owned, per-entity reputation records and an append-only event log. Each
+  // reputation record and each event is stored in its OWN GM-only JournalEntry
+  // (mirroring the ledger), so there is no unbounded embedded history and no
+  // schema version bump. Records are keyed by the (shopId, scope, subjectId)
+  // triple; events are keyed by their idempotency `key`.
+
+  function reputationJournalName(record) {
+    return `Reputation: ${record.shopId} ${record.scope}:${record.subjectId}`;
+  }
+
+  async function getReputation(shopId, scope, subjectId) {
+    const records = await listRecords(REPUTATION_KIND);
+    return (
+      records.find(
+        (r) => r.shopId === shopId && r.scope === scope && r.subjectId === subjectId
+      ) || null
+    );
+  }
+
+  async function upsertReputation(record) {
+    const normalized = normalizeReputation(record);
+    const existing = await getReputation(
+      normalized.shopId,
+      normalized.scope,
+      normalized.subjectId
+    );
+    if (existing) {
+      // Preserve the persisted id on an update; never create a second record.
+      const next = normalizeReputation({ ...normalized, id: existing.id });
+      return updateRecord(REPUTATION_KIND, existing.id, next, reputationJournalName(next));
+    }
+    return insertRecord(REPUTATION_KIND, normalized, reputationJournalName(normalized));
+  }
+
+  async function findReputationEventByKey(key) {
+    const events = await listRecords(REPUTATION_EVENT_KIND);
+    return events.find((e) => e.key === key) || null;
+  }
+
+  async function createReputationEvent(record) {
+    const normalized = normalizeReputationEvent(record);
+    // Keyed by idempotency key; never create a second event for an existing key
+    // (prevents duplicate JournalEntries on a race). Returns `{ record, created }`
+    // so callers can tell whether their key already existed.
+    const existing = await findReputationEventByKey(normalized.key);
+    if (existing) return { record: existing, created: false };
+    const created = await insertRecord(
+      REPUTATION_EVENT_KIND,
+      normalized,
+      `Reputation Event: ${normalized.key}`
+    );
+    return { record: created, created: true };
+  }
+
+  async function updateReputationEvent(id, patch = {}) {
+    const doc = await findJournalByKindAndId(REPUTATION_EVENT_KIND, id);
+    if (!doc) return null;
+    const current = normalizeReputationEvent(flagScope(doc).record);
+    const next = normalizeReputationEvent({ ...current, ...patch });
+    const flags = { schemaVersion: SCHEMA_VERSION, kind: REPUTATION_EVENT_KIND, record: next };
+    await docAccess.updateJournalEntry(doc, { flags: { [SCOPE]: flags } });
+    return next;
+  }
+
+  async function listReputationEvents({ shopId, scope, subjectId } = {}) {
+    let events = await listRecords(REPUTATION_EVENT_KIND);
+    if (shopId != null) events = events.filter((e) => e.shopId === shopId);
+    if (scope != null) events = events.filter((e) => e.scope === scope);
+    if (subjectId != null) events = events.filter((e) => e.subjectId === subjectId);
+    return events.sort((a, b) => b.createdAt - a.createdAt);
+  }
+
   return {
     listLocations,
     createLocation,
@@ -212,6 +308,12 @@ export function createStore(docAccess) {
     findLedgerByKey,
     createLedger,
     updateLedger,
+    getReputation,
+    upsertReputation,
+    findReputationEventByKey,
+    createReputationEvent,
+    updateReputationEvent,
+    listReputationEvents,
     // Utility used by tests and the runtime to create ids.
     makeId,
   };

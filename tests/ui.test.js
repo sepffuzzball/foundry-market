@@ -51,7 +51,22 @@ globalThis.foundry = {
     api: { ApplicationV2, HandlebarsApplicationMixin },
   },
 };
-globalThis.Hooks = { on() {}, off() {} };
+const _hookRegistry = {};
+globalThis.Hooks = {
+  on(event, fn) {
+    (_hookRegistry[event] ||= []).push(fn);
+  },
+  off() {},
+  once(event, fn) {
+    (_hookRegistry[event] ||= []).push({ once: true, fn });
+  },
+};
+function fireHook(event) {
+  for (const entry of _hookRegistry[event] || []) {
+    if (typeof entry === 'function') entry();
+    else entry.fn();
+  }
+}
 globalThis.CONST = { DOCUMENT_OWNERSHIP_LEVELS: { OWNER: 3, OBSERVER: 2 } };
 globalThis.game = {
   user: { id: 'u1', isGM: false },
@@ -1790,4 +1805,956 @@ test('storefront categories exclude categories that only appear on hidden entrie
     ['all', 'Weapon'],
     'a hidden-only category is not offered as a filter tab'
   );
+});
+
+// ---- M3: runtime reputation API guard (injected globals) -----------------------
+
+test('runtime api.reputation.adjust is GM-gated and never accepts a forged GM id', async () => {
+  // Wire enough of the Foundry boundary that main.js `init` can run: module
+  // registration for the api attachment, settings for register/registerMenu and
+  // an empty journal for the default reputation-adjacent store reads.
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {} };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+
+  await import('../src/core/main.js');
+  fireHook('init');
+
+  const api = globalThis.game.modules.get('market').api;
+  assert.ok(api);
+  assert.ok(api.reputation, 'reputation surface exposed on the module api');
+  assert.equal(typeof api.reputation.adjust, 'function');
+  assert.equal(typeof api.reputation.getEffective, 'function');
+  assert.equal(typeof api.getReputation, 'function');
+  assert.equal(typeof api.quotePrice, 'function');
+
+  // Non-GM guard: the wrapper rejects before any read/write.
+  globalThis.game.user.isGM = false;
+  const r1 = await api.reputation.adjust({
+    shopId: 's1',
+    scope: 'actor',
+    subjectId: 'Actor.a',
+    delta: 5,
+    requestId: 'r1',
+  });
+  assert.equal(r1.status, 'error');
+  assert.equal(r1.error, 'not-a-gm');
+
+  // GM path: the wrapper always passes THIS user's id (never a forged GM id). A
+  // missing shop surfaces as shop-not-found, proving the request was routed into
+  // the real service with the authenticated user keys.
+  globalThis.game.user.isGM = true;
+  const prevGet = globalThis.game.users.get;
+  globalThis.game.users.get = (id) => ({ id, isGM: true });
+  try {
+    const r2 = await api.reputation.adjust({
+      shopId: 'missing',
+      scope: 'actor',
+      subjectId: 'Actor.a',
+      delta: 5,
+      requestId: 'r2',
+    });
+    assert.equal(r2.status, 'error');
+    assert.equal(r2.error, 'shop-not-found');
+  } finally {
+    globalThis.game.users.get = prevGet;
+  }
+});
+
+test('runtime api.reputation.getEffective is GM-only: a non-GM read returns null', async () => {
+  // Wire just enough of the Foundry boundary that main.js `init` can run, then
+  // re-fire it so the api is attached (module is cached; re-firing the hook
+  // re-runs the once-registered init path).
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {} };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+  globalThis.game.actors = { get: () => null };
+
+  await import('../src/core/main.js');
+  fireHook('init');
+
+  const api = globalThis.game.modules.get('market').api;
+  const shop = { id: 's1', social: { partyId: '' } };
+
+  // Non-GM caller: the wrapper rejects before any service read, so it can never
+  // probe another player's reputation.
+  globalThis.game.user.isGM = false;
+  const rejected = await api.reputation.getEffective(shop, 'Actor.a');
+  assert.equal(rejected, null, 'non-GM getEffective read returns null');
+
+  // GM caller: routes into the live reputation service and resolves a value.
+  globalThis.game.user.isGM = true;
+  const gmResult = await api.reputation.getEffective(shop, 'Actor.a');
+  assert.ok(gmResult, 'GM getEffective read resolves the effective reputation');
+  assert.equal(typeof gmResult.score, 'number');
+});
+
+// ---- M3: manager social / NPC / reputation UI wiring -------------------------
+
+function fakeSocialPanel(values = {}) {
+  const textNames = ['primaryPersonality', 'secondaryPersonality', 'partyId'];
+  const numNames = ['secondaryWeight', 'individualWeight', 'partyWeight', 'shopMarkupBps'];
+  const fields = {};
+  for (const name of textNames) {
+    fields[`[name="${name}"]`] = { type: 'text', value: String(values[name] ?? '') };
+  }
+  for (const name of numNames) {
+    fields[`[name="${name}"]`] = { type: 'number', value: String(values[name] ?? '') };
+  }
+  return { querySelector: (sel) => fields[sel] || null };
+}
+
+function socialPanelRoot(panel) {
+  return {
+    querySelector: (sel) => (sel === '.social-panel' ? panel : null),
+    querySelectorAll: () => [],
+  };
+}
+
+function fakeNpcRows(rows = []) {
+  const els = rows.map((r) => ({
+    dataset: { npcId: r.id },
+    querySelector: (sel) => {
+      const map = {
+        '[name="npcName"]': { value: String(r.npcName ?? '') },
+        '[name="npcRole"]': { value: String(r.npcRole ?? '') },
+        '[name="npcActorUuid"]': { value: String(r.npcActorUuid ?? '') },
+        '[name="npcPortrait"]': { value: String(r.npcPortrait ?? '') },
+        '[name="npcGreeting"]': { value: String(r.npcGreeting ?? '') },
+        '[name="npcPersonality"]': { value: String(r.npcPersonality ?? '') },
+        '[name="npcVisible"]': { type: 'checkbox', checked: r.npcVisible !== false },
+      };
+      return map[sel] || null;
+    },
+  }));
+  return { querySelectorAll: (sel) => (sel === '.npc-list [data-npc-id]' ? els : []) };
+}
+
+// A persistent store exposing the M2/M3 store surface used by the social / NPC /
+// reputation editors, including `findShop`, `updateShop` and the GM-only
+// `listReputationEvents` read.
+function makeM3Store({ shops = [], events = [] } = {}) {
+  const map = new Map();
+  for (const s of shops) map.set(s.id, structuredClone(s));
+  const calls = [];
+  return {
+    _map: map,
+    _calls: calls,
+    listLocations: async () => [],
+    listShops: async () => Array.from(map.values()),
+    findShop: async (id) => {
+      const s = map.get(id);
+      return s ? structuredClone(s) : null;
+    },
+    updateShop: async (id, patch) => {
+      calls.push({ id, patch });
+      const s = map.get(id);
+      if (!s) return null;
+      const next = { ...s, ...patch };
+      map.set(id, next);
+      return next;
+    },
+    listReputationEvents: async ({ shopId, scope, subjectId } = {}) =>
+      events.filter(
+        (e) =>
+          (!shopId || e.shopId === shopId) &&
+          (!scope || e.scope === scope) &&
+          (!subjectId || e.subjectId === subjectId)
+      ),
+  };
+}
+
+function baseNpc(name, extra = {}) {
+  return {
+    id: `npc-${name}`,
+    name,
+    role: '',
+    actorUuid: '',
+    portrait: '',
+    greeting: '',
+    personality: 'honest',
+    visible: true,
+    ...extra,
+  };
+}
+
+test('manager save-social writes normalized social and syncs the primary NPC personality', async () => {
+  const store = makeM3Store({
+    shops: [
+      {
+        id: 'shop1',
+        name: 'S',
+        locationId: 'loc1',
+        open: true,
+        inventory: [],
+        owner: 'Mira',
+        npcs: [baseNpc('Mira', { personality: 'greedy' }), baseNpc('Tavi')],
+        social: { primaryPersonality: 'greedy', individualWeight: 70, partyWeight: 30 },
+      },
+    ],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = socialPanelRoot(
+    fakeSocialPanel({
+      primaryPersonality: 'generous',
+      secondaryPersonality: '',
+      secondaryWeight: 0,
+      individualWeight: 70,
+      partyWeight: 30,
+      partyId: '',
+      shopMarkupBps: 500,
+    })
+  );
+  await app._onSaveSocial({}, {}, {});
+  assert.equal(store._calls.length, 1, 'one social patch written');
+  const { id, patch } = store._calls[0];
+  assert.equal(id, 'shop1');
+  assert.equal(patch.social.primaryPersonality, 'generous');
+  assert.equal(patch.social.individualWeight, 70);
+  assert.equal(patch.social.partyWeight, 30);
+  assert.equal(patch.social.shopMarkupBps, 500);
+  assert.equal(patch.npcs[0].personality, 'generous', 'primary NPC personality synced');
+  assert.equal(patch.npcs[1].personality, 'honest', 'secondary NPC untouched');
+});
+
+test('manager save-social surfaces a weight-sum error without writing', async () => {
+  const store = makeM3Store({
+    shops: [{ id: 'shop1', name: 'S', owner: 'Mira', npcs: [], social: {}, inventory: [] }],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app.render = async () => {};
+  app.element = socialPanelRoot(
+    fakeSocialPanel({ primaryPersonality: 'honest', individualWeight: 70, partyWeight: 20 })
+  );
+  await app._onSaveSocial({}, {}, {});
+  assert.equal(store._calls.length, 0, 'no write on invalid weights');
+  assert.ok(app._data.notice.includes('must equal 100'), 'weight-sum error surfaced');
+});
+
+test('manager save-social retains the existing autoPurchase config', async () => {
+  const store = makeM3Store({
+    shops: [
+      {
+        id: 'shop1',
+        name: 'S',
+        locationId: 'loc1',
+        open: true,
+        inventory: [],
+        owner: 'Mira',
+        npcs: [baseNpc('Mira', { personality: 'greedy' })],
+        social: {
+          primaryPersonality: 'greedy',
+          individualWeight: 70,
+          partyWeight: 30,
+          autoPurchase: { enabled: true, minimumSpend: 500, cooldownSeconds: 3600, delta: 3 },
+        },
+      },
+    ],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = socialPanelRoot(
+    fakeSocialPanel({
+      primaryPersonality: 'generous',
+      secondaryPersonality: '',
+      secondaryWeight: 0,
+      individualWeight: 70,
+      partyWeight: 30,
+      partyId: '',
+      shopMarkupBps: 500,
+    })
+  );
+  await app._onSaveSocial({}, {}, {});
+  assert.equal(store._calls.length, 1, 'one social patch written');
+  const { patch } = store._calls[0];
+  assert.equal(patch.social.primaryPersonality, 'generous');
+  assert.deepEqual(
+    patch.social.autoPurchase,
+    { enabled: true, minimumSpend: 500, cooldownSeconds: 3600, delta: 3 },
+    'a non-default autoPurchase survives a social save (not editable in the panel)'
+  );
+});
+
+test('manager save-social leaves the unsaved form intact on a validation error', async () => {
+  const store = makeM3Store({
+    shops: [{ id: 'shop1', name: 'S', owner: 'Mira', npcs: [], social: {}, inventory: [] }],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  let refreshed = false;
+  app._refreshData = async () => {
+    refreshed = true;
+  };
+  app.render = async () => {};
+  app.element = socialPanelRoot(
+    fakeSocialPanel({ primaryPersonality: 'honest', individualWeight: 70, partyWeight: 20 })
+  );
+  await app._onSaveSocial({}, {}, {});
+  assert.equal(store._calls.length, 0, 'no write on invalid weights');
+  assert.ok(app._data.notice.includes('must equal 100'), 'weight-sum error surfaced');
+  assert.equal(refreshed, false, 'a validation error leaves the unsaved form intact (no data refresh)');
+});
+
+test('manager add-npc persists a new merchant and reassigns the owner', async () => {
+  const store = makeM3Store({
+    shops: [{ id: 'shop1', name: 'S', owner: '', npcs: [], inventory: [], social: {} }],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onAddNpc({}, {}, {});
+  assert.equal(store._calls.length, 1);
+  const { patch } = store._calls[0];
+  assert.equal(patch.npcs.length, 1);
+  assert.equal(patch.npcs[0].name, 'New merchant');
+  assert.ok(patch.npcs[0].id, 'generated id present');
+  assert.equal(patch.npcs[0].personality, 'honest', 'defaults to the honest preset');
+  assert.equal(patch.owner, 'New merchant', 'owner reassigned to the new primary');
+});
+
+test('manager add-npc enforces the three-merchant cap', async () => {
+  const store = makeM3Store({
+    shops: [
+      {
+        id: 'shop1',
+        name: 'S',
+        owner: 'A',
+        inventory: [],
+        social: {},
+        npcs: [baseNpc('A'), baseNpc('B'), baseNpc('C')],
+      },
+    ],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onAddNpc({}, {}, {});
+  assert.equal(store._calls.length, 0, 'no write at the cap');
+  assert.equal(app._data.notice, 'A shop can have at most three merchants.');
+});
+
+test('manager save-npcs normalizes rows, caps at three and syncs owner/social', async () => {
+  const store = makeM3Store({
+    shops: [
+      { id: 'shop1', name: 'S', owner: '', npcs: [], inventory: [], social: { primaryPersonality: 'honest' } },
+    ],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  app.element = fakeNpcRows([
+    { id: 'a', npcName: 'Mira', npcRole: 'Owner', npcPersonality: 'greedy' },
+    { id: 'b', npcName: 'Tavi', npcRole: 'Clerk', npcPersonality: 'honest' },
+    { id: 'c', npcName: 'Nia', npcRole: '', npcPersonality: 'generous' },
+    { id: 'd', npcName: 'Extra', npcRole: '', npcPersonality: 'proud' },
+  ]);
+  await app._onSaveNpcs({}, {}, {});
+  assert.equal(store._calls.length, 1);
+  const { patch } = store._calls[0];
+  assert.equal(patch.npcs.length, 3, 'roster capped to three');
+  assert.equal(patch.npcs[0].name, 'Mira');
+  assert.equal(patch.npcs[1].name, 'Tavi');
+  assert.equal(patch.npcs[2].name, 'Nia');
+  assert.equal(patch.owner, 'Mira', 'owner synced to the first merchant name');
+  assert.equal(patch.social.primaryPersonality, 'greedy', 'social primary synced from the first merchant');
+});
+
+test('manager save-npcs surfaces an invalid portrait error without writing', async () => {
+  const store = makeM3Store({
+    shops: [{ id: 'shop1', name: 'S', owner: '', npcs: [], inventory: [], social: {} }],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app.render = async () => {};
+  app.element = fakeNpcRows([
+    { id: 'a', npcName: 'Mira', npcPortrait: 'https://cdn.example.com/x.png' },
+  ]);
+  await app._onSaveNpcs({}, {}, {});
+  assert.equal(store._calls.length, 0, 'no write on an invalid portrait');
+  assert.ok(
+    app._data.notice.includes('media path') || app._data.notice.includes('local media'),
+    'validation error surfaced in the notice'
+  );
+});
+
+test('manager remove-npc reassigns the owner and never deletes the shop', async () => {
+  const store = makeM3Store({
+    shops: [
+      {
+        id: 'shop1',
+        name: 'S',
+        owner: 'Mira',
+        inventory: [],
+        social: {},
+        npcs: [baseNpc('Mira', { personality: 'greedy' }), baseNpc('Tavi')],
+      },
+    ],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onRemoveNpc({}, { dataset: { npcId: 'npc-Mira' } }, {});
+  assert.equal(store._calls.length, 1, 'a reassignment patch was written');
+  const { patch } = store._calls[0];
+  assert.equal(patch.npcs.length, 1, 'removed merchant dropped');
+  assert.equal(patch.npcs[0].name, 'Tavi', 'remaining merchant kept in order');
+  assert.equal(patch.owner, 'Tavi', 'owner reassigned to the new primary');
+});
+
+test('manager manual reputation adjustment validates and calls the GM-only adjust', async () => {
+  const store = makeM3Store({
+    shops: [{ id: 'shop1', name: 'S', owner: '', npcs: [], inventory: [], social: {} }],
+    events: [
+      {
+        shopId: 'shop1',
+        scope: 'actor',
+        subjectId: 'Actor.a1',
+        status: 'committed',
+        delta: 5,
+        reason: 'Helped the shop',
+        createdAt: Date.now(),
+      },
+    ],
+  });
+  const adjustCalls = [];
+  const app = new MarketManager({
+    deps: {
+      store,
+      isGM: () => true,
+      systemId: () => 'dnd5e',
+      getActor: async () => ({ id: 'a1', uuid: 'Actor.a1' }),
+      getReputation: async () => ({ score: 5, band: { title: 'Friendly' }, individual: 5, party: 0 }),
+      adjustReputation: async (params) => {
+        adjustCalls.push(params);
+        return { status: 'committed' };
+      },
+    },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._data.selectedReputationActorId = 'a1';
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="reputationDelta"]') return { value: '5' };
+      if (sel === '[name="reputationReason"]') return { value: 'Helped the shop' };
+      return null;
+    },
+  };
+  await app._onAdjustReputation({}, {}, {});
+  assert.equal(adjustCalls.length, 1, 'adjust invoked once');
+  const params = adjustCalls[0];
+  assert.equal(params.shopId, 'shop1');
+  assert.equal(params.scope, 'actor');
+  assert.equal(params.subjectId, 'Actor.a1');
+  assert.equal(params.delta, 5);
+  assert.equal(params.reason, 'Helped the shop');
+  assert.ok(params.requestId, 'fresh idempotency requestId supplied');
+  assert.equal(app._data.notice, '', 'no notice on a committed adjust');
+  assert.equal(app._data.selectedReputation.score, 5, 'reputation reloaded after the adjust');
+  assert.equal(app._data.reputationHistory.length, 1, 'committed history reloaded');
+  assert.equal(app._data.reputationHistory[0].reason, 'Helped the shop');
+});
+
+test('manager reputation adjust rejects a zero delta and a missing reason without invoking the API', async () => {
+  const store = makeM3Store({
+    shops: [{ id: 'shop1', name: 'S', inventory: [], social: {} }],
+  });
+  let adjustCalls = 0;
+  const app = new MarketManager({
+    deps: {
+      store,
+      isGM: () => true,
+      systemId: () => 'dnd5e',
+      adjustReputation: async () => {
+        adjustCalls++;
+        return { status: 'committed' };
+      },
+    },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._data.selectedReputationActorId = 'a1';
+  app.render = async () => {};
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="reputationDelta"]') return { value: '0' };
+      if (sel === '[name="reputationReason"]') return { value: 'No reason' };
+      return null;
+    },
+  };
+  await app._onAdjustReputation({}, {}, {});
+  assert.equal(adjustCalls, 0, 'no adjust call for a zero delta');
+  assert.equal(app._data.notice, 'Adjustment must be a non-zero whole number.');
+  app.element = {
+    querySelector: (sel) => {
+      if (sel === '[name="reputationDelta"]') return { value: '5' };
+      if (sel === '[name="reputationReason"]') return { value: '   ' };
+      return null;
+    },
+  };
+  await app._onAdjustReputation({}, {}, {});
+  assert.equal(adjustCalls, 0, 'no adjust call for a missing reason');
+  assert.equal(app._data.notice, 'A reason is required for a reputation adjustment.');
+});
+
+// ---- M3: storefront personalized quote / privacy / refusal / staleness ---------
+
+test('storefront actor switch requests a personalized catalog and clears stale per-actor data', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: {
+      hasActiveGM: () => true,
+      request: async (payload) => {
+        sent.push(payload);
+        return null;
+      },
+    },
+  });
+  app.render = async () => {};
+  app._data.actors = [{ id: 'a1', name: 'A' }, { id: 'a2', name: 'B' }];
+  app._data.selectedActorId = 'a1';
+  app._data.relationship = { score: 5, title: 'Friendly', individual: 5, party: 0 };
+  app._data.merchants = [{ name: 'Mira' }];
+  app._data.inventory = [{ id: 'e1', price: 10 }];
+  app._data.selectedEntryId = 'e1';
+  await app._onSelectActor({}, { value: 'a2' }, {});
+  assert.equal(app._data.selectedActorId, 'a2');
+  assert.equal(app._data.relationship, null, 'relationship cleared on switch');
+  assert.equal(app._data.merchants.length, 0, 'merchants cleared on switch');
+  assert.equal(app._data.inventory.length, 0, 'stale catalog cleared on switch');
+  assert.equal(app._data.selectedEntryId, null, 'detail cleared on switch');
+  assert.ok(sent.length >= 1, 'a catalog request was issued');
+  const last = sent[sent.length - 1];
+  assert.equal(last.type, 'catalog');
+  assert.equal(last.actorId, 'a2', 'personalized actorId sent');
+});
+
+test('storefront catalog response rejects a stale actor echo and applies a matching one', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { isGM: () => true } });
+  app._loaded = true;
+  // A no-op render keeps the response handler from calling `_onRender` (which
+  // iterates `game.actors`) as stray async activity after the test ends.
+  app.render = async () => {};
+  app._pendingCatalogRequestId = 'cat-2';
+  app._data.selectedActorId = 'a2';
+  app._data.shop = null;
+  const stale = {
+    flags: {
+      market: {
+        type: 'response',
+        response: {
+          requestId: 'cat-2',
+          actorId: 'a1',
+          shopId: 'shop1',
+          type: 'catalog',
+          shop: { id: 'shop1', name: 'Old' },
+          inventory: [],
+        },
+      },
+    },
+  };
+  await app._onChatMessage(stale, {}, 'gm1');
+  assert.equal(app._data.shop, null, 'a different-actor response is ignored');
+  assert.equal(app._pendingCatalogRequestId, 'cat-2', 'pending catalog request preserved');
+  const match = {
+    flags: {
+      market: {
+        type: 'response',
+        response: {
+          requestId: 'cat-2',
+          actorId: 'a2',
+          shopId: 'shop1',
+          type: 'catalog',
+          shop: { id: 'shop1', name: 'New' },
+          inventory: [{ id: 'e1' }],
+          merchants: [],
+          relationship: { score: 5, title: 'Friendly', individual: 5, party: 0 },
+        },
+      },
+    },
+  };
+  await app._onChatMessage(match, {}, 'gm1');
+  assert.equal(app._data.shop.name, 'New', 'a matching-actor response is applied');
+  assert.equal(app._pendingCatalogRequestId, null);
+});
+
+test('storefront _prepareContext derives priceLines and relationship modifierText without private data', () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: {} });
+  app._data.shop = { id: 'shop1', appearance: {} };
+  const priceBreakdown = {
+    quantity: 1,
+    unitBase: 100,
+    baseTotal: 100,
+    shopBps: 1500,
+    personalityBps: 0,
+    reputationBps: 4000,
+    haggleBps: 0,
+    adjustmentBps: 5500,
+    unitPrice: 155,
+    total: 155,
+    band: { title: 'Hated', threshold: -100 },
+    refused: true,
+  };
+  app._data.inventory = [
+    {
+      id: 'e1',
+      name: 'Potion',
+      category: 'C',
+      price: 100,
+      quantity: 1,
+      stockMode: 'finite',
+      canBuy: false,
+      priceBreakdown,
+      system: { value: 1 },
+      itemUuid: 'Compendium.a.Item.x',
+    },
+  ];
+  app._data.relationship = { score: -100, title: 'Hated', individual: -100, party: 0 };
+  const ctx = app._prepareContext();
+  const lines = ctx.inventory[0].priceLines;
+  assert.ok(Array.isArray(lines), 'priceLines derived from the breakdown');
+  const byLabel = Object.fromEntries(lines.map((l) => [l.label, l.value]));
+  assert.equal(byLabel['Base price'], '100');
+  assert.equal(byLabel['Shop adjustment'], '+15%');
+  assert.equal(byLabel['Reputation adjustment'], '+40%');
+  assert.equal(byLabel['Total adjustment'], '+55%');
+  assert.equal(byLabel['Final price'], '155');
+  assert.equal(ctx.relationship.title, 'Hated');
+  assert.equal(ctx.relationship.score, -100);
+  assert.ok(ctx.relationship.modifierText.includes('Hated'), 'modifierText derived from the band');
+  assert.ok(ctx.relationship.modifierText.includes('+40%'), 'modifierText reflects the quote');
+  assert.ok(!('partyId' in ctx.relationship), 'no private party id leaked');
+  assert.ok(!('priceLines' in app._data.inventory[0]), 'raw inventory entry untouched');
+});
+
+test('storefront rejects a purchase on a canBuy false (Hated) entry', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { hasActiveGM: () => true } });
+  app._data.selectedActorId = 'a1';
+  app._data.inventory = [{ id: 'e1', canBuy: false }];
+  let sent = null;
+  app._request = (payload) => {
+    sent = payload;
+    return Promise.resolve(null);
+  };
+  app.render = async () => {};
+  app._requestPurchase('e1');
+  await Promise.resolve();
+  assert.equal(sent, null, 'no purchase request sent');
+  assert.ok(app._data.feedback.includes('refuses'), 'refusal feedback surfaced');
+});
+
+test('storefront maps a service-refused purchase error to a readable message', () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: {} });
+  const text = app._purchaseErrorText({ status: 'failed', error: 'service-refused' });
+  assert.ok(text.includes('standing'), 'service-refused mapped to a readable message');
+});
+
+test('storefront still purchases a personalized canBuy entry (M1 flow intact)', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { hasActiveGM: () => true } });
+  app._data.selectedActorId = 'a1';
+  app._data.inventory = [{ id: 'e1', canBuy: true, priceBreakdown: null }];
+  let sent = null;
+  app._readQuantity = () => 2;
+  app._request = (payload) => {
+    sent = payload;
+    return Promise.resolve(null);
+  };
+  app.render = async () => {};
+  app._requestPurchase('e1');
+  await Promise.resolve();
+  assert.ok(sent, 'a canBuy entry is purchased');
+  assert.equal(sent.entryId, 'e1');
+  assert.equal(sent.quantity, 2);
+  assert.equal(sent.actorId, 'a1');
+});
+
+test('shop template disables the catalog Buy button on a Hated canBuy false entry', () => {
+  const template = readFileSync(new URL('../templates/shop.hbs', import.meta.url), 'utf8');
+  const cardButton = template.match(/data-action="buy" data-entry-id="\{\{entry\.id\}\}"[^>]*>/);
+  assert.ok(cardButton, 'product-card Buy button found in the shop template');
+  assert.match(cardButton[0], /entry\.canBuy/, 'card button disables on a canBuy false entry');
+});
+
+// ---- M3 final blockers: blank actor UX + staleness + remove-npc sync ---------
+
+test('storefront initial auto-select picks the first owned actor exactly once on first render', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: {
+      hasActiveGM: () => true,
+      ownedActors: () => [{ id: 'a1', name: 'A' }, { id: 'a2', name: 'B' }],
+      request: async (payload) => {
+        sent.push(payload);
+        return null;
+      },
+    },
+  });
+  app.element = null;
+  await app._onRender({});
+  assert.equal(app._data.selectedActorId, 'a1', 'first owned actor auto-selected on first render');
+  assert.ok(sent.length >= 1, 'a catalog request was issued');
+  assert.equal(sent[sent.length - 1].actorId, 'a1', 'catalog requested for the auto-selected actor');
+  // A later render (choice already made) does not re-run the auto-select.
+  await app._onRender({});
+  assert.equal(app._data.selectedActorId, 'a1', 'a later render does not re-select');
+});
+
+test('storefront an explicit blank actor selection stays blank and requests the base catalog', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: {
+      hasActiveGM: () => true,
+      ownedActors: () => [{ id: 'a1', name: 'A' }],
+      request: async (payload) => {
+        sent.push(payload);
+        return null;
+      },
+    },
+  });
+  app.element = null;
+  // The player explicitly chose no character (blank/null). This must survive a
+  // re-render (no auto-select) and request the base public catalog.
+  app._data.selectedActorId = null;
+  await app._onRender({});
+  assert.equal(app._data.selectedActorId, null, 'an explicit blank stays blank through render');
+  assert.ok(sent.length >= 1, 'a catalog request was issued');
+  assert.equal(sent[sent.length - 1].actorId, null, 'base public catalog requested (no rep leak)');
+});
+
+test('storefront catalog request uses the data actor snapshot, not a stale DOM actor select', async () => {
+  const sent = [];
+  const app = new MarketStorefront({
+    shopId: 'shop1',
+    deps: {
+      hasActiveGM: () => true,
+      request: async (payload) => {
+        sent.push(payload);
+        return null;
+      },
+    },
+  });
+  app.render = async () => {};
+  app._data.actors = [{ id: 'a1', name: 'A' }, { id: 'a2', name: 'B' }];
+  app._data.selectedActorId = 'a2';
+  // The actor `<select>` still holds the OLD actor (a1) from before a switch;
+  // the catalog request must use the data snapshot, never the DOM value.
+  app.element = {
+    querySelector: (sel) => (sel === '[name="actorId"]' ? { type: 'select-one', value: 'a1' } : null),
+    querySelectorAll: () => [],
+  };
+  await app._requestCatalog();
+  assert.ok(sent.length >= 1, 'a catalog request was issued');
+  assert.equal(sent[sent.length - 1].actorId, 'a2', 'uses the data actor, not the stale DOM value');
+});
+
+test('storefront correlation matches the data actor even when the DOM actor select is stale', async () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { isGM: () => true } });
+  app._loaded = true;
+  app.render = async () => {};
+  app._pendingCatalogRequestId = 'cat-9';
+  app._data.selectedActorId = 'a2';
+  app._data.shop = null;
+  // The actor select still reports a1 while the data actor is a2.
+  app.element = {
+    querySelector: (sel) => (sel === '[name="actorId"]' ? { type: 'select-one', value: 'a1' } : null),
+  };
+  const stale = {
+    flags: {
+      market: {
+        type: 'response',
+        response: {
+          requestId: 'cat-9',
+          actorId: 'a1',
+          shopId: 'shop1',
+          type: 'catalog',
+          shop: { id: 'shop1', name: 'Old' },
+          inventory: [],
+        },
+      },
+    },
+  };
+  await app._onChatMessage(stale, {}, 'gm1');
+  assert.equal(app._data.shop, null, 'a stale-DOM actor response is rejected');
+  assert.equal(app._pendingCatalogRequestId, 'cat-9', 'pending catalog request preserved');
+  const match = {
+    flags: {
+      market: {
+        type: 'response',
+        response: {
+          requestId: 'cat-9',
+          actorId: 'a2',
+          shopId: 'shop1',
+          type: 'catalog',
+          shop: { id: 'shop1', name: 'New' },
+          inventory: [],
+        },
+      },
+    },
+  };
+  await app._onChatMessage(match, {}, 'gm1');
+  assert.equal(app._data.shop.name, 'New', 'a response for the data actor is accepted');
+  assert.equal(app._pendingCatalogRequestId, null);
+});
+
+test('manager remove-npc promotes the new primary and syncs social primary personality', async () => {
+  const store = makeM3Store({
+    shops: [
+      {
+        id: 'shop1',
+        name: 'S',
+        owner: 'Mira',
+        inventory: [],
+        social: { primaryPersonality: 'greedy', individualWeight: 70, partyWeight: 30 },
+        npcs: [
+          baseNpc('Mira', { personality: 'greedy' }),
+          baseNpc('Tavi', { personality: 'honest' }),
+          baseNpc('Nia', { personality: 'generous' }),
+        ],
+      },
+    ],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onRemoveNpc({}, { dataset: { npcId: 'npc-Mira' } }, {});
+  assert.equal(store._calls.length, 1, 'a reassignment patch was written');
+  const { patch } = store._calls[0];
+  assert.equal(patch.npcs[0].name, 'Tavi', 'remaining merchant promoted in order');
+  assert.equal(patch.owner, 'Tavi', 'owner reassigned to the new primary');
+  assert.equal(patch.social.primaryPersonality, 'honest', 'social primary synced to the new primary personality');
+  assert.equal(patch.social.individualWeight, 70, 'other social fields preserved');
+  assert.equal(patch.social.partyWeight, 30, 'other social fields preserved');
+});
+
+test('manager remove-npc keeps the shop social primary unchanged when no merchants remain', async () => {
+  const store = makeM3Store({
+    shops: [
+      {
+        id: 'shop1',
+        name: 'S',
+        owner: 'Mira',
+        inventory: [],
+        social: { primaryPersonality: 'greedy', individualWeight: 70, partyWeight: 30 },
+        npcs: [baseNpc('Mira', { personality: 'greedy' })],
+      },
+    ],
+  });
+  const app = new MarketManager({
+    deps: { store, isGM: () => true, systemId: () => 'dnd5e' },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._refreshData = async () => {};
+  app.render = async () => {};
+  await app._onRemoveNpc({}, { dataset: { npcId: 'npc-Mira' } }, {});
+  assert.equal(store._calls.length, 1, 'a reassignment patch was written');
+  const { patch } = store._calls[0];
+  assert.equal(patch.npcs.length, 0, 'roster emptied');
+  assert.equal(patch.owner, '', 'owner blanked when no merchants remain');
+  assert.ok(!('social' in patch), 'no social patch when the roster is empty (primary left unchanged)');
+});
+
+// ---- M3 repair: reputation actor selector uses the native change event ---------
+
+test('manager reputation actor change event loads the actor score and history', async () => {
+  const store = makeM3Store({
+    shops: [{ id: 'shop1', name: 'S', owner: '', npcs: [], inventory: [], social: {} }],
+    events: [
+      {
+        shopId: 'shop1',
+        scope: 'actor',
+        subjectId: 'Actor.a2',
+        status: 'committed',
+        delta: 7,
+        reason: 'Great customer',
+        createdAt: Date.now(),
+      },
+    ],
+  });
+  const app = new MarketManager({
+    deps: {
+      store,
+      isGM: () => true,
+      systemId: () => 'dnd5e',
+      listActors: () => [
+        { id: 'a1', name: 'A', uuid: 'Actor.a1' },
+        { id: 'a2', name: 'B', uuid: 'Actor.a2' },
+      ],
+      getActor: async (id) => ({ id, uuid: `Actor.${id}` }),
+      getReputation: async (_shopId, actorId) => ({
+        score: actorId === 'a2' ? 7 : 0,
+        band: { title: actorId === 'a2' ? 'Friendly' : 'Neutral' },
+        individual: actorId === 'a2' ? 7 : 0,
+        party: 0,
+      }),
+    },
+  });
+  app._data.selectedShopId = 'shop1';
+  app._loaded = true;
+  let rendered = false;
+  app.render = async () => {
+    rendered = true;
+  };
+  const listeners = {};
+  let addCount = 0;
+  const select = {
+    value: '',
+    addEventListener(type, fn) {
+      addCount++;
+      listeners[type] = fn;
+    },
+  };
+  app.element = {
+    querySelector: (sel) => (sel === '[name="reputationActorId"]' ? select : null),
+    querySelectorAll: () => [],
+  };
+  // Bind once via _onRender; a second render on the same node must not stack.
+  await app._onRender({});
+  assert.equal(addCount, 1, 'change listener bound once');
+  await app._onRender({});
+  assert.equal(addCount, 1, 'no stacked change listener on the same node');
+  // The actor `<select>` change event drives the selection (no data-action click).
+  select.value = 'a2';
+  await listeners.change();
+  assert.equal(app._data.selectedReputationActorId, 'a2', 'actor selection captured from the select value');
+  assert.equal(app._data.selectedReputation.score, 7, 'actor effective score loaded');
+  assert.equal(app._data.selectedReputation.title, 'Friendly');
+  assert.equal(app._data.selectedReputation.individual, 7);
+  assert.equal(app._data.reputationHistory.length, 1, 'committed history loaded');
+  assert.equal(app._data.reputationHistory[0].reason, 'Great customer');
+  assert.equal(rendered, true, 'selection re-rendered with the actor record');
 });

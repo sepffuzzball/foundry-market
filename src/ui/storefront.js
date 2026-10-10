@@ -108,12 +108,22 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       hasGM: this._hasActiveGM(),
       currencyLabel: this._currencyLabel(),
       actors: [],
-      selectedActorId: null,
+      // `undefined` means "no actor chosen yet"; only the initial auto-select
+      // treats that as "pick the first owned actor" (once). An explicit blank/null
+      // selection the player makes must stay blank through later re-renders and
+      // request the base public catalog.
+      selectedActorId: undefined,
       pending: false,
       loading: false,
       feedback: '',
       notice: '',
       error: null,
+      // Per-actor social data projected from the catalog response. `merchants`
+      // is the PUBLIC merchant projection and `relationship` is the PUBLIC
+      // sanitized relationship; both are cleared on actor switch so a stale
+      // actor's personalized prices and standing never bleed into a new one.
+      merchants: [],
+      relationship: null,
       // Storefront browsing state (M2). These live in `_data`; the display list
       // is derived in `_prepareContext` so M1 callers inspecting `_data.inventory`
       // continue to see the raw catalog.
@@ -136,20 +146,116 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     // `_data.inventory`, which M1 tests and purchase/catalog logic read.
     const list = this._catalogEntries();
     const id = this._data.selectedEntryId;
-    const selectedEntry = (id && list.find((e) => e.id === id)) || null;
+    // Add a safe, display-only `priceLines` array to each entry so the template
+    // never needs to interpret a raw price breakdown. The raw `_data.inventory`
+    // entries (and their validated `priceBreakdown`) stay untouched.
+    const entries = list.map((e) => ({ ...e, priceLines: this._priceLinesFor(e) }));
+    const selectedEntry = (id && entries.find((e) => e.id === id)) || null;
     return {
       ...this._data,
-      inventory: list,
+      inventory: entries,
       categories: this._catalogCategories(),
       selectedEntry,
+      // The raw `_data.relationship` is the sanitized server projection; augment
+      // it with the display `modifierText` and never expose a private record.
+      relationship: this._prepareRelationship(),
+      merchants: this._data.merchants || [],
     };
+  }
+
+  /**
+   * Build the player-facing relationship view. Adds a human-readable
+   * `modifierText` derived from the band title / a catalog quote. Returns null
+   * when no relationship was supplied (non-personalized catalog).
+   */
+  _prepareRelationship() {
+    const rel = this._data.relationship;
+    if (!rel) return null;
+    return {
+      ...rel,
+      modifierText: this._relationshipModifierText(rel),
+    };
+  }
+
+  /**
+   * Derive a short, non-mechanical description of how the player's standing
+   * affects prices. Reads the reputation basis-point modifier from a catalog
+   * quote (the same validated price breakdown already sent to the player) so it
+   * never claims a number it did not measure; falls back to a neutral phrase when
+   * the quote carries no reputation adjustment.
+   */
+  _relationshipModifierText(rel) {
+    const title = rel?.title || '';
+    let repBps = null;
+    for (const e of this._data.inventory || []) {
+      const pd = e?.priceBreakdown;
+      if (!pd || typeof pd.reputationBps !== 'number') continue;
+      // Prefer the quote whose band title matches this relationship; otherwise
+      // keep the most recent reputationBps encountered as a fallback.
+      repBps = pd.reputationBps;
+      if (pd.band?.title === title) break;
+    }
+    if (repBps == null || repBps === 0) {
+      return title ? `Your standing (${title}) leaves prices unchanged.` : '';
+    }
+    const pct = repBps / 100;
+    const sign = pct > 0 ? '+' : '';
+    const verb = pct > 0 ? 'raises' : 'lowers';
+    const who = title ? `Your standing (${title})` : 'Your standing';
+    return `${who} ${verb} prices by ${sign}${pct}%.`;
+  }
+
+  /**
+   * Produce a safe `{label, value}` price-line list for a catalog entry from its
+   * validated price breakdown. Breaks the raw bps fields into human-readable
+   * percentage labels and surfaces the base, per-adjustment and final amounts.
+   * Returns an empty array when no breakdown exists (e.g. a non-social quote).
+   */
+  _priceLinesFor(entry) {
+    const pd = entry?.priceBreakdown;
+    if (!pd || typeof pd !== 'object') return [];
+    const out = [];
+    const base = pd.unitBase ?? pd.baseTotal;
+    if (typeof base === 'number') out.push({ label: 'Base price', value: String(base) });
+    const components = [
+      ['Shop', pd.shopBps],
+      ['Personality', pd.personalityBps],
+      ['Reputation', pd.reputationBps],
+      ['Haggle', pd.haggleBps],
+    ];
+    for (const [label, bps] of components) {
+      if (typeof bps === 'number' && bps !== 0) {
+        out.push({ label: `${label} adjustment`, value: this._bpsLabel(bps) });
+      }
+    }
+    if (typeof pd.adjustmentBps === 'number') {
+      out.push({ label: 'Total adjustment', value: this._bpsLabel(pd.adjustmentBps) });
+    }
+    const final = pd.unitPrice ?? pd.total;
+    if (typeof final === 'number') out.push({ label: 'Final price', value: String(final) });
+    return out;
+  }
+
+  /**
+   * Format a basis-point value as a signed percentage string (e.g. 1500 bps ->
+   * '+15%', -500 bps -> '-5%'). Non-finite values render as ''.
+   */
+  _bpsLabel(bps) {
+    if (typeof bps !== 'number' || !Number.isFinite(bps)) return '';
+    const pct = bps / 100;
+    const sign = pct > 0 ? '+' : '';
+    return `${sign}${pct}%`;
   }
 
   async _onRender(event) {
     this._data.hasGM = this._hasActiveGM();
     this._bindControls();
     this._data.actors = this._ownedActors();
-    if (!this._data.selectedActorId && this._data.actors.length) {
+    // Auto-select the first owned actor only while no choice has been made yet
+    // (`selectedActorId === undefined`). This fires exactly once on the initial
+    // render; afterwards an explicit blank/null selection (null) is never
+    // overwritten and keeps requesting the base public catalog.
+    if (this._data.selectedActorId === undefined && this._data.actors.length) {
       this._data.selectedActorId = this._data.actors[0].id;
     }
     this._applyStorefrontStyles();
@@ -252,12 +358,27 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
    * surface an error instead of leaving the storefront stuck loading.
    */
   async _sendCatalogRequest(requestId) {
+    // Snapshot the chosen actor BEFORE the re-render below, so the request never
+    // reads a stale/auto-selected DOM value from the actor `<select>`. Read only
+    // `_data.selectedActorId` (never `_selectedActorId()`/the DOM): an
+    // undefined/blank selection normalizes to null, which requests the base
+    // public catalog (no personalization, no reputation leak).
+    const actorId = this._data.selectedActorId ?? null;
     this._pendingCatalogRequestId = requestId;
     this._data.loading = true;
     this._data.notice = '';
     this.render({ force: true });
     try {
-      await this._request({ type: 'catalog', shopId: this._storefrontShopId, requestId });
+      await this._request({
+        type: 'catalog',
+        shopId: this._storefrontShopId,
+        // Ask for a personalized (per-actor) quote only when an actor is chosen.
+        // A null actorId requests the base public catalog instead. The response
+        // echoes the same actorId so the storefront can reject a stale response
+        // from a previously selected actor.
+        actorId,
+        requestId,
+      });
     } catch (err) {
       this._pendingCatalogRequestId = null;
       this._data.loading = false;
@@ -269,12 +390,21 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
 
   _requestPurchase(entryId) {
     if (this._data.pending) return;
+    // A Hated-standing item is flagged `canBuy false` by the server and the
+    // template disables the Buy button, but guard the action as well so a
+    // programmatic/edge click never sends a doomed purchase.
+    const entry = (this._data.inventory || []).find((e) => e.id === entryId);
+    if (entry?.canBuy === false) {
+      this._data.feedback = 'The shop refuses to serve you at your current standing.';
+      this.render({ force: true });
+      return;
+    }
     if (!this._hasActiveGM()) {
       this._data.feedback = 'A Game Master is not currently connected.';
       this.render({ force: true });
       return;
     }
-    const actorId = this._selectedActorId();
+    const actorId = this._data.selectedActorId;
     if (!actorId) {
       this._data.feedback = 'Choose a character to shop as.';
       this.render({ force: true });
@@ -314,23 +444,54 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     const response = message?.flags?.market?.response || {};
     const requestId = response.requestId;
     if (requestId && requestId === this._pendingCatalogRequestId) {
-      await this._onCatalogResponse(response);
+      // Reject a correlated response that was quoted for a DIFFERENT actor (e.g.
+      // the GM echoed a stale or forked actorId). A stale requestId is already
+      // filtered above, so this is the second correlation guard. `null` matches
+      // only the base (non-personalized) catalog.
+      if (this._catalogResponseActorMatches(response)) {
+        await this._onCatalogResponse(response);
+      }
     } else if (requestId && requestId === this._pendingPurchaseRequestId) {
       await this._onPurchaseResponse(response);
     }
   }
 
+  /**
+   * Check that a catalog response was quoted for the currently selected actor.
+   * The server echoes the request's `actorId`; a personalized request must come
+   * back for the SAME actor or be discarded, and a base (null) response only
+   * matches when no actor is selected. A missing echo (`undefined`) normalizes to
+   * null so a base catalog still matches.
+   */
+  _catalogResponseActorMatches(response) {
+    // Match against the SAME `_data.selectedActorId` snapshot used to send the
+    // request (never the DOM actor `<select>`), so the strict correlation cannot
+    // be fooled by a stale DOM value left over from an earlier actor.
+    const selected = this._data.selectedActorId ?? null;
+    const responseActor = response?.actorId ?? null;
+    return (responseActor ?? null) === selected;
+  }
+
   _onCatalogResponse(response) {
     this._pendingCatalogRequestId = null;
     this._data.loading = false;
+    // A generalized catalog refresh issued by a GM refresh (or a purchase-triggered
+    // refresh) may not carry a selected actor; always accept the public merchant
+    // projection and public relationship, but never let private store data leak.
+    this._data.merchants = Array.isArray(response.merchants) ? response.merchants : [];
     if (response.type === 'error') {
       this._data.shop = null;
       this._data.inventory = [];
+      this._data.relationship = null;
       this._data.error = response.error || 'catalog-error';
       this._data.notice = this._catalogErrorText(response.error);
     } else {
       this._data.shop = response.shop || null;
+      // The inventory entries carry the per-actor price quote (`priceBreakdown`,
+      // `basePrice`, `canBuy`); store them verbatim so the public catalog view and
+      // the later price-line derivation read from the same validated response.
       this._data.inventory = Array.isArray(response.inventory) ? response.inventory : [];
+      this._data.relationship = response.relationship || null;
       this._data.error = null;
       this._data.notice = '';
     }
@@ -374,6 +535,7 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       'actor-not-found': 'Character not found.',
       'adapter-unsupported': 'This system has no price adapter configured.',
       'not-a-gm': 'No active Game Master.',
+      'service-refused': 'The shop refused this sale due to your standing.',
       'conflicting duplicate payload': 'This request was already processed.',
       'ledger-pending': 'This purchase is pending recovery; please check the market ledger.',
       'server-error': 'The market server hit an error while processing the purchase.',
@@ -394,9 +556,18 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
   }
 
   async _onSelectActor(event, target, data) {
-    const id = target?.value ?? target?.dataset?.actorId;
-    this._data.selectedActorId = id;
+    const id = target?.value ?? target?.dataset?.actorId ?? null;
+    const selected = id || null;
+    this._data.selectedActorId = selected;
+    // Clear the previously quoted per-actor social data (and the stale catalog)
+    // so a re-render never shows the previous actor's personalized prices or
+    // standing while the new actor's quotes are in flight.
+    this._data.relationship = null;
+    this._data.merchants = [];
+    this._data.inventory = [];
+    this._data.selectedEntryId = null;
     this.render({ force: true });
+    await this._requestRefresh();
   }
 
   _selectedActorId() {
@@ -450,8 +621,10 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     }
     const actorSelect = root.querySelector('select[name="actorId"]');
     if (actorSelect) {
+      // The actor `<select>` is bound directly (not through `data-action`) so the
+      // switch clears the previous actor's personalized catalog and re-quotes.
       actorSelect.addEventListener('change', () => {
-        this._data.selectedActorId = actorSelect.value;
+        this._onSelectActor(null, actorSelect, {});
       });
     }
     const quantityInput = root.querySelector('input[name="quantity"]');

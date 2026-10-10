@@ -8,8 +8,10 @@
 //   - Handle player requests via ChatMessage (no raw socket).
 //   - Wire the M1 UI: market manager (GM), player storefront and canvas markers.
 
-import { makeId } from '../services/model.js';
+import { makeId, normalizePriceBreakdown } from '../services/model.js';
 import { createCommerce } from '../services/commerce.js';
+import { createReputationService } from '../social/service.js';
+import { quoteSocial } from '../social/pricing.js';
 import { getAdapter } from '../adapters/index.js';
 import { requestMessageData, attachMarketHandler } from './requests.js';
 import { store } from '../storage/store.js';
@@ -82,6 +84,40 @@ function registerSettingsMenu() {
   });
 }
 
+/**
+ * Resolve whether `userId` owns `actor` (or is a GM). Used by the commerce
+ * purchase path, the catalog actor guard and the public read/quote API methods.
+ */
+function actorOwnedBy(actor, userId) {
+  if (!actor) return false;
+  const user = game.users.get(userId);
+  if (!user) return false;
+  if (user.isGM) return true;
+  // Prefer the document API because it resolves the default ownership
+  // level for players rather than reading a raw ownership map that may not
+  // carry an entry for the user (falling back to `default`).
+  if (typeof actor.testUserPermission === 'function') {
+    const owner = CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER;
+    return actor.testUserPermission(user, owner);
+  }
+  const level = actor.ownership?.[userId];
+  return typeof level === 'number' && level >= 3; // CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER
+}
+
+/**
+ * Return the effective reputation of `actor` against `shop` through the live
+ * reputation service. Shared by the commerce purchase path (pre-debit social
+ * quote) and the catalog/quote API surface. Throws when the service is not yet
+ * built (it is created after commerce in `init`; this is only ever called at
+ * request/purchase time, well after startup).
+ */
+async function getSocialEffective(shop, actor) {
+  if (!repService) {
+    throw new Error('[market] reputation service not ready');
+  }
+  return repService.getEffective(shop, actor.uuid);
+}
+
 function buildCommerce() {
   return createCommerce({
     store,
@@ -96,24 +132,11 @@ function buildCommerce() {
       const user = game.users.get(userId);
       return !!user && user.isGM;
     },
-    actorOwnedBy: (actor, userId) => {
-      if (!actor) return false;
-      const user = game.users.get(userId);
-      if (!user) return false;
-      if (user.isGM) return true;
-      // Prefer the document API because it resolves the default ownership
-      // level for players rather than reading a raw ownership map that may not
-      // carry an entry for the user (falling back to `default`).
-      if (typeof actor.testUserPermission === 'function') {
-        const owner = CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER;
-        return actor.testUserPermission(user, owner);
-      }
-      const level = actor.ownership?.[userId];
-      return typeof level === 'number' && level >= 3; // CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER
-    },
+    actorOwnedBy,
     logger: console,
     now: () => Date.now(),
     makeId,
+    getSocial: getSocialEffective,
   });
 }
 
@@ -126,6 +149,9 @@ function buildRequestContext(commerce) {
     gmIds: () => game.users.filter((u) => u.isGM).map((u) => u.id),
     respond: (data) =>
       ChatMessage.create({ ...data, style: CONST.CHAT_MESSAGE_STYLES.OOC }),
+    getActor: (id) => (id ? game.actors.get(id) : null),
+    actorOwnedBy,
+    getSocial: getSocialEffective,
   };
 }
 
@@ -198,6 +224,75 @@ function exposeApi(commerce) {
       });
       return ChatMessage.create({ ...data, style: CONST.CHAT_MESSAGE_STYLES.OOC });
     },
+    // M3 reputation + social pricing surface. `adjust` is GM-only: the service
+    // itself is GM-gated, but the API wrapper rejects a non-GM caller up front
+    // and always passes THIS user's id (never a caller-supplied, possibly forged
+    // GM id). `getEffective` is the safest GM-only read helper: a non-GM caller
+    // is rejected (returns null) before any service read, so it can never probe
+    // another player's reputation; public/owned reads go through
+    // `getReputation`/`quotePrice`, which check actor ownership and return null
+    // when the actor is not owned by the current user (or GM) and never leak a
+    // hidden entry.
+    reputation: {
+      getEffective: (shop, actorUuid) => {
+        // GM-only: reject a non-GM caller before touching the service (never
+        // leaks an unowned/untrusted actor's private reputation score).
+        if (!game.user?.isGM) return null;
+        return repService.getEffective(shop, actorUuid);
+      },
+      adjust: (params) => {
+        if (!game.user?.isGM) {
+          return Promise.resolve({ status: 'error', error: 'not-a-gm' });
+        }
+        return repService.adjust(params, game.user.id);
+      },
+    },
+    getReputation: async (shopId, actorId) => {
+      const actor = game.actors.get(actorId);
+      if (!actor) return null;
+      if (!(game.user?.isGM || actorOwnedBy(actor, game.user.id))) return null;
+      const shop = await store.findShop(shopId);
+      if (!shop) return null;
+      return repService.getEffective(shop, actor.uuid);
+    },
+    quotePrice: async (shopId, entryId, actorId, qty) => {
+      const actor = game.actors.get(actorId);
+      if (!actor) return null;
+      if (!(game.user?.isGM || actorOwnedBy(actor, game.user.id))) return null;
+      const shop = await store.findShop(shopId);
+      if (!shop) return null;
+      const entry = shop.inventory.find((e) => e.id === entryId);
+      if (!entry) return null;
+      if (entry.visible === false) return null;
+      const effective = await repService.getEffective(shop, actor.uuid);
+      const quote = quoteSocial(entry, qty == null ? 1 : qty, {
+        shop,
+        scores: { individual: effective.individual, party: effective.party },
+      });
+      return {
+        entryId,
+        basePrice: entry.price,
+        unitPrice: quote.unitPrice,
+        total: quote.total,
+        quantity: quote.quantity,
+        refused: quote.refused,
+        band: quote.band,
+        priceBreakdown: normalizePriceBreakdown({
+          quantity: quote.quantity,
+          unitBase: quote.unitBase,
+          baseTotal: quote.baseTotal,
+          shopBps: quote.shopBps,
+          personalityBps: quote.personalityBps,
+          reputationBps: quote.reputationBps,
+          haggleBps: quote.haggleBps,
+          adjustmentBps: quote.adjustmentBps,
+          unitPrice: quote.unitPrice,
+          total: quote.total,
+          band: quote.band,
+          refused: quote.refused,
+        }),
+      };
+    },
     openManager: () => {
       // GM-only: fail closed (render nothing) rather than constructing the
       // manager for a non-GM user that cannot edit the private store.
@@ -246,11 +341,22 @@ function registerJournalDirectory() {
 }
 
 let commerceInstance = null;
+let repService = null;
 
 Hooks.once('init', () => {
   registerSettings();
   registerSettingsMenu();
   commerceInstance = buildCommerce();
+  repService = createReputationService({
+    store,
+    runShopExclusive: commerceInstance.runShopExclusive,
+    isGM: (userId) => {
+      const user = game.users.get(userId);
+      return !!user && user.isGM;
+    },
+    makeId,
+    now: () => Date.now(),
+  });
   exposeApi(commerceInstance);
 });
 

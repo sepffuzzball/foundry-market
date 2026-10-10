@@ -4,11 +4,15 @@
 // imported by Node for tests. Only plain data helpers live here.
 
 import { normalizeTheme } from '../themes/registry.js';
+import { isValidPersonality } from '../social/personalities.js';
+import { clampReputation } from '../social/reputation.js';
 
 export const SCHEMA_VERSION = 1;
 export const LOCATION_KIND = 'location';
 export const SHOP_KIND = 'shop';
 export const LEDGER_KIND = 'ledger';
+export const REPUTATION_KIND = 'reputation';
+export const REPUTATION_EVENT_KIND = 'reputationEvent';
 
 export const STOCK_MODES = ['finite', 'unlimited', 'non-restocking'];
 export const LEDGER_STATUSES = ['pending', 'committed', 'failed', 'needsRecovery'];
@@ -26,6 +30,26 @@ export const WELCOME_MESSAGE_MAX = 500;
 export const PUBLIC_DESCRIPTION_MAX = 1000;
 export const CATEGORY_MAX = 120;
 export const RARITY_MAX = 60;
+
+// ---- M3 social constants ---------------------------------------------------
+// A shop carries at most one primary NPC and up to MAX_SHOP_NPCS total. The
+// primary (first) NPC is the shop owner on a legacy shop and the name/portrait
+// are kept synchronized with the legacy `owner` string.
+export const MAX_SHOP_NPCS = 3;
+export const NPC_GREETING_MAX = 500;
+
+// Basis-point adjustments are bounded. Reputation and shop markup are read from
+// the same range used by the social pricing engine.
+export const SOCIAL_BPS_MIN = -9000;
+export const SOCIAL_BPS_MAX = 50000;
+
+// Combined adjustment envelope for a social price breakdown. Each component
+// (shop/personality/reputation/haggle) is individually bounded to
+// [SOCIAL_BPS_MIN, SOCIAL_BPS_MAX], but quoteSocial sums them additively, so the
+// combined `adjustmentBps` may span the full sum of those bounds and must be
+// validated against these combined bounds, not the per-component ones.
+export const SOCIAL_COMBINED_BPS_MIN = -36000;
+export const SOCIAL_COMBINED_BPS_MAX = 200000;
 
 export const ACCENT_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
@@ -237,6 +261,164 @@ export function normalizeInventoryEntry(raw = {}) {
   };
 }
 
+// ---- M3 social + NPC normalization ----------------------------------------
+
+function intInRange(value, min, max, label) {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`[market] '${label}' must be a safe integer, got ${value}`);
+  }
+  if (value < min || value > max) {
+    throw new Error(`[market] '${label}' must be between ${min} and ${max}, got ${value}`);
+  }
+  return value;
+}
+
+function bpsInRange(value, label) {
+  return intInRange(value, SOCIAL_BPS_MIN, SOCIAL_BPS_MAX, label);
+}
+
+function normalizeAutoPurchase(raw = {}) {
+  const enabled = raw.enabled === true ? true : false;
+  const minimumSpend = assertInteger(
+    raw.minimumSpend ?? 100,
+    'shop.social.autoPurchase.minimumSpend'
+  );
+  const cooldownSeconds = assertInteger(
+    raw.cooldownSeconds ?? 86400,
+    'shop.social.autoPurchase.cooldownSeconds'
+  );
+  const delta = assertInteger(raw.delta ?? 1, 'shop.social.autoPurchase.delta', { min: 1 });
+  return { enabled, minimumSpend, cooldownSeconds, delta };
+}
+
+/**
+ * Normalize a shop's `social` object to a known, validated shape. The two
+ * personality weight fields must be bounded integers and, when both are
+ * supplied, must sum to exactly 100 (a strict percent split). `partyId` is
+ * empty by default and a missing secondary personality collapses to ''.
+ */
+export function normalizeShopSocial(raw = {}) {
+  const primaryPersonality = isValidPersonality(raw.primaryPersonality)
+    ? raw.primaryPersonality
+    : 'honest';
+  const secondaryPersonality =
+    raw.secondaryPersonality && isValidPersonality(raw.secondaryPersonality)
+      ? raw.secondaryPersonality
+      : '';
+  const secondaryWeight = intInRange(
+    raw.secondaryWeight ?? 0,
+    0,
+    100,
+    'shop.social.secondaryWeight'
+  );
+
+  const hasIndividual = raw.individualWeight != null;
+  const hasParty = raw.partyWeight != null;
+  let individualWeight = intInRange(
+    raw.individualWeight ?? 70,
+    0,
+    100,
+    'shop.social.individualWeight'
+  );
+  let partyWeight = intInRange(raw.partyWeight ?? 30, 0, 100, 'shop.social.partyWeight');
+  if (hasIndividual && hasParty) {
+    if (individualWeight + partyWeight !== 100) {
+      throw new Error(
+        `[market] shop.social individualWeight + partyWeight must equal 100, got ${individualWeight} + ${partyWeight}`
+      );
+    }
+  } else if (hasIndividual) {
+    partyWeight = 100 - individualWeight;
+  } else if (hasParty) {
+    individualWeight = 100 - partyWeight;
+  }
+
+  const partyId = assertString(raw.partyId ?? '', 'shop.social.partyId', { allowEmpty: true });
+  const shopMarkupBps = bpsInRange(raw.shopMarkupBps ?? 0, 'shop.social.shopMarkupBps');
+  const autoPurchase = normalizeAutoPurchase(raw.autoPurchase);
+
+  return {
+    primaryPersonality,
+    secondaryPersonality,
+    secondaryWeight,
+    individualWeight,
+    partyWeight,
+    partyId,
+    shopMarkupBps,
+    autoPurchase,
+  };
+}
+
+/**
+ * Normalize a single shop NPC to a known shape. `name` is required; all other
+ * fields fall back to documented defaults. The `portrait` is a local media path
+ * validated with the same strict media-path rules as the shop appearance, and
+ * `personality` falls back to 'honest' when unknown.
+ */
+export function normalizeNpc(raw = {}) {
+  const id = raw.id || makeId();
+  const name = assertString(raw.name, 'npcs[].name');
+  const role = assertString(raw.role ?? '', 'npcs[].role', { allowEmpty: true });
+  const actorUuid = assertString(raw.actorUuid ?? '', 'npcs[].actorUuid', { allowEmpty: true });
+  const portrait = assertMediaPath(raw.portrait, 'npcs[].portrait');
+  const greeting = assertString(raw.greeting ?? '', 'npcs[].greeting', { allowEmpty: true }).slice(
+    0,
+    NPC_GREETING_MAX
+  );
+  const personality = isValidPersonality(raw.personality) ? raw.personality : 'honest';
+  const visible = raw.visible === false ? false : true;
+  return { id, name, role, actorUuid, portrait, greeting, personality, visible };
+}
+
+function ownerNpc(owner, social, shopId) {
+  return {
+    // The primary (owner) NPC on a legacy shop gets a deterministic id derived
+    // from the stable shop id, so re-normalizing the same shop never regenerates
+    // it, and an owner name change keeps the same id.
+    id: `owner-${shopId}`,
+    name: owner,
+    role: '',
+    actorUuid: '',
+    portrait: '',
+    greeting: '',
+    personality: social.primaryPersonality,
+    visible: true,
+  };
+}
+
+/**
+ * Resolve a shop's NPC list and synchronized `owner` string. A shop carries at
+ * most MAX_SHOP_NPCS NPCs (extra entries are dropped). The first (primary) NPC
+ * is the shop owner: on a legacy shop (no npcs field) it is created from the
+ * existing `owner` string, and the returned `owner` string is kept synchronized
+ * from the first NPC. When raw NPCs exist alongside a non-empty `owner` string
+ * changed through the manager's legacy owner field, the owner value takes
+ * precedence and is applied to the primary NPC's name so an owner edit made
+ * before NPCs were introduced is never lost.
+ *
+ * A new shop with no owner (empty `owner` string) has zero NPCs; the primary
+ * owner NPC is only created once the GM specifies an owner.
+ *
+ * `shopId` is the stable shop id, used to derive the deterministic owner NPC id
+ * so the same shop always maps to the same primary NPC id.
+ */
+function resolveNpcs(raw, owner, social, shopId) {
+  if (Array.isArray(raw.npcs)) {
+    let npcs = raw.npcs.slice(0, MAX_SHOP_NPCS).map(normalizeNpc);
+    if (npcs.length === 0 && owner !== '') {
+      npcs = [ownerNpc(owner, social, shopId)];
+    } else if (npcs.length > 0 && owner !== '') {
+      npcs[0] = { ...npcs[0], name: owner };
+    }
+    const outOwner = npcs.length > 0 ? npcs[0].name : owner;
+    return { npcs, owner: outOwner };
+  }
+  if (owner !== '') {
+    return { npcs: [ownerNpc(owner, social, shopId)], owner };
+  }
+  return { npcs: [], owner: owner };
+}
+
 export function normalizeShop(raw = {}) {
   const name = assertString(raw.name, 'shop.name');
   const open = raw.open === false ? false : true;
@@ -248,9 +430,13 @@ export function normalizeShop(raw = {}) {
   const inventory = (Array.isArray(raw.inventory) ? raw.inventory : []).map(
     normalizeInventoryEntry
   );
+  const id = raw.id || makeId();
+  const owner = assertString(raw.owner ?? '', 'shop.owner', { allowEmpty: true });
+  const social = normalizeShopSocial(raw.social);
+  const resolved = resolveNpcs(raw, owner, social, id);
 
   return {
-    id: raw.id || makeId(),
+    id,
     name,
     locationId: assertString(raw.locationId ?? '', 'shop.locationId', {
       allowEmpty: true,
@@ -259,10 +445,12 @@ export function normalizeShop(raw = {}) {
       allowEmpty: true,
     }),
     theme: normalizeTheme(raw.theme),
-    owner: assertString(raw.owner ?? '', 'shop.owner', { allowEmpty: true }),
+    owner: resolved.owner,
     appearance: normalizeAppearance(raw.appearance),
     open,
     inventory,
+    npcs: resolved.npcs,
+    social,
     createdAt,
   };
 }
@@ -286,6 +474,82 @@ export function normalizeLocation(raw = {}) {
   };
 }
 
+/**
+ * Validate and normalize a social price breakdown for persistence on a ledger
+ * record, or return null when none is supplied. A breakdown contains only plain
+ * integer monetary/bps fields, a `band` with a display title and threshold, and
+ * a `refused` boolean. Every numeric field must be a safe integer; the band
+ * title must be a non-empty string and the threshold a safe integer; `refused`
+ * must be a boolean. This never accepts raw arbitrary JSON - an unvalidated
+ * breakdown must fail closed rather than leak an unbounded object into the
+ * ledger. Returns null for a null/undefined input (legacy/non-social purchase).
+ */
+export function normalizePriceBreakdown(raw = null) {
+  if (raw == null) return null;
+  const quantity = assertInteger(raw.quantity ?? 1, 'priceBreakdown.quantity', { min: 1 });
+  const unitBase = assertInteger(raw.unitBase ?? 0, 'priceBreakdown.unitBase');
+  const baseTotal = assertInteger(raw.baseTotal ?? 0, 'priceBreakdown.baseTotal');
+  // Basis-point fields are signed: a reputation/personality/haggle discount is
+  // negative (e.g. Loved = -1500) and never below SOCIAL_BPS_MIN.
+  const shopBps = assertInteger(raw.shopBps ?? 0, 'priceBreakdown.shopBps', {
+    min: SOCIAL_BPS_MIN,
+  });
+  const personalityBps = assertInteger(
+    raw.personalityBps ?? 0,
+    'priceBreakdown.personalityBps',
+    { min: SOCIAL_BPS_MIN }
+  );
+  const reputationBps = assertInteger(
+    raw.reputationBps ?? 0,
+    'priceBreakdown.reputationBps',
+    { min: SOCIAL_BPS_MIN }
+  );
+  const haggleBps = assertInteger(raw.haggleBps ?? 0, 'priceBreakdown.haggleBps', {
+    min: SOCIAL_BPS_MIN,
+  });
+  // The combined adjustment is the additive sum of up to four width-
+  // [-9000, 50000] components, so it is bounded by the combined envelope
+  // [-36000, 200000], not by the per-component bounds.
+  const adjustmentBps = intInRange(
+    raw.adjustmentBps ?? 0,
+    SOCIAL_COMBINED_BPS_MIN,
+    SOCIAL_COMBINED_BPS_MAX,
+    'priceBreakdown.adjustmentBps'
+  );
+  const unitPrice = assertInteger(raw.unitPrice ?? 0, 'priceBreakdown.unitPrice');
+  const total = assertInteger(raw.total ?? 0, 'priceBreakdown.total');
+  // The `band` is optional (a raw/legacy breakdown may omit it), but when it is
+  // present its title must be non-empty. An absent band defaults to a non-empty
+  // neutral title so the rest of the validation (e.g. `refused`) still runs.
+  const band = raw.band;
+  const bandTitle =
+    band == null
+      ? 'neutral'
+      : assertString(band.title ?? '', 'priceBreakdown.band.title');
+  const bandThreshold =
+    band == null
+      ? 0
+      : assertInteger(band.threshold ?? 0, 'priceBreakdown.band.threshold', {
+          min: -100,
+        });
+  const refused = assertBoolean(raw.refused ?? false, 'priceBreakdown.refused');
+
+  return {
+    quantity,
+    unitBase,
+    baseTotal,
+    shopBps,
+    personalityBps,
+    reputationBps,
+    haggleBps,
+    adjustmentBps,
+    unitPrice,
+    total,
+    band: { title: bandTitle, threshold: bandThreshold },
+    refused,
+  };
+}
+
 export function normalizeLedgerRecord(raw = {}) {
   const key = assertString(raw.key, 'ledger.key');
   const status = assertLedgerStatus(raw.status || 'pending');
@@ -295,6 +559,7 @@ export function normalizeLedgerRecord(raw = {}) {
   const quantity = assertInteger(raw.quantity ?? 1, 'ledger.quantity', { min: 1 });
   const unitPrice = assertInteger(raw.unitPrice ?? 0, 'ledger.unitPrice');
   const totalPrice = assertInteger(raw.totalPrice ?? 0, 'ledger.totalPrice');
+  const priceBreakdown = normalizePriceBreakdown(raw.priceBreakdown);
   const createdAt = Number(raw.createdAt ?? Date.now());
   const updatedAt = Number(raw.updatedAt ?? createdAt);
 
@@ -318,11 +583,175 @@ export function normalizeLedgerRecord(raw = {}) {
     quantity,
     unitPrice,
     totalPrice,
+    priceBreakdown,
     payload: raw.payload ?? {},
     outcome: raw.outcome ?? {},
     error: assertString(raw.error ?? '', 'ledger.error', { allowEmpty: true }),
     compensation: (Array.isArray(raw.compensation) ? raw.compensation : []).slice(),
     createdAt,
     updatedAt,
+  };
+}
+
+// ---- M3 GM reputation persistence -----------------------------------------
+// GM-owned, per-entity reputation records and an append-only per-change event
+// log. Each record and each event is stored in its OWN GM-only JournalEntry (no
+// unbounded embedded history, no schema version bump - SCHEMA_VERSION stays 1).
+//
+// A reputation record is keyed by the (shopId, scope, subjectId) triple:
+//   { id, shopId, scope: 'actor'|'party'|'faction', subjectId, score, updatedAt }
+// An event is a single adjustment of a record:
+//   { id, key, shopId, scope, subjectId, previous, delta, next, reason,
+//     source: 'gm'|'purchase'|'haggle', status: 'pending'|'committed'|
+//     'needsRecovery', createdAt }
+
+export const REPUTATION_SCOPES = ['actor', 'party', 'faction'];
+export const REPUTATION_SOURCES = ['gm', 'purchase', 'haggle'];
+export const REPUTATION_EVENT_STATUSES = ['pending', 'committed', 'needsRecovery'];
+export const REPUTATION_ID_MAX = 120;
+export const REPUTATION_REASON_MAX = 200;
+
+// Actor subject ids must be a Foundry world Actor UUID (``Actor.<id>``). Party /
+// faction ids are safe non-empty slug-like ids (letters, digits, dot, underscore,
+// hyphen, no path separators).
+const ACTOR_UUID_RE = /^Actor\.[A-Za-z0-9]+$/;
+const ID_SLUG_RE = /^[A-Za-z0-9._-]+$/;
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+
+export function assertSignedInteger(value, label) {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`[market] '${label}' must be a safe integer, got ${value}`);
+  }
+  return value;
+}
+
+/**
+ * Validate a market record id (shopId or subjectId): a non-empty string, at most
+ * 120 chars, and free of control characters. Leading/trailing whitespace is
+ * trimmed.
+ */
+export function assertMarketId(value, label) {
+  if (typeof value !== 'string') {
+    throw new Error(`[market] '${label}' must be a string, got ${typeof value}`);
+  }
+  const v = value.trim();
+  if (v === '') throw new Error(`[market] '${label}' must not be empty`);
+  if (v.length > REPUTATION_ID_MAX) {
+    throw new Error(
+      `[market] '${label}' must be at most ${REPUTATION_ID_MAX} chars, got ${v.length}`
+    );
+  }
+  if (CONTROL_CHAR_RE.test(v)) {
+    throw new Error(`[market] '${label}' must not contain control characters`);
+  }
+  return v;
+}
+
+export function assertReputationScope(value) {
+  if (!REPUTATION_SCOPES.includes(value)) {
+    throw new Error(
+      `[market] reputation scope must be one of ${REPUTATION_SCOPES.join(', ')}, got ${value}`
+    );
+  }
+  return value;
+}
+
+export function assertReputationSource(value) {
+  if (!REPUTATION_SOURCES.includes(value)) {
+    throw new Error(
+      `[market] reputation source must be one of ${REPUTATION_SOURCES.join(', ')}, got ${value}`
+    );
+  }
+  return value;
+}
+
+export function assertReputationEventStatus(value) {
+  if (!REPUTATION_EVENT_STATUSES.includes(value)) {
+    throw new Error(
+      `[market] reputation event status must be one of ${REPUTATION_EVENT_STATUSES.join(', ')}, got ${value}`
+    );
+  }
+  return value;
+}
+
+/**
+ * Validate a subject id for a given scope. For `actor` it must be a Foundry
+ * world Actor UUID; for `party`/`faction` it must be a safe non-empty slug id
+ * (no path separators, no arbitrary path traversal).
+ */
+export function assertSubjectId(scope, value) {
+  const v = assertMarketId(value, 'subjectId');
+  if (scope === 'actor') {
+    if (!ACTOR_UUID_RE.test(v)) {
+      throw new Error(
+        `[market] 'subjectId' for scope 'actor' must match /^Actor\\.[A-Za-z0-9]+$/, got '${v}'`
+      );
+    }
+  } else if (!ID_SLUG_RE.test(v)) {
+    throw new Error(
+      `[market] 'subjectId' for scope '${scope}' must be a safe id (letters, digits, dot, underscore, hyphen), got '${v}'`
+    );
+  }
+  return v;
+}
+
+/**
+ * Normalize a reputation record. The score is clamped into [-100, 100] and
+ * rounded to an integer; `updatedAt` defaults to now.
+ */
+export function normalizeReputation(raw = {}) {
+  const shopId = assertMarketId(raw.shopId, 'shopId');
+  const scope = assertReputationScope(raw.scope);
+  const subjectId = assertSubjectId(scope, raw.subjectId);
+  const score = clampReputation(raw.score ?? 0);
+  const updatedAt = Number(raw.updatedAt ?? Date.now());
+  if (!Number.isSafeInteger(updatedAt)) {
+    throw new Error('[market] reputation.updatedAt must be a safe integer');
+  }
+  return {
+    id: raw.id || makeId(),
+    shopId,
+    scope,
+    subjectId,
+    score,
+    updatedAt,
+  };
+}
+
+/**
+ * Normalize a reputation event. `key` is the idempotency key, `reason` is capped
+ * at REPUTATION_REASON_MAX and `delta` must be a signed safe integer. The score
+ * fields are clamped into range.
+ */
+export function normalizeReputationEvent(raw = {}) {
+  const key = assertString(raw.key, 'event.key');
+  const shopId = assertMarketId(raw.shopId, 'shopId');
+  const scope = assertReputationScope(raw.scope);
+  const subjectId = assertSubjectId(scope, raw.subjectId);
+  const source = assertReputationSource(raw.source || 'gm');
+  const status = assertReputationEventStatus(raw.status || 'pending');
+  const previous = clampReputation(raw.previous ?? 0);
+  const delta = assertSignedInteger(raw.delta ?? 0, 'event.delta');
+  const next = clampReputation(raw.next ?? 0);
+  const reason = assertString(raw.reason ?? '', 'event.reason', {
+    allowEmpty: true,
+  }).slice(0, REPUTATION_REASON_MAX);
+  const createdAt = Number(raw.createdAt ?? Date.now());
+  if (!Number.isSafeInteger(createdAt)) {
+    throw new Error('[market] reputationEvent.createdAt must be a safe integer');
+  }
+  return {
+    id: raw.id || makeId(),
+    key,
+    shopId,
+    scope,
+    subjectId,
+    previous,
+    delta,
+    next,
+    reason,
+    source,
+    status,
+    createdAt,
   };
 }
