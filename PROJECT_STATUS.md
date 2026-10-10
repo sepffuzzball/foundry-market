@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.6`).
+  `download` release pointers, with `version` `0.1.7`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -37,7 +37,16 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
   GM as a public JournalEntry (default OBSERVER) plus a Scene Note with
   `flags.market.shopId`; the shop is verified to exist before the journal is
   created and a failed Note creation removes the marker journal best-effort.
-  Clicking a marker opens the storefront and suppresses the journal sheet.
+  Clicking a marker - whether created by dropping a shop element or by dragging a
+  Market journal from the Journal sidebar - opens the storefront and suppresses
+  the journal sheet: `handleActivateNote` resolves the shop id from the Note's own
+  `flags.market.shopId` and, when absent, from the linked JournalEntry (via
+  `note.entry` or `game.journal.get` on the Note document's `entryId`), but only
+  when that journal is a validated `MarketShop` entry, so an ordinary linked
+  Journal note is unaffected. It fails closed (opens nothing) when the Note flags
+  and the linked journal disagree, and never lets an `openShop` rejection make the
+  hook async. A direct click on the market JournalEntry in the Journal directory
+  still opens the plain Journal sheet (not supported in this milestone).
   Request/response ChatMessages use `style: CONST.CHAT_MESSAGE_STYLES.OOC` (never
   obsolete `CONST.CHAT_MESSAGE_TYPES.WHISPER`) while keeping the `whisper` list.
 - Storage (`src/storage/store.js`): locations, shops and a purchase ledger
@@ -132,7 +141,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.6/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.7/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -159,12 +168,19 @@ The **`0.1.4` release was published** as a prerelease (tag `0.1.4`, carrying
 published** as a prerelease (tag `0.1.5`), so its download URL is live and
 installable - but its storefront is broken: the GM "View storefront" path throws
 a Handlebars parse error because `templates/shop.hbs` left a `{{#if}}` block
-unterminated (see `docs/smoke-test.md` section 6). That parse failure is fixed in
-this **`0.1.6` patch prerelease** (the `0.1.6` download URL is live only once that
-tag's `release` job completes and publishes the `0.1.6` GitHub release), and the
-fix is **not yet re-confirmed on a live Foundry VTT 14 install**. Until then,
-install by pointing Foundry at the repo directory as a module source, or from the
-published `0.1.6` release once it exists.
+unterminated (see `docs/smoke-test.md` section 6). That parse failure was fixed in
+the **`0.1.6` patch prerelease**, which has been published and installed. A further
+routing gap remains: with `0.1.6` installed, a market map marker click may open the
+Journal sheet instead of the storefront, because the `activateNote` handler
+previously read only `note.document.flags.market.shopId` from the Note itself. This
+**`0.1.7` patch prerelease** routes a marker click via the linked `MarketShop`
+journal when the Note flags are absent (`handleActivateNote` now resolves the shop
+id from the Note's own flags and, when those are absent, from the linked
+JournalEntry). It is **not yet re-confirmed on a live Foundry VTT 14 install**, and
+the `0.1.7` download URL is live only once that tag's `release` job completes and
+publishes the `0.1.7` GitHub release. Until then, install by pointing Foundry at
+the repo directory as a module source, or from the published `0.1.6` release
+(which carries the storefront fix but not the marker-routing fix).
 
 ### Known issues / caveats
 
@@ -185,6 +201,19 @@ published `0.1.6` release once it exists.
   **not yet re-confirmed on a live Foundry VTT 14 install** - see
   `docs/smoke-test.md` section 6, which remains the manual real-runtime check and
   should not be marked live-tested until retested there.
+- The map-marker click routing is fixed only in this **prospective `0.1.7`
+  patch prerelease** and is **not yet re-confirmed on a live Foundry VTT 14
+  install**. With `0.1.6` installed, a market map marker click may open the
+  Journal sheet instead of the storefront, because the `activateNote` handler
+  previously read only the Note's own `flags.market.shopId`. `handleActivateNote`
+  now resolves the shop id from the Note's own flags and, when those are absent,
+  from the linked `MarketShop` journal - but only when that journal is a validated
+  `MarketShop` entry, so an ordinary linked journal note is unaffected, and it
+  fails closed (opens nothing) when the Note flags and the linked journal disagree.
+  A double-click on the map marker (the Note activation path) is what routes to the
+  storefront; a direct click on the market JournalEntry in the Journal directory is
+  a separate, intentionally unhandled path that still opens the plain Journal
+  sheet. Run `docs/smoke-test.md` section 6 before trusting the marker routing.
 - The `Daggerheart` adapter only reports support once the GM configures the
   generic adapter path settings; `DC20` and `Twodsix` are first-class and report
   support regardless (use `getAdapter('generic', config)` for a custom generic

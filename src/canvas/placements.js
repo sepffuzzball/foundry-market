@@ -6,8 +6,10 @@
 // JournalEntry (default OBSERVER ownership) plus a Scene Note that points at
 // it. The Note carries `flags.market.shopId`; no private store data is copied.
 // Clicking the Note fires `activateNote`, which opens the storefront for that
-// shop and suppresses the default journal sheet. A stale marker whose shop no
-// longer exists still opens a storefront that reports the missing shop.
+// shop and suppresses the default journal sheet. A market marker dragged from
+// the Journal sidebar (a `MarketShop` journal with no `flags.market` on the
+// Note) routes the same way through the linked journal. A stale marker whose
+// shop no longer exists still opens a storefront that reports the missing shop.
 
 export const MARKET_SHOP_TYPE = 'MarketShop';
 export const MARKET_ICON = 'icons/svg/shop.svg';
@@ -207,9 +209,93 @@ export async function handleCanvasDrop(ctx) {
   });
 }
 
+// A marker shop id must be a non-empty string; anything else is treated as
+// absent so an ordinary Note never matches a market marker.
+function isNonemptyString(value) {
+  return typeof value === 'string' && value !== '';
+}
+
 /**
- * Handle `activateNote`. If the Note is a market marker, open the storefront
- * and suppress the default journal sheet.
+ * Extract the market shop id carried directly on the Note (or its document).
+ * A marker created by this module writes `flags.market.shopId` onto the Note.
+ * A Note made by dragging a Market Journal from the sidebar carries no such
+ * flag, so this returns null for those and the linked journal is consulted.
+ */
+function noteShopId(note) {
+  const docShopId = note?.document?.flags?.market?.shopId;
+  if (isNonemptyString(docShopId)) return docShopId;
+  const ownShopId = note?.flags?.market?.shopId;
+  if (isNonemptyString(ownShopId)) return ownShopId;
+  return null;
+}
+
+/**
+ * Resolve the JournalEntry a Note links to. `note.entry` is the linked document
+ * (the v14 Note getter) when it has already resolved; a thenable getter cannot
+ * be read synchronously, so in that case (or when `note.entry` is absent) we
+ * fall back to `game.journal.get(entryId)` using the Note document's `entryId`.
+ * A missing `game` is tolerated so the code never throws a ReferenceError
+ * outside a Foundry runtime.
+ */
+function noteEntry(note) {
+  const entry = note?.entry;
+  // A real (non-thenable) linked journal is used directly. A thenable getter has
+  // no synchronous flags to read, so we fall through to the live collection.
+  if (entry && typeof entry.then !== 'function') return entry;
+  const entryId = note?.document?.entryId;
+  if (!entryId) return entry || null;
+  try {
+    const resolved = globalThis.game?.journal?.get?.(entryId) ?? null;
+    return resolved || entry || null;
+  } catch {
+    return entry || null;
+  }
+}
+
+/**
+ * Validate a linked JournalEntry as a market marker. Only a `MarketShop`
+ * journal carrying a non-empty shopId counts; an ordinary journal returns null
+ * so the default journal-sheet behavior is preserved.
+ */
+function entryShopId(entry) {
+  if (entry?.flags?.market?.type !== MARKET_SHOP_TYPE) return null;
+  return isNonemptyString(entry.flags.market.shopId) ? entry.flags.market.shopId : null;
+}
+
+// Log an openShop failure with a stable message and the validated, bounded shop
+// id, never the raw error (which may carry a private store record).
+function logOpenShopFailure(shopId, err) {
+  const id = typeof shopId === 'string' ? shopId : '';
+  const bounded = id.length > 120 ? id.slice(0, 120) : id;
+  console.warn(`market: failed to open shop ${bounded}`);
+}
+
+/**
+ * Invoke `openShop` and swallow any synchronous throw or asynchronous rejection
+ * without making the hook async: the caller still returns synchronously. A
+ * rejected promise is never left unhandled.
+ */
+function invokeOpenShop(openShop, shopId) {
+  let result;
+  try {
+    result = openShop(shopId);
+  } catch (err) {
+    logOpenShopFailure(shopId, err);
+    return;
+  }
+  if (result && typeof result.catch === 'function') {
+    result.catch((err) => logOpenShopFailure(shopId, err));
+  }
+}
+
+/**
+ * Handle `activateNote`. If the Note is a market marker - either the Note
+ * itself carries `flags.market.shopId`, or the JournalEntry it links to is a
+ * `MarketShop` journal - open the storefront and suppress the default journal
+ * sheet. Shop id resolution prefers a validated market journal entry, fails
+ * closed on a Note-flags / journal mismatch (opening nothing rather than the
+ * wrong shop), and only ever opens a shop when a validated market marker id is
+ * present.
  *
  * @param {object}   note       the Note document (or wrapper)
  * @param {Function} openShop   async (shopId) => void
@@ -217,9 +303,15 @@ export async function handleCanvasDrop(ctx) {
  *                    true when not a market note (allow default behavior)
  */
 export function handleActivateNote(note, openShop) {
-  const shopId = note?.document?.flags?.market?.shopId;
-  if (!shopId) return true;
-  openShop(shopId);
+  const noteId = noteShopId(note);
+  const entryId = entryShopId(noteEntry(note));
+  // Not a market marker unless the Note itself or its linked journal is one.
+  if (noteId === null && entryId === null) return true;
+  // Fail closed on a mismatch: the Note flags and the linked journal disagree on
+  // which shop this marker points to, so open nothing rather than the wrong shop.
+  if (noteId !== null && entryId !== null && noteId !== entryId) return false;
+  const shopId = entryId ?? noteId;
+  invokeOpenShop(openShop, shopId);
   return false;
 }
 

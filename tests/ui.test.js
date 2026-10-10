@@ -466,6 +466,193 @@ test('handleActivateNote opens the storefront and suppresses the journal', () =>
   assert.equal(placements.handleActivateNote(plain, () => {}), true);
 });
 
+test('handleActivateNote opens a storefront for a sidebar-dragged Market journal with no Note flags', () => {
+  let opened = null;
+  // A Market journal dragged from the Journal sidebar creates a Note with no
+  // `flags.market`; the linked journal carries the MarkerShop type and shopId.
+  const note = {
+    document: { flags: {}, entryId: 'j-market' },
+    entry: { flags: { market: { type: 'MarketShop', shopId: 'shop9' } } },
+  };
+  const handled = placements.handleActivateNote(note, (id) => {
+    opened = id;
+  });
+  assert.equal(handled, false, 'suppresses the default journal sheet');
+  assert.equal(opened, 'shop9');
+});
+
+test('handleActivateNote reads market flags on a bare Note document', () => {
+  let opened = null;
+  // A Note document passed directly (no wrapper `.document`) still carries the
+  // module-set `flags.market.shopId` and must route to the storefront.
+  const note = { flags: { market: { shopId: 'shop3' } } };
+  const handled = placements.handleActivateNote(note, (id) => {
+    opened = id;
+  });
+  assert.equal(handled, false);
+  assert.equal(opened, 'shop3');
+});
+
+test('handleActivateNote resolves a linked Market journal via game.journal.get on entryId', () => {
+  const prevGame = globalThis.game;
+  const docs = {
+    'j-9': { flags: { market: { type: 'MarketShop', shopId: 'shopX' } } },
+  };
+  globalThis.game = { journal: { get: (id) => docs[id] || null } };
+  try {
+    let opened = null;
+    // No `note.entry`, only the Note document's entryId: the fallback resolves
+    // the journal through the live game collection and routes to the storefront.
+    const note = { document: { flags: {}, entryId: 'j-9' } };
+    const handled = placements.handleActivateNote(note, (id) => {
+      opened = id;
+    });
+    assert.equal(handled, false);
+    assert.equal(opened, 'shopX');
+  } finally {
+    globalThis.game = prevGame;
+  }
+});
+
+test('handleActivateNote falls back to the journal collection when note.entry is a thenable', () => {
+  const prevGame = globalThis.game;
+  const docs = {
+    'j-9': { flags: { market: { type: 'MarketShop', shopId: 'shopY' } } },
+  };
+  globalThis.game = { journal: { get: (id) => docs[id] || null } };
+  try {
+    let opened = null;
+    // An async v14 entry getter exposes a thenable, not a resolved document;
+    // the handler must still resolve the marker through game.journal.get(entryId).
+    const note = {
+      entry: Promise.resolve({ flags: { market: { type: 'MarketShop', shopId: 'shopY' } } }),
+      document: { flags: {}, entryId: 'j-9' },
+    };
+    const handled = placements.handleActivateNote(note, (id) => {
+      opened = id;
+    });
+    assert.equal(handled, false);
+    assert.equal(opened, 'shopY');
+  } finally {
+    globalThis.game = prevGame;
+  }
+});
+
+test('handleActivateNote leaves an ordinary linked journal unaffected', () => {
+  const prevGame = globalThis.game;
+  globalThis.game = { journal: { get: () => ({ flags: { market: { type: 'Quest' } } }) } };
+  try {
+    // A linked journal that is not a MarketShop must not suppress the default
+    // journal sheet even when the Note has no market flags.
+    const note = { document: { flags: {}, entryId: 'j-1' } };
+    assert.equal(placements.handleActivateNote(note, () => {}), true);
+  } finally {
+    globalThis.game = prevGame;
+  }
+});
+
+test('handleActivateNote fails closed when Note flags and the linked journal disagree', () => {
+  let opened = null;
+  const note = {
+    document: { flags: { market: { shopId: 'shopA' } } },
+    entry: { flags: { market: { type: 'MarketShop', shopId: 'shopB' } } },
+  };
+  const handled = placements.handleActivateNote(note, (id) => {
+    opened = id;
+  });
+  assert.equal(handled, false, 'still suppresses the journal sheet');
+  assert.equal(opened, null, 'no storefront opened for a mismatched marker');
+});
+
+test('registerPlacements activateNote hook routes a market Note to openShop and returns false', () => {
+  let opened = null;
+  const unregister = placements.registerPlacements({
+    isGM: () => true,
+    openShop: (id) => {
+      opened = id;
+    },
+  });
+  const handlers = _hookRegistry['activateNote'] || [];
+  const handler = handlers[handlers.length - 1];
+  assert.equal(typeof handler, 'function', 'activateNote handler registered');
+  const note = { document: { flags: { market: { shopId: 'shop7' } } } };
+  const result = handler(note);
+  assert.equal(result, false, 'the hook preserves the false return (suppresses the journal)');
+  assert.equal(opened, 'shop7');
+  unregister();
+});
+
+test('handleActivateNote swallows a synchronously throwing openShop', () => {
+  let warned = null;
+  const prevWarn = console.warn;
+  console.warn = (...args) => {
+    warned = args;
+  };
+  try {
+    const note = { document: { flags: { market: { shopId: 's1' } } } };
+    const handled = placements.handleActivateNote(note, () => {
+      throw new Error('private store record secret on sync throw');
+    });
+    assert.equal(handled, false, 'still returns false synchronously on a sync throw');
+    assert.ok(warned, 'the sync throw was logged');
+    const logged = warned.join(' ');
+    assert.ok(logged.includes('market: failed to open shop'), 'stable message logged');
+    assert.ok(!logged.includes('private store record secret on sync throw'), 'no raw error leaks');
+  } finally {
+    console.warn = prevWarn;
+  }
+});
+
+test('handleActivateNote bounds an overlong shop id in the openShop failure log', () => {
+  let warned = null;
+  const prevWarn = console.warn;
+  console.warn = (...args) => {
+    warned = args;
+  };
+  try {
+    const longShopId = 'x'.repeat(150);
+    const note = { document: { flags: { market: { shopId: longShopId } } } };
+    const handled = placements.handleActivateNote(note, () => {
+      throw new Error('whatever');
+    });
+    assert.equal(handled, false, 'still returns false synchronously');
+    assert.ok(warned, 'the failure was logged');
+    const logged = warned.join(' ');
+    assert.ok(logged.includes('x'.repeat(120)), 'bounded shop id (<=120) logged');
+    assert.ok(!logged.includes('x'.repeat(150)), 'overlong shop id not logged unbounded');
+  } finally {
+    console.warn = prevWarn;
+  }
+});
+
+test('handleActivateNote swallows an asynchronously rejecting openShop without an unhandled rejection', async () => {
+  let opened = null;
+  let warned = null;
+  const prevWarn = console.warn;
+  console.warn = (...args) => {
+    warned = args;
+  };
+  try {
+    const note = { document: { flags: { market: { shopId: 'shop1' } } } };
+    const handled = placements.handleActivateNote(note, (id) => {
+      opened = id;
+      return Promise.reject(new Error('private store record secret on async rejection'));
+    });
+    assert.equal(handled, false, 'returns false synchronously regardless of the Promise');
+    assert.equal(opened, 'shop1');
+    // Flush the microtasks so the rejected promise's catch runs; if the rejection
+    // were left unhandled, node:test would fail on the unhandled rejection.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(warned, 'the async rejection was logged, not left unhandled');
+    const logged = warned.join(' ');
+    assert.ok(logged.includes('market: failed to open shop'), 'stable message logged');
+    assert.ok(logged.includes('shop1'), 'shop id logged');
+    assert.ok(!logged.includes('private store record secret on async rejection'), 'no raw error leaks');
+  } finally {
+    console.warn = prevWarn;
+  }
+});
+
 test('handleCanvasDrop is GM-gated and rejects non-market drops', async () => {
   // non-market drop returns null
   const out = await placements.handleCanvasDrop({

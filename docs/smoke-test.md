@@ -11,7 +11,7 @@ with a fresh world where you can discard the data. You need at least two browser
 clients (one on an **active GM** user, one on a **player** user). The player
 client is the one that exercises the storefront.
 
-This checklist targets the current **0.1.6** prerelease. **No live Foundry VTT
+This checklist targets the current **0.1.7** prerelease. **No live Foundry VTT
 14 verification has been run yet** for M1-M6 - the automated `npm test` suite
 only mocks the Foundry boundaries, so every section below is the intended manual
 real-runtime check and nothing here has yet been confirmed on a live install.
@@ -146,28 +146,58 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 
 ## 6. Player opens the shop via the Note
 
-> **Status: template parse failure fixed, live retest still pending.** The
-> storefront template (`templates/shop.hbs`) previously left the
+> **Status: template parse failure fixed (in `0.1.6`), live retest still pending.**
+> The storefront template (`templates/shop.hbs`) previously left the
 > `{{#if actors.length}}` block unterminated, so opening the storefront failed at
 > render time with a Handlebars parse error ("Parse error ... EOF expecting
-> `{{/if}}`"). That block is now closed and the template is guarded by an
+> `{{/if}}`"). That block is now closed (shipped in the `0.1.6` patch prerelease)
+> and the template is guarded by an
 > automated block-balance unit test in `tests/ui.test.js`. It has **not** yet
 > been re-confirmed on a live Foundry VTT 14 install - run this section again
 > before treating the storefront as verified. Do not mark this section as
 > live-tested by the automated suite.
 
-1. As the **player**, click the Scene Note created in section 4.
-2. As the **GM** (or player), also open the storefront via the manager's **View
+> **Status: with `0.1.6` installed a market map marker click may open the Journal;
+> the `0.1.7` routing fix is not yet live-tested.** The `activateNote` handler
+> previously read only `note.document.flags.market.shopId`, so a market marker
+> whose Note carried no such flag (e.g. a Market journal dragged from the Journal
+> sidebar, or a directly-created marker) fell through to the default Journal sheet
+> instead of the storefront. The **`0.1.7` prerelease** routes the click via the
+> linked `MarketShop` journal when the Note flags are absent: `handleActivateNote`
+> now resolves the shop id from the Note's own flags and, when those are absent,
+> from the linked JournalEntry (`note.entry`, or via `game.journal.get` on the Note
+> document's `entryId`) - but only when that journal is a validated `MarketShop`
+> entry, so an ordinary linked Journal note is unaffected. It fails closed (opens
+> nothing) when the Note flags and the linked journal disagree, and never lets an
+> `openShop` rejection make the hook async. This `0.1.7` fix has **not** yet been
+> re-confirmed on a live Foundry VTT 14 install - run both marker paths below
+> again. Note the split: a **double-click** on the map marker (the Note activation
+> path) is what these steps route to the storefront; a **direct click** on the
+> market JournalEntry in the Journal directory is a separate, intentionally
+> unhandled path that still opens the plain Journal sheet.
+
+1. As the **player**, click the Scene Note created in section 4 (the double-click
+   on the Note after dropping a shop element on the scene). Confirm the
+   **Market Storefront** opens, not the Journal sheet.
+2. As the **GM**, also drag a Market journal from the Journal sidebar onto the
+   scene to create a second marker, then as the **player** click that Note. Confirm
+   the storefront opens (the sidebar-drag marker must route the same way).
+3. As the **GM** (or player), also open the storefront via the manager's **View
    storefront** button. Immediately confirm the console reports **no
    Handlebars parse failure** (no `Parse error ... EOF expecting {{/if}}`
    message) - a blank/erroring storefront on either path is a regression.
 
 **Expected**
 
-- The **Market Storefront** opens instead of the Journal sheet (the Note handler
-  suppresses the default journal), and the storefront renders without a
-  Handlebars parse failure on **both** the Note path and the manager's **View
-  storefront** path.
+- A **click** (double-click, i.e. the Note activation path) on a market marker -
+  whether it was created by dropping a shop element (section 4) or by dragging a
+  Market journal from the Journal sidebar - opens the **Market Storefront**
+  instead of the Journal sheet (the Note handler suppresses the default journal),
+  and the storefront renders without a Handlebars parse failure on **both** the
+  Note path and the manager's **View storefront** path.
+- A **direct click** on the market JournalEntry in the Journal directory is
+  **not** supported in this milestone: it still opens the plain Journal sheet, not
+  the storefront. Only the canvas Scene Note routes to the storefront.
 - The storefront shows shop 1's catalog, including the entry from section 3.
 - The entry's `system` data and `itemUuid` are NOT exposed - only the allowlisted
   public fields (id, name, img, price, quantity, stockMode, visible) are shown.
