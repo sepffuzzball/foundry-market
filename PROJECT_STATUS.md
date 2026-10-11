@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.9`).
+  `download` release pointers, with `version` `0.1.10`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -81,6 +81,23 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
   detect a GM handover to THIS client and re-run the sweep (coalesced, so a
   handover storm never duplicates work), and a GM who becomes inactive during a
   deferred `Folder.create` simply does not move the journal.
+- Ledger summary pages (`src/storage/ledger-summary.js`): a Foundry-free module
+  that renders a GM-only, human-readable HTML summary of each purchase attempt
+  and maintains it as a module-owned `JournalEntryPage` of type `text` named
+  `Purchase summary` (flagged `flags.market.ledgerSummary: true`) on the ledger
+  journal. The renderer is pure, clips and HTML-escapes every dynamic field, never
+  dumps the raw `payload`/`outcome`, falls back to stable ids when a
+  shop/actor/item name is unknown, shows status / attempted buy / shop / quantity
+  / quoted unit-total in copper (or `Not quoted` for a pre-quote failure) / reason
+  and diagnostic detail on failure / compensation / created-updated stamps. The
+  ledger record now also persists an optional bounded `detail` string
+  (`LEDGER_DETAIL_MAX` = 500) that is never exposed to players (the public
+  purchase projection already strips it). The store wires it in best-effort and
+  never awaited (guarded on `typeof docAccess.syncLedgerSummary`), serialized per
+  journal so a committed update always wins over a stale pending render, and
+  caught so a summary failure can never fail the ledger write or the sweep; the
+  startup / GM-handover sweep backfills a summary for any existing journal. A
+  GM-added page on the same journal is never replaced.
 - Schema + normalization (`src/services/model.js`): records validated to safe
   integer minor units; stock modes validated; ids generated locally.
 - Pricing (`src/services/pricing.js`): pure, integer-only quoting, parsing,
@@ -167,7 +184,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.9/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.10/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -210,28 +227,52 @@ threw, `0.1.8` corrects the conversion interpretation (the per-denomination copp
 factor is now `conversion.cp / conversion[d]`) and sanitizes the purchase failure
 reporting (`publicPurchaseResult` collapses any raw adapter/store exception to a
 bounded code, and the player chat reads `Purchase failed (<code>).` - never a raw
-`[market] ...` detail). The dnd5e balance fix is **not yet re-confirmed on a live
-Foundry VTT 14 install** (user live retest is still pending - see
-`docs/smoke-test.md` section 22).
+`[market] ...` detail). The **`0.1.9` release was also published** (tag `0.1.9`),
+adding the Ledger folder organizer (see below). The dnd5e balance fix is **not yet
+re-confirmed on a live Foundry VTT 14 install** (user live retest is still pending
+- the `0.1.9` attempt was later diagnosed as a stale browser-loaded adapter
+module, not a code bug - see `docs/smoke-test.md` sections 22 and 26).
 
-The **prospective `0.1.9` prerelease** adds the Ledger folder organizer
-(`src/storage/ledger-folders.js`): the active GM lazily creates a single `Market
-Ledgers` root under the Journal directory with `Success`/`Failure`/`Pending`/
-`Needs Recovery` children and files each GM-private ledger journal into the child
-matching its current status, moving an existing ledger journal on a status change
-and rerunning a bounded sweep over every ledger journal on the active GM's
-`ready`/GM-handover (recovering un-filed legacy/schema-v0 journals). Folders are
-located by document type + exact `flags.market.ledgerRole` + exact parent id,
-never by name; the organizer only ever moves a journal's `folder`, never deletes
-a ledger journal, never alters its record/status/idempotency and never touches
-the marker/shop/reputation/advanced-order journals (so it never hides unrelated
-journals); ledger data is preserved and stays GM-only. Placement is best-effort
-and never awaited, so a folder create/move failure cannot block or fail a
-persisted ledger write. The `0.1.9` download URL is live only once that tag's
-`release` job completes and publishes the `0.1.9` GitHub release. Until then,
-install by pointing Foundry at the repo directory as a module source, or from the
-published `0.1.8` release (which carries the conversion and marker-routing fixes
-but not the ledger folder organizer).
+The **`0.1.9` release was published** (tag `0.1.9`), adding the Ledger folder
+organizer (`src/storage/ledger-folders.js`): the active GM lazily creates a
+single `Market Ledgers` root under the Journal directory with `Success`/
+`Failure`/`Pending`/`Needs Recovery` children and files each GM-private ledger
+journal into the child matching its current status, moving an existing ledger
+journal on a status change and rerunning a bounded sweep over every ledger
+journal on the active GM's `ready`/GM-handover (recovering un-filed legacy/
+schema-v0 journals). Folders are located by document type + exact
+`flags.market.ledgerRole` + exact parent id, never by name; the organizer only
+ever moves a journal's `folder`, never deletes a ledger journal, never alters its
+record/status/idempotency and never touches the marker/shop/reputation/
+advanced-order journals (so it never hides unrelated journals); ledger data is
+preserved and stays GM-only. Placement is best-effort and never awaited, so a
+folder create/move failure cannot block or fail a persisted ledger write.
+**The `0.1.9` live dnd5e retest was diagnosed as a stale browser-loaded adapter
+module, not a code bug**: the `Dnd5eAdapter` actually imported by the browser was
+a cached older module still using the pre-fix `0.1`/`100` reading, while a fresh,
+cache-busted load of the current adapter succeeded. The published `0.1.9` server
+code is correct; the retest hit browser/Foundry module caching, not
+`balance-read-failed`. After any update, hard-refresh / reopen ALL Foundry tabs
+and clients and then run a NEW purchase rather than trusting an attempt made by
+the previously cached adapter.
+**The prospective `0.1.10` prerelease** adds the GM-readable purchase ledger
+pages (`src/storage/ledger-summary.js`): each ledger journal gains a module-owned
+`Purchase summary` text page (rendered escaped HTML) showing status / attempted
+buy / shop / quantity / quoted copper unit-total (or `Not quoted` for a pre-quote
+failure) / reason + diagnostic detail on failure / compensation / timestamps,
+with names best-effort and ids as fallback; the record persists an optional
+bounded `detail` string (max 500 chars) that is never sent to players, the sync
+is best-effort/non-blocking and never fails the ledger write, it is serialized
+per journal so a committed render always wins, and the startup / GM-handover
+sweep backfills a summary for existing journals. That sweep only reads and
+renders - it never replays or re-executes an old transaction, so an old failed
+purchase is left exactly as recorded and never charged again, and the diagnostic
+`detail` lives only on the GM-private page/record (never in player chat). The
+`0.1.10` download URL is live only once that tag's `release` job completes and
+publishes the `0.1.10` GitHub release. Until then, install by pointing Foundry at
+the repo directory as a module source, or from the published `0.1.9` release
+(which carries the folder organizer but not the GM-readable purchase ledger
+pages).
 
 ### Known issues / caveats
 
@@ -297,6 +338,15 @@ but not the ledger folder organizer).
   handover / concurrent multi-GM processing both clients can see "no record"
   before either persists one and both charge, potentially overselling stock or
   double-debiting a wallet.
+- **Updating a release can load a stale cached adapter module.** The module ships
+  native browser ESM with no build/transpile. A browser (or Foundry's module
+  loader) can serve a previously imported adapter module from cache after an
+  update, so the live `Dnd5eAdapter` may still be the old pre-fix one (using the
+  `0.1`/`100` reading) even though the published server code is correct - the
+  `0.1.9` dnd5e retest was diagnosed exactly this way. After updating, do a
+  **hard-refresh / reopen ALL Foundry tabs and clients** and then run a **NEW
+  purchase**; if a fresh, cache-busted load of the adapter succeeds, the issue was
+  browser cache, not the release.
 - The Ledger folder organizer (`src/storage/ledger-folders.js`) is Node-tested
   only against a fake folder collection - the live `Folder.create`/move, the
   active-GM sweep on `ready`/GM-handover and the player-side folder visibility are
@@ -304,6 +354,16 @@ but not the ledger folder organizer).
   `docs/smoke-test.md` section 23). It never deletes a ledger journal, never
   touches the marker/shop/reputation/advanced-order journals (so it never hides
   unrelated journals), and only ever moves the journal's `folder`.
+- The GM-readable purchase ledger pages (`src/storage/ledger-summary.js`) are
+  Node-tested only against a fake embedded-document surface - the live
+  `JournalEntryPage` create/update and the player-side invisibility are **not yet
+  verified on a live Foundry VTT 14 install** (see `docs/smoke-test.md` section
+  23.6). The summary is best-effort: a page failure is logged, never fails the
+  ledger write, and the startup / GM-handover sweep backfills any missing summary
+  page. That sweep only reads and renders - it never replays or re-executes an old
+  transaction, so an old failed purchase is never charged again, and the
+  diagnostic `detail` is written only to the GM-private page/record, never into a
+  player chat/response.
 - `finite` and `non-restocking` stock modes both currently decrement; the
   restock-policy difference is a later milestone.
 

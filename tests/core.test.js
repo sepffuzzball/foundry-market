@@ -758,6 +758,35 @@ test('purchase marks needsRecovery when compensation itself fails', async () => 
   assert.ok(ledger.compensation.includes('currency-refund-failed'));
 });
 
+test('purchase persists a bounded diagnostic detail on the compensated ledger', async () => {
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 5 } });
+  // Delivery throws after the debit, so the post-pending compensation catch runs.
+  actor.createEmbeddedDocuments = async () => {
+    throw new Error('delivery exploded');
+  };
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+
+  const result = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(result.status, 'failed');
+  // The response/error/status logic is unchanged (no detail leaks on the result).
+  assert.equal(result.error, 'delivery exploded');
+  assert.ok(!('detail' in result), 'detail is not surfaced on the raw commerce result');
+
+  // The GM-only ledger keeps the diagnostic detail alongside the error so the
+  // summary page can show it for GM diagnosis.
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.equal(ledger.status, 'failed');
+  assert.equal(ledger.error, 'delivery exploded');
+  assert.equal(ledger.detail, 'delivery exploded', 'diagnostic detail persisted on the ledger');
+});
+
 test('purchase rejects when the executing user is not a GM', async () => {
   const store = createMockStore();
   store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
@@ -794,6 +823,77 @@ test('purchase reports adapter unsupported without charging', async () => {
   assert.equal(result.status, 'failed');
   assert.equal(result.error, 'adapter-unsupported');
   assert.equal(actor.system.currency.gp, 5, 'no charge');
+});
+
+test('purchase persists quoteKnown for GM diagnosis on post-quote, pending and pre-quote paths', async () => {
+  // (1) A post-quote failure records a known quote with the quoted total.
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 1 } });
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+  await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 2, requestId: 'insuf', userId: 'user1' },
+    'gm1'
+  );
+  let ledger = getLedgerForUser(store, 'user1:insuf');
+  assert.equal(ledger.status, 'failed');
+  assert.equal(ledger.error, 'insufficient-funds');
+  assert.equal(ledger.quoteKnown, true, 'a post-quote failure flags the quote as known');
+  assert.equal(ledger.totalPrice, 200, 'the quoted total persists on the failed attempt');
+  assert.equal(actor.system.currency.gp, 1, 'no charge before the refusal');
+
+  // (2) A successful quote starts as a pending record carrying quoteKnown true,
+  // which survives the final commit patch.
+  const store2 = createMockStore();
+  store2._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor2 = createMockActor({ currency: { gp: 5 } });
+  const commerce2 = createCommerce(
+    makeCommerceCtx({ store: store2, actor: actor2, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter() })
+  );
+  await commerce2.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, requestId: 'ok', userId: 'user1' },
+    'gm1'
+  );
+  ledger = getLedgerForUser(store2, 'user1:ok');
+  assert.equal(ledger.status, 'committed');
+  assert.equal(ledger.quoteKnown, true, 'a successful quote keeps quoteKnown true');
+
+  // (3) A pre-quote failure never flags a quote.
+  const store3 = createMockStore();
+  const commerce3 = createCommerce(
+    makeCommerceCtx({ store: store3, actor: actor2, itemSource: makeSourceItem(), adapter: new Dnd5eAdapter(), isGM: () => false })
+  );
+  await commerce3.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, requestId: 'gm', userId: 'user1' },
+    'player'
+  );
+  ledger = getLedgerForUser(store3, 'user1:gm');
+  assert.equal(ledger.status, 'failed');
+  assert.equal(ledger.error, 'not-a-gm');
+  assert.equal(ledger.quoteKnown, false, 'a pre-quote failure leaves quoteKnown false');
+
+  // (4) A zero-price quote is still a known quote: a balance-read-failed after a
+  // free item records a 0 cp total with quoteKnown true.
+  const store4 = createMockStore();
+  store4._shops.set('shop1', makeShop({ price: 0, quantity: 10 }));
+  const actor4 = createMockActor({ currency: { gp: 1 } });
+  const failing = new Dnd5eAdapter();
+  failing.getBalance = async () => { throw new Error('balance store threw'); };
+  const commerce4 = createCommerce(
+    makeCommerceCtx({ store: store4, actor: actor4, itemSource: makeSourceItem(), adapter: failing })
+  );
+  await commerce4.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, requestId: 'zero', userId: 'user1' },
+    'gm1'
+  );
+  ledger = getLedgerForUser(store4, 'user1:zero');
+  assert.equal(ledger.status, 'failed');
+  assert.equal(ledger.error, 'balance-read-failed');
+  assert.equal(ledger.quoteKnown, true, 'a zero-price quote is still a known quote');
+  assert.equal(ledger.totalPrice, 0);
+  assert.equal(ledger.unitPrice, 0);
 });
 
 test('purchase serializes per shop through the queue', async () => {

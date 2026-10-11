@@ -129,6 +129,45 @@ runs duplicate work. A GM who becomes inactive during a deferred `Folder.create`
 simply does not move the journal (the organizer re-checks the active-GM predicate
 after the awaited create).
 
+### Ledger summary pages (`src/storage/ledger-summary.js`)
+
+In addition to the machine-readable `flags.market.record`, the active GM can read a
+plain-text summary of each purchase attempt on the journal itself. A deliberately
+Foundry-free module (`src/storage/ledger-summary.js`) renders that summary as escaped
+HTML and maintains it as a module-owned `JournalEntryPage` of type `text` under the
+fixed name `Purchase summary`, marked with `flags.market.ledgerSummary: true`.
+
+The renderer is pure and never touches `game` or the store: `renderLedgerSummary(record,
+{ shopName, actorName, itemName })` returns an HTML string that shows Status, the
+attempted Buy (item/actor names and ids), Shop, Quantity, the quoted unit/total in
+copper when a quote is known, the reason code and diagnostic detail on a
+failure, any compensation, and created/updated timestamps. A quote is "known" for a
+pending/committed attempt or when the record carries the `quoteKnown` flag (persisted
+for every post-quote failure - `service-refused`, `adapter-unsupported`,
+`balance-read-failed`, `insufficient-funds`, `merchant-funds-overflow` - even when the
+quoted total is `0 cp`), or via the legacy heuristic of a nonzero unit/total or a
+structured `priceBreakdown`; a pre-quote failure such as `shop-not-found` or
+`actor-not-found` renders `Not quoted`. The Shop line shows a named shop with its
+id once (`Name (shop id)`) and an unnamed shop by its id alone (`(shop id)`), never
+duplicated. All dynamic data is clipped
+and HTML-escaped, the raw `payload`/`outcome` objects are never dumped, unknown
+identifiers fall back to stable ids, and item/shop/actor names are best-effort (resolved
+from the store's shop record and the live actors collection, or omitted). The ledger
+record now also persists an optional, bounded `detail` string (`LEDGER_DETAIL_MAX` =
+500) so a failure carries a diagnostic for the GM; it is never sent to players (the
+public purchase projection already strips it).
+
+Persistence is best-effort and never awaited, mirroring the folder arrange. The store
+schedules a summary sync after `createLedger`/`updateLedger` (and, in the ready/handover
+sweep, for existing journals) and guards on `typeof docAccess.syncLedgerSummary ===
+'function'`, so an adapter without the optional method is unaffected. Writes are
+serialized **per journal** and each task re-reads the LIVE `flags.market.record`
+immediately before rendering, so a queued committed render always wins over a stale
+pending snapshot. The page is created when absent and updated ONLY when it is the
+module-owned page and the content changed; a GM-added page on the same journal is never
+replaced. The active-GM predicate is re-checked before the read and after each await,
+and any failure is caught and logged so it can never fail the ledger write or the sweep.
+
 Records are normalized before persistence (`src/services/model.js`):
 
 - Location: `id, name, description, theme, createdAt`.
@@ -148,11 +187,21 @@ Records are normalized before persistence (`src/services/model.js`):
   The public-facing `publicDescription`/`category`/`rarity` fields are empty by
   default (the item's internal system description is never auto-exposed); the GM
   fills them in the manager inventory row.
-- Ledger: `id, key, status, payloadHash, userId, shopId, entryId, actorId,
-  quantity, unitPrice, totalPrice, priceBreakdown, payload, outcome, error,
-  compensation, createdAt, updatedAt`. `priceBreakdown` is the validated
+- Ledger: `id, key, status, quoteKnown, payloadHash, userId, shopId, entryId,
+  actorId, quantity, unitPrice, totalPrice, priceBreakdown, payload, outcome,
+  error, detail, compensation, createdAt, updatedAt`. `quoteKnown` is a boolean
+  that is `true` whenever a quote was successfully produced - pending, committed,
+  and every post-quote failure (`service-refused`, `adapter-unsupported`,
+  `balance-read-failed`, `insufficient-funds`, `merchant-funds-overflow`), even
+  when the quoted total is `0 cp` (a free/fully-discounted item) - and `false`
+  (the default) for pre-quote failures and legacy records that predate the flag.
+  `priceBreakdown` is the validated
   social-pricing breakdown from a social purchase (or `null` on the legacy
-  non-social path) and is also mirrored into the stored `outcome`.
+  non-social path) and is also mirrored into the stored `outcome`. `error` is a
+  stable bounded failure code; `detail` is an optional bounded (at most 500
+  chars) diagnostic string attached to a failed attempt. Neither is exposed to
+  players - `detail` is only used by the GM-only ledger summary - but both are
+  persisted so the GM can audit a failure.
 
 All integer fields (prices, quantities, balances) are validated as non-negative
 safe integers, and integer overflow of quotes and currency conversions is

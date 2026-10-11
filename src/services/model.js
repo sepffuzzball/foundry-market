@@ -16,6 +16,9 @@ export const REPUTATION_EVENT_KIND = 'reputationEvent';
 
 export const STOCK_MODES = ['finite', 'unlimited', 'non-restocking'];
 export const LEDGER_STATUSES = ['pending', 'committed', 'failed', 'needsRecovery'];
+// Bounded diagnostic detail attached to a failed ledger record (e.g. a reason
+// string). Never exposed to players; used only in the GM-only ledger summary.
+export const LEDGER_DETAIL_MAX = 500;
 export const OWNER_LEVEL = 3;
 
 // M2 appearance validation constants. These are shared with the request layer so
@@ -1021,12 +1024,26 @@ export function normalizePriceBreakdown(raw = null) {
 export function normalizeLedgerRecord(raw = {}) {
   const key = assertString(raw.key, 'ledger.key');
   const status = assertLedgerStatus(raw.status || 'pending');
+  // Diagnostic detail is optional and bounded; it is stored for the GM-only
+  // summary and never exposed to players (the public sandbox already strips it).
+  const detail = assertString(raw.detail ?? '', 'ledger.detail', {
+    allowEmpty: true,
+  }).slice(0, LEDGER_DETAIL_MAX);
   const payloadHash = assertString(raw.payloadHash ?? '', 'ledger.payloadHash', {
     allowEmpty: true,
   });
   const quantity = assertInteger(raw.quantity ?? 1, 'ledger.quantity', { min: 1 });
   const unitPrice = assertInteger(raw.unitPrice ?? 0, 'ledger.unitPrice');
   const totalPrice = assertInteger(raw.totalPrice ?? 0, 'ledger.totalPrice');
+  // Whether a quote was successfully produced for this attempt. This is set true
+  // for every post-quote path (pending, committed, and the post-quote failures
+  // service-refused / adapter-unsupported / balance-read-failed /
+  // insufficient-funds / merchant-funds-overflow) - even when the quoted total is
+  // 0 cp (a free/fully-discounted item). It stays false for pre-quote failures
+  // (e.g. shop-not-found) and legacy records that predate the flag. It is only
+  // ever consumed by the GM-only summary renderer; it is never projected to
+  // players.
+  const quoteKnown = assertBoolean(raw.quoteKnown ?? false, 'ledger.quoteKnown');
   const priceBreakdown = normalizePriceBreakdown(raw.priceBreakdown);
   const createdAt = Number(raw.createdAt ?? Date.now());
   const updatedAt = Number(raw.updatedAt ?? createdAt);
@@ -1035,6 +1052,7 @@ export function normalizeLedgerRecord(raw = {}) {
     id: raw.id || makeId(),
     key,
     status,
+    quoteKnown,
     payloadHash,
     userId: assertString(raw.userId ?? '', 'ledger.userId', {
       allowEmpty: true,
@@ -1055,6 +1073,7 @@ export function normalizeLedgerRecord(raw = {}) {
     payload: raw.payload ?? {},
     outcome: raw.outcome ?? {},
     error: assertString(raw.error ?? '', 'ledger.error', { allowEmpty: true }),
+    detail,
     compensation: (Array.isArray(raw.compensation) ? raw.compensation : []).slice(),
     createdAt,
     updatedAt,

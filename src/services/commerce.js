@@ -176,6 +176,7 @@ export function createCommerce(deps) {
           status: 'failed',
           error,
           ...extra,
+          detail,
         })
       );
       return { status: record.status, ledgerId: record.id, error, detail };
@@ -478,7 +479,7 @@ export function createCommerce(deps) {
         payload: requestPayload,
         error: 'service-refused',
         detail: 'shop reputation is Hated',
-        extra: { totalPrice: total, unitPrice, priceBreakdown },
+        extra: { quoteKnown: true, totalPrice: total, unitPrice, priceBreakdown },
       });
     }
     const adapter = getAdapter(systemId());
@@ -489,6 +490,7 @@ export function createCommerce(deps) {
         payload: requestPayload,
         error: 'adapter-unsupported',
         detail: adapter ? adapter.unsupportedReason || '' : 'no adapter',
+        extra: { quoteKnown: true, totalPrice: total, unitPrice, priceBreakdown },
       });
     }
 
@@ -502,6 +504,7 @@ export function createCommerce(deps) {
         payload: requestPayload,
         error: 'balance-read-failed',
         detail: (err && err.message) || String(err),
+        extra: { quoteKnown: true, totalPrice: total, unitPrice, priceBreakdown },
       });
     }
     if (balance < total) {
@@ -511,7 +514,7 @@ export function createCommerce(deps) {
         payload: requestPayload,
         error: 'insufficient-funds',
         detail: `need ${total}, have ${balance}`,
-        extra: { totalPrice: total, balance, unitPrice, priceBreakdown },
+        extra: { quoteKnown: true, totalPrice: total, balance, unitPrice, priceBreakdown },
       });
     }
 
@@ -530,7 +533,7 @@ export function createCommerce(deps) {
           payload: requestPayload,
           error: 'merchant-funds-overflow',
           detail: `merchant funds ${funds} + total ${total} overflow`,
-          extra: { totalPrice: total, funds, unitPrice, priceBreakdown },
+          extra: { quoteKnown: true, totalPrice: total, funds, unitPrice, priceBreakdown },
         });
       }
     }
@@ -545,6 +548,7 @@ export function createCommerce(deps) {
           payloadHash: payloadHash(requestPayload),
           payload: requestPayload,
           status: 'pending',
+          quoteKnown: true,
           shopId,
           entryId,
           actorId,
@@ -795,6 +799,10 @@ export function createCommerce(deps) {
           status,
           updatedAt: now(),
           error: String((err && err.message) || err),
+          // Persist the diagnostic detail alongside the error so the GM-only
+          // summary page can show the bounded message (the normalizer caps it to
+          // LEDGER_DETAIL_MAX). The response/error/status logic is unchanged.
+          detail: String((err && err.message) || err),
           compensation,
           outcome: {
             createdItemId: created?.id ?? null,

@@ -11,7 +11,7 @@ with a fresh world where you can discard the data. You need at least two browser
 clients (one on an **active GM** user, one on a **player** user). The player
 client is the one that exercises the storefront.
 
-This checklist targets the current **0.1.9** prerelease. **No live Foundry VTT
+This checklist targets the current **0.1.10** prerelease. **No live Foundry VTT
 14 verification has been run yet** for M1-M6 - the automated `npm test` suite
 only mocks the Foundry boundaries, so every section below is the intended manual
 real-runtime check and nothing here has yet been confirmed on a live install.
@@ -1048,11 +1048,16 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 > because the adapter misread `CONFIG.DND5E.currencies[d].conversion` (which is
 > UNITS PER GP) as GP per unit. The conversion math and purchase failure reporting
 > were corrected in the **published `0.1.8` prerelease** (carried forward into
-> this `0.1.9` prerelease) and are verified by the automated `npm test` suite in
+> this `0.1.10` prerelease) and are verified by the automated `npm test` suite in
 > Node; this section is the intended real-runtime check on a live v14 install.
-> The dnd5e balance fix is **not yet re-confirmed on a live Foundry VTT 14
-> install** - a live retest is still pending, so do not claim it live-confirmed.
-> **Note:** the per-user purchase ledger Journal
+> **The `0.1.9` live retest appeared to fail but was diagnosed as a stale
+> browser-loaded adapter module, not a code bug** - the browser served a cached
+> older `Dnd5eAdapter` (still the pre-fix `0.1`/`100` reading) while a fresh,
+> cache-busted load of the current adapter succeeded. So the dnd5e balance fix is
+> **still not re-confirmed on a live Foundry VTT 14 install**: run **section 26**
+> first to confirm the current adapter is loaded (cache-busted / hard reload),
+> then run a **NEW** purchase before claiming any live result. **Note:** the
+> per-user purchase ledger Journal
 > (`Ledger:<user>:<requestId>`, created by the default store) is the expected
 > **GM-private** audit/idempotency record - one per request - not an extra sale or
 > a bug. Diagnose a purchase failure via that journal's `error`/`detail` fields
@@ -1062,6 +1067,8 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 
 1. As the **GM**, use a dnd5e 6.x world. Configure a non-default currency config
    via `opts.currencyConfig` (or rely on the live `CONFIG.DND5E.currencies`).
+   First confirm the **loaded adapter is the current one** (cache-busted / hard
+   reload - see section 26), so a stale cached adapter is never tested.
 2. As the **player**, buy an item and confirm the wallet debit and the item price
    are read through the conversion table.
 3. As the **player**, purchase a **low-priced item** (e.g. a 1 gp item -
@@ -1195,7 +1202,9 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 - The one-time startup sweep (`store.organizeLedgerJournals`) enumerates every
   ledger journal regardless of schema version and files it into the matching
   status child. A non-ledger journal (shop / marker / reputation / advanced
-  order) is never modified and no journal is ever deleted.
+  order) is never modified and no journal is ever deleted. The same sweep also
+  backfills the GM-only `Purchase summary` page for any ledger journal that
+  lacks one (a malformed record is skipped safely).
 
 ### 23.5 Active-GM handover
 
@@ -1207,6 +1216,50 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 - The folder sweep stops cleanly (`status: 'idle'`) and no folder is created or
   moved by a non-active GM. A handover mid-purchase never fails the ledger write;
   the journal is simply left un-filed until the next sweep.
+
+### 23.6 Ledger summary page (GM-only purchase summary)
+
+> **Status: Node-tested only; live page verification pending.** The GM-readable
+> purchase ledger pages (`src/storage/ledger-summary.js`) are new in the
+> **`0.1.10` prerelease** and are exercised by the automated suite in Node. This
+> section is the intended real-runtime check on a live v14 install; the actual
+> `JournalEntryPage` create/update and the player-side invisibility are **not
+> yet verified**. The summary is best-effort: a page create/update failure never
+> fails the ledger write, so the journal may lack a summary page until the
+> one-time startup / handover sweep renders it. That sweep only reads and renders
+> - it never replays or re-executes an old transaction, so an old failed purchase
+> is never charged again, and the diagnostic `detail` is written only to the
+> GM-private page/record, never into a player chat/response.
+
+1. As the **active GM**, make a purchase that reaches `committed` (section 7) or
+   any failure (e.g. a `shop-not-found` / `balance-read-failed` attempt).
+2. Open the resulting ledger `JournalEntry` (`Ledger:<user>:<requestId>`). The
+   journal should carry a text page named **`Purchase summary`** (a
+   `JournalEntryPage` of type `text`, marked `flags.market.ledgerSummary: true`)
+   showing Status, the attempted Buy, Shop, Quantity, the quoted unit/total in
+   copper (or `Not quoted` for a pre-quote failure), the reason code and the
+   diagnostic detail on a failure, any compensation, and created/updated stamps.
+3. Confirm that adding and editing a **separate** GM page on the same journal is
+   never overwritten by the market: only the module-owned `Purchase summary`
+   page is updated.
+4. Confirm a failure diagnostic on a failed attempt appears only on the journal
+   page, never in the player chat/response (the public result exposes only
+   `error`, never `detail`).
+
+**Expected**
+
+- A ledger journal created or updated via the store gains a module-owned text
+  page with the rendered summary; committing an update re-renders it to the new
+  status (never a stale pending render).
+- The startup/handover sweep backfills a summary page for any existing ledger
+  journal that lacks one; a malformed journal is skipped safely.
+- The ready/handover sweep only reads and renders - it does **not** replay or
+  re-execute the transaction, so an old failed purchase is left exactly as
+  recorded and never charged again.
+- The `Purchase summary` page is GM-readable; the journal itself remains GM-only
+  (`ownership.default = 0`) and a player never sees the `detail` string (the
+  player-facing result exposes only a bounded safe code).
+- A summary page failure never fails the ledger write or the sweep.
 
 ## 24. M6 - Accessibility (keyboard, screen reader, contrast, reduced motion)
 
@@ -1295,9 +1348,58 @@ real-runtime check and nothing here has yet been confirmed on a live install.
   only wall-clock assertion is a very generous 10 s catastrophic-regression-only
   guard, so normal CI slowness does not flip it.
 
-## 26. Summary / verdict
+## 26. Verify a live retest is not a stale cached adapter (current adapter + NEW purchase + GM-only pages)
 
-Record a pass/fail + notes row for each section. Take **all** sections (1-25) as
+> **Why:** after a release update the browser (or Foundry's module loader) can
+> serve a previously imported adapter module from cache, so a live retest may run
+> the OLD `Dnd5eAdapter` (the pre-fix `0.1`/`100` reading) even though the
+> published server code is correct. The `0.1.9` dnd5e retest was diagnosed exactly
+> this way. Run this check before trusting ANY live result, and after every
+> update. Do not mark a section live-tested until this one confirms the current
+> adapter was tested.
+
+1. In the GM client, confirm the **current** adapter is loaded. If the module was
+   updated (or edited) since the last load, **force a hard refresh / cache-bust**
+   by reloading the world or hard-refreshing the browser tab so
+   `src/adapters/index.js` (and the rest of the ESM graph) is re-imported rather
+   than served from cache. Then **reopen ALL Foundry tabs and clients** (GM and
+   player): each client caches ESM independently, so a stale adapter can persist
+   in one client while another has the current one.
+2. Confirm `game.modules.get('market').api.getAdapter('dnd5e')` reflects the
+   current code path - it should read the live `CONFIG.DND5E.currencies` and
+   derive the copper factor as `conversion.cp / conversion[d]` (e.g. `cp.conversion
+   === 100`, `gp.conversion === 1`, `pp.conversion === 0.1`), never a hardcoded
+   `0.1`/`100` reciprocal.
+3. Perform a **NEW** purchase (do not re-read an attempt made before the refresh -
+   the fresh adapter is the only valid signal).
+4. Confirm the live result is correct and **GM-only**:
+   - the per-request ledger `JournalEntry` (`Ledger:<user>:<requestId>`) is
+     **GM-only** (`ownership.default = 0`) and is filed in the matching `Market
+     Ledgers < status >` child;
+   - the ledger journal carries the module-owned **`Purchase summary`** text page
+     (a `JournalEntryPage` flagged `flags.market.ledgerSummary: true`), which is
+     GM-readable;
+   - a failure diagnostic (the `detail` string) appears **only** on that
+     GM-private page/record - the player-facing chat/response exposes only a
+     bounded safe code (e.g. `Purchase failed (balance-read-failed).`), never a raw
+     `[market] ...` stack.
+
+**Expected**
+
+- The loaded adapter is the current one (cache-busted / hard reload, all tabs and
+  clients reopened), and the previous cached-adapter failure does not recur.
+- The fresh adapter yields a valid outcome: the NEW purchase records one debit /
+  one delivery / one committed ledger record, or, on a forced failure, only a
+  bounded safe code in player-facing content - never a raw exception message.
+- The ledger record/folder/page are GM-only and the diagnostic `detail` stays on
+  the GM-private page/record; the player never sees `detail`.
+- The startup / GM-handover sweep backfills a summary page for any existing
+  journal but does **not** replay or re-execute an old transaction, so an old
+  failed purchase is never charged again.
+
+## 27. Summary / verdict
+
+Record a pass/fail + notes row for each section. Take **all** sections (1-26) as
 the minimum signal for M1/M2/M3/M4/M5/M6 - do not claim completion on the strength
 of `npm test` alone (that only mocks the Foundry boundaries). If you are about to
 run a real economy, treat sections 1, 4 (UI/hook shapes), 12 (last-item
@@ -1306,7 +1408,8 @@ contention), 15.3/15.4 (M2 action dispatch), 16.4 (M3 personalized quote), 17.5
 19.3 (M5 GM advanced-order adjudication), 20.2/20.3 (M5 order adjudication and
 buyback funds/balance), 20.5 (M5 recovery), 21.3/21.4/21.5 (M6 backup import,
 privacy and partial-after-write), 22.1-22.3 (M6 dynamic conversion and system
-adapter runtime), 23.1-23.5 (ledger folder organizer), 24.1-24.4 (M6 keyboard/
-screen-reader accessibility) and
+adapter runtime), 23.1-23.6 (ledger folder organizer + GM-readable purchase
+ledger pages), 24.1-24.4 (M6 keyboard/screen-reader accessibility), 26 (stale
+cached adapter / current-adapter verification) and
 the multi-GM concurrency note as mandatory, and confirm the two blockers in the
 intro are addressed before you trust a live economy to the module.

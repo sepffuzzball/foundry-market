@@ -30,6 +30,7 @@ import {
   makeId,
 } from '../services/model.js';
 import { createLedgerFolderOrganizer, journalFolderId } from './ledger-folders.js';
+import { renderLedgerSummary, resolveLedgerIds, syncLedgerSummaryPage } from './ledger-summary.js';
 
 const SCOPE = 'market';
 
@@ -42,7 +43,21 @@ function flagScope(doc) {
  * collection. Referenced lazily so importing this module under Node never
  * touches `game`.
  */
-function defaultDocAccess() {
+export function defaultDocAccess() {
+  // Shared active-GM predicate: this client's user must be the active GM. It
+  // fails closed (returns false) on an absent `game` global rather than throw:
+  // the best-effort ledger summary and folder arrange are launched fire-and-
+  // forget after the ledger write, so they can settle AFTER the runtime tears
+  // `game` down (between persistence and the scheduled background task). Every
+  // access is guarded so this closure never throws - it simply reports "not the
+  // active GM".
+  function isActiveGM() {
+    return (
+      !!globalThis.game?.user &&
+      !!globalThis.game?.user?.isGM &&
+      globalThis.game?.user?.id === (globalThis.game?.users?.activeGM?.id ?? null)
+    );
+  }
   // The ledger folder organizer is built lazily, on first use, so importing this
   // module under Node never touches `game`/`globalThis.Folder`. It is only ever
   // reached once the runtime is live and a ledger journal exists.
@@ -52,16 +67,9 @@ function defaultDocAccess() {
     organizer = createLedgerFolderOrganizer({
       folders: globalThis.game?.folders,
       FolderClass: globalThis.game?.folders?.documentClass || globalThis.Folder,
-      // The active-GM predicate must fail closed (return false) on an absent
-      // `game` global rather than throw: the best-effort ledger folder arrange is
-      // launched fire-and-forget after the ledger write, so it can settle AFTER
-      // the runtime tears `game` down (between persistence and the scheduled
-      // background task). Every access is guarded with optional chaining so this
-      // closure never throws - it simply reports "not the active GM".
-      isActiveGM: () =>
-        !!globalThis.game?.user &&
-        !!globalThis.game?.user?.isGM &&
-        globalThis.game?.user?.id === (globalThis.game?.users?.activeGM?.id ?? null),
+      // The active-GM predicate is shared (fails closed) and re-checked before
+      // every read/create/move; see `isActiveGM` above.
+      isActiveGM,
       logger: console,
     });
     return organizer;
@@ -92,6 +100,13 @@ function defaultDocAccess() {
     },
     async organizeLedgerJournal(doc, status) {
       return getOrganizer().organize(doc, status);
+    },
+    // Best-effort, GM-only ledger summary page sync. Renders the human-readable
+    // summary from the given (already name-resolved) record and writes it to the
+    // module-owned text page on `doc`. Never throws, never fails the ledger write.
+    async syncLedgerSummary(doc, record, names = {}) {
+      const html = renderLedgerSummary(record, names);
+      return syncLedgerSummaryPage(doc, html, { isActiveGM });
     },
   };
 }
@@ -127,6 +142,93 @@ export function createStore(docAccess) {
     }
   }
 
+  // --- Ledger summary sync ---------------------------------------------------
+  // Best-effort, GM-only: after a ledger record is persisted we ALSO render a
+  // human-readable summary page for the active GM. This mirrors the folder
+  // arrange exactly: it is launched fire-and-forget and NEVER awaited, its
+  // failure never affects the ledger write, and it is guarded so an adapter
+  // without the optional method (e.g. an older test fake) is unaffected.
+  //
+  // Per-journal serialization: summary writes for the SAME journal run one at a
+  // time, keyed by stable doc id, so a queued summary never races another and a
+  // stale pending render can never overwrite a later committed render. Each task
+  // re-reads the LIVE `flags.market.record` immediately before rendering, so the
+  // committed state always wins over a stale enqueued pending one.
+  const summaryQueues = new Map();
+
+  function summaryQueueKey(doc) {
+    const id = doc?.id ?? doc?._id;
+    return id != null ? `id:${id}` : doc;
+  }
+
+  // Resolve best-effort display names for a ledger record so the GM-facing
+  // summary is readable. Shop name/item name come from the store's shop record
+  // (via `findShop`), actor name from the live game actors collection. Never
+  // throws: an unknown shop/actor just yields null names and the renderer falls
+  // back to stable ids.
+  async function resolveLedgerNames(record) {
+    const ids = resolveLedgerIds(record);
+    let shopName = null;
+    let itemName = null;
+    if (ids.shopId) {
+      const shop = await findShop(ids.shopId);
+      if (shop) {
+        shopName = shop.name;
+        if (ids.entryId) {
+          const entry = (shop.inventory || []).find((e) => e.id === ids.entryId);
+          if (entry) itemName = entry.name;
+        }
+      }
+    }
+    let actorName = null;
+    if (ids.actorId) {
+      actorName = globalThis.game?.actors?.get?.(ids.actorId)?.name ?? null;
+    }
+    return { shopName, itemName, actorName };
+  }
+
+  async function runLedgerSummaryTask(doc) {
+    try {
+      // Re-read the LIVE persisted record immediately before rendering so a
+      // queued commit wins over a stale pending snapshot captured earlier.
+      const live = flagScope(doc)?.record;
+      if (!live) return;
+      const normalized = normalizeLedgerRecord(live);
+      const names = await resolveLedgerNames(normalized);
+      await docAccess.syncLedgerSummary(doc, normalized, names);
+    } catch (err) {
+      // A summary failure must never fail the ledger write or the sweep; log and
+      // move on (the next write or the ready sweep retries).
+      console.warn('[market] ledger summary sync failed', err);
+    }
+  }
+
+  function enqueueLedgerSummary(doc) {
+    if (typeof docAccess.syncLedgerSummary !== 'function') return Promise.resolve();
+    const key = summaryQueueKey(doc);
+    const prev = summaryQueues.get(key) || Promise.resolve();
+    // Run regardless of whether the previous task settled; the tail swallows any
+    // error so the map never grows and the next enqueue starts clean.
+    const run = prev.then(
+      () => runLedgerSummaryTask(doc),
+      () => runLedgerSummaryTask(doc)
+    );
+    const tail = run.then(
+      () => undefined,
+      () => undefined
+    );
+    summaryQueues.set(key, tail);
+    tail.then(() => {
+      if (summaryQueues.get(key) === tail) summaryQueues.delete(key);
+    });
+    return run;
+  }
+
+  // Test/utility hook: resolve once every queued ledger summary has settled.
+  async function flushLedgerSummaries() {
+    await Promise.all(Array.from(summaryQueues.values()));
+  }
+
   async function findJournalByKindAndId(kind, id) {
     const docs = await docAccess.listJournalEntries();
     return (
@@ -160,6 +262,11 @@ export function createStore(docAccess) {
       Promise.resolve()
         .then(() => docAccess.organizeLedgerJournal(doc, status))
         .catch((err) => console.warn('[market] ledger folder organize failed on create', err));
+    }
+    // Best-effort lag of the GM-only summary page. Same fire-and-forget contract
+    // as the folder organize: never awaited, never allowed to fail the write.
+    if (kind === LEDGER_KIND && typeof docAccess.syncLedgerSummary === 'function') {
+      enqueueLedgerSummary(doc);
     }
     const stored = flagScope(doc)?.record;
     return normalizeRecordForKind(kind, stored ?? record);
@@ -278,6 +385,10 @@ export function createStore(docAccess) {
       Promise.resolve()
         .then(() => docAccess.organizeLedgerJournal(doc, status))
         .catch((err) => console.warn('[market] ledger folder organize failed on update', err));
+    }
+    // Best-effort lag of the GM-only summary page, same fire-and-forget contract.
+    if (typeof docAccess.syncLedgerSummary === 'function') {
+      enqueueLedgerSummary(doc);
     }
     return next;
   }
@@ -441,7 +552,10 @@ export function createStore(docAccess) {
     if (!active()) return { status: 'idle', moved: 0, failed: 0, skipped: 0 };
 
     const organize = docAccess.organizeLedgerJournal;
-    if (typeof organize !== 'function') {
+    const syncSummary = docAccess.syncLedgerSummary;
+    // The sweep needs at least one of the folder organize or the summary sync;
+    // with neither it must stay an idle no-op (the documented contract).
+    if (typeof organize !== 'function' && typeof syncSummary !== 'function') {
       return { status: 'idle', moved: 0, failed: 0, skipped: 0 };
     }
     // Prefer the ledger-wide enumeration (all schema versions) so legacy schema
@@ -470,6 +584,17 @@ export function createStore(docAccess) {
         skipped += 1;
         continue;
       }
+      // Best-effort GM-only summary backfill. Independent of the folder counts
+      // below and of organizer availability: the task handles a malformed or
+      // unknown-status record safely and logs (never throws) on failure, and any
+      // summary outcome is never counted against moved/failed/skipped. The sync
+      // is SCHEDULED, never awaited, so a never-settling summary cannot delay the
+      // folder work for this journal or the next doc; per-journal serialization
+      // and error swallowing in the queue still apply.
+      if (typeof syncSummary === 'function' && active()) {
+        enqueueLedgerSummary(doc);
+      }
+      if (typeof organize !== 'function') continue;
       const status = f?.record?.status;
       if (!LEDGER_STATUSES.includes(status)) {
         skipped += 1;
@@ -514,6 +639,8 @@ export function createStore(docAccess) {
     createAdvancedOrder,
     updateAdvancedOrder,
     organizeLedgerJournals,
+    // Test/utility hook: await every queued best-effort ledger summary sync.
+    flushLedgerSummaries,
     // Utility used by tests and the runtime to create ids.
     makeId,
   };

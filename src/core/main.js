@@ -642,7 +642,10 @@ function registerAutomationRuntime() {
  * in-flight promise: while a sweep is running, any further trigger merely requests
  * one follow-up, which runs after the current sweep finishes. This never blocks the
  * request handler (the sweep is not awaited), and the store re-checks the active GM
- * before the read and before each organize.
+ * before the read and before each organize. Beyond filing folders, the same sweep
+ * also backfills the GM-only ledger summary pages for existing/legacy journals, so
+ * a restart or handover is the reconciliation point for any summary that was never
+ * written.
  */
 function scheduleLedgerFolderSweep() {
   if (ledgerSweepInFlight) {
@@ -905,7 +908,9 @@ Hooks.once('ready', () => {
   // delays the request handler or storefront wiring; the store re-checks the
   // active GM before the read and before each organize, and a failure is logged,
   // not thrown. The same sweep is re-triggered by `userConnected`/`updateUser`
-  // on a GM handover that becomes THIS client.
+  // on a GM handover that becomes THIS client. The sweep also backfills the
+  // GM-only ledger summary pages, so a startup/handover is the reconciliation
+  // point for any journal whose summary was never rendered.
   lastLedgerActiveGMId = game.users?.activeGM?.id ?? null;
   scheduleLedgerFolderSweep();
   registerLedgerUserSweep();
