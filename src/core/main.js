@@ -637,6 +637,62 @@ function registerAutomationRuntime() {
   if (isActiveGM()) scheduleAutomationRun();
 }
 
+/**
+ * Schedule one best-effort ledger folder sweep. Reentrancy is guarded by a single
+ * in-flight promise: while a sweep is running, any further trigger merely requests
+ * one follow-up, which runs after the current sweep finishes. This never blocks the
+ * request handler (the sweep is not awaited), and the store re-checks the active GM
+ * before the read and before each organize.
+ */
+function scheduleLedgerFolderSweep() {
+  if (ledgerSweepInFlight) {
+    ledgerSweepQueued = true;
+    return;
+  }
+  ledgerSweepInFlight = (async () => {
+    try {
+      await store.organizeLedgerJournals({ isActiveGM });
+    } catch (err) {
+      // Caught and logged so a bad journal never breaks the request channel.
+      console.error('[market] ledger folder sweep failed', err);
+    } finally {
+      ledgerSweepInFlight = null;
+      if (ledgerSweepQueued) {
+        ledgerSweepQueued = false;
+        scheduleLedgerFolderSweep();
+      }
+    }
+  })();
+}
+
+/**
+ * Possibly trigger a ledger folder sweep on a GM handover. Reads the active GM at
+ * event time (via a microtask, so any computed `game.users.activeGM` state has
+ * settled) and only sweeps when the active GM id CHANGED and now equals THIS user's
+ * id. No sweep is issued when the active GM is unchanged or is not this client.
+ */
+function maybeScheduleLedgerFolderSweep() {
+  // Defer the read to a microtask: `game.users.activeGM` may be recomputed only
+  // after the hook's synchronous event has finished.
+  queueMicrotask(() => {
+    const current = game.users?.activeGM?.id ?? null;
+    if (current === lastLedgerActiveGMId) return; // unchanged
+    lastLedgerActiveGMId = current;
+    if (current !== game.user?.id) return; // not this client's turn
+    if (!game.user?.isGM) return; // non-active GM
+    scheduleLedgerFolderSweep();
+  });
+}
+
+/**
+ * Register the GM-handover hooks and record the active GM at startup. Called once
+ * from `ready`; the startup placeholder sweep above is handled by the caller.
+ */
+function registerLedgerUserSweep() {
+  Hooks.on('userConnected', () => maybeScheduleLedgerFolderSweep());
+  Hooks.on('updateUser', () => maybeScheduleLedgerFolderSweep());
+}
+
 let commerceInstance = null;
 let automationService = null;
 let repService = null;
@@ -650,6 +706,14 @@ let theftCommerce = null;
 let backupService = null;
 let automationRunInFlight = null;
 let automationRunQueued = false;
+// Ledger folder sweep state. `lastLedgerActiveGMId` tracks the active GM id we
+// last swept for (or observed), so a `userConnected`/`updateUser` event only
+// triggers a sweep when the active GM actually changed AND became THIS user.
+// `ledgerSweepInFlight`/`ledgerSweepQueued` coalesce concurrent triggers so a
+// handover storm never starts duplicate sweeps.
+let lastLedgerActiveGMId = null;
+let ledgerSweepInFlight = null;
+let ledgerSweepQueued = false;
 
 Hooks.once('init', () => {
   registerSettings();
@@ -835,6 +899,16 @@ Hooks.once('ready', () => {
   });
   registerJournalDirectory();
   registerAutomationRuntime();
+  // Startup best-effort ledger folder sweep. Record the active GM id as the
+  // baseline for later handover sweeps, then run one sweep now (which no-ops
+  // cleanly if this client is not the active GM). Fire-and-forget so it never
+  // delays the request handler or storefront wiring; the store re-checks the
+  // active GM before the read and before each organize, and a failure is logged,
+  // not thrown. The same sweep is re-triggered by `userConnected`/`updateUser`
+  // on a GM handover that becomes THIS client.
+  lastLedgerActiveGMId = game.users?.activeGM?.id ?? null;
+  scheduleLedgerFolderSweep();
+  registerLedgerUserSweep();
 });
 
 // Re-exports for tooling/tests that import this module directly.

@@ -67,6 +67,7 @@ import {
 } from '../src/core/requests.js';
 import { fingerprintItem } from '../src/advanced/valuation.js';
 import { createStore, store as defaultStore } from '../src/storage/store.js';
+import { createLedgerFolderOrganizer, LEDGER_FOLDER_ROLES } from '../src/storage/ledger-folders.js';
 import {
   makeItem as sellMakeItem,
   createMockActor as sellCreateMockActor,
@@ -2704,6 +2705,104 @@ function createFakeDocAccess() {
   };
 }
 
+// A fake docAccess wired to a real ledger-folder organizer. `folders` is a live
+// list the organizer scans (it exposes the low-level folder records for
+// assertions) and `FolderClass` creates + records folders in that same list.
+// `opts.isActiveGM` controls both the organizer's own gate and the sweep gate the
+// store reads through `store.organizeLedgerJournals({ isActiveGM })`.
+function createFakeDocAccessWithOrganizer({
+  isActiveGM = () => true,
+  ListLedgerJournals = null,
+} = {}) {
+  const docs = new Map();
+  const folders = [];
+  let seq = 0;
+  let folderSeq = 0;
+  const FolderClass = {
+    create: async (data) => {
+      const id = `folder-${++folderSeq}`;
+      const folder = {
+        id,
+        name: data.name,
+        type: data.type,
+        folder: data.folder ?? null,
+        flags: data.flags,
+      };
+      folders.push(folder);
+      return folder;
+    },
+  };
+  const organizer = createLedgerFolderOrganizer({
+    folders,
+    FolderClass,
+    isActiveGM,
+    logger: { warn: () => {} },
+  });
+  function makeDoc({ name, flags, folder = null } = {}) {
+    const id = `journal-${++seq}`;
+    const doc = {
+      id,
+      name,
+      flags,
+      _source: { folder },
+      failUpdate: false,
+      update(patch) {
+        if (this.failUpdate) throw new Error('[market] fake doc.update failed');
+        if (patch && patch.folder !== undefined) this._source.folder = patch.folder;
+        if (patch && patch.flags) this.flags = { ...this.flags, ...patch.flags };
+        return this;
+      },
+    };
+    docs.set(id, doc);
+    return doc;
+  }
+  const listJournalEntries = () => Promise.resolve(Array.from(docs.values()));
+  const listLedgerJournals =
+    ListLedgerJournals === null
+      ? () => Promise.resolve(Array.from(docs.values()))
+      : () => Promise.resolve(ListLedgerJournals(docs));
+  return {
+    docs,
+    folders,
+    FolderClass,
+    makeDoc,
+    async listJournalEntries() {
+      return listJournalEntries();
+    },
+    async listLedgerJournals() {
+      return listLedgerJournals();
+    },
+    async getJournalEntry(id) {
+      return docs.get(id) || null;
+    },
+    async createJournalEntry({ name, flags }) {
+      return makeDoc({ name, flags });
+    },
+    async updateJournalEntry(doc, patch) {
+      for (const [key, value] of Object.entries(patch)) {
+        if (key === 'flags') doc.flags = { ...doc.flags, ...value };
+        else doc[key] = value;
+      }
+      return doc;
+    },
+    async organizeLedgerJournal(doc, status) {
+      return organizer.organize(doc, status);
+    },
+    // Test-only: resolve once every queued folder placement (including the
+    // store's fire-and-forget organizes) has settled, so a test can await the
+    // best-effort arrange deterministically.
+    async flushOrganizer() {
+      return organizer.flush();
+    },
+  };
+}
+
+function folderByRole(folders, role) {
+  return folders.find(
+    (f) => f.type === 'JournalEntry' && f.flags?.market?.ledgerRole === role
+  ) || null;
+}
+
 test('store creates and updates locations without erasing fields', async () => {
   const store = createStore(createFakeDocAccess());
   const loc = await store.createLocation({ name: 'Town', description: 'A town' });
@@ -2839,6 +2938,421 @@ test('store ledger create/find/update idempotency key', async () => {
 
   const missing = await store.findLedgerByKey('user1:nope');
   assert.equal(missing, null);
+});
+
+test('store files a new ledger journal into the Pending folder and moves it on commit', async () => {
+  const da = createFakeDocAccessWithOrganizer();
+  const store = createStore(da);
+  const result = await store.createLedger({
+    key: 'u1:r1',
+    status: 'pending',
+    payloadHash: 'abc',
+    quantity: 1,
+    unitPrice: 5,
+    totalPrice: 5,
+  });
+  assert.equal(result.created, true);
+  const rec = result.record;
+
+  const doc = Array.from(da.docs.values()).find(
+    (d) => d.flags?.market?.kind === 'ledger' && d.flags?.market?.record?.id === rec.id
+  );
+  // The store launches the folder arrange best-effort (never awaited), so the test
+  // harness must flush the organizer before asserting the folder placement.
+  await da.flushOrganizer();
+  const root = folderByRole(da.folders, LEDGER_FOLDER_ROLES.root);
+  const pending = folderByRole(da.folders, LEDGER_FOLDER_ROLES.pending);
+  assert.ok(root, 'root folder created');
+  assert.ok(pending, 'pending child folder created');
+  assert.equal(doc._source.folder, pending.id, 'journal filed into Pending');
+
+  const updated = await store.updateLedger(rec.id, { status: 'committed' });
+  assert.equal(updated.status, 'committed');
+  await da.flushOrganizer();
+  const success = folderByRole(da.folders, LEDGER_FOLDER_ROLES.success);
+  assert.ok(success, 'success child folder created');
+  assert.equal(doc._source.folder, success.id, 'journal moved into Success on commit');
+});
+
+test('a ledger folder-create error never fails the ledger record or status', async () => {
+  const da = createFakeDocAccessWithOrganizer();
+  // Root creation succeeds, child creation throws -> the journal stays unfiled.
+  da.FolderClass.create = async (data) => {
+    if (data.flags?.market?.ledgerRole !== LEDGER_FOLDER_ROLES.root) {
+      throw new Error('folder boom');
+    }
+    const folder = {
+      id: 'folder-root',
+      name: data.name,
+      type: data.type,
+      folder: data.folder ?? null,
+      flags: data.flags,
+    };
+    da.folders.push(folder);
+    return folder;
+  };
+  const store = createStore(da);
+  const result = await store.createLedger({
+    key: 'u1:r2',
+    status: 'pending',
+    payloadHash: 'abc',
+    quantity: 1,
+    unitPrice: 5,
+    totalPrice: 5,
+  });
+  assert.equal(result.created, true, 'record persisted despite folder failure');
+  assert.equal(result.record.status, 'pending');
+  // Let the best-effort arrange settle (it swallows the child create error).
+  await da.flushOrganizer();
+  const doc = Array.from(da.docs.values()).find(
+    (d) => d.flags?.market?.kind === 'ledger' && d.flags?.market?.record?.id === result.record.id
+  );
+  assert.equal(doc._source.folder, null, 'journal left unfiled');
+});
+
+test('a journal move failure during update keeps the committed status persisted', async () => {
+  const da = createFakeDocAccessWithOrganizer();
+  const store = createStore(da);
+  const result = await store.createLedger({
+    key: 'u1:r3',
+    status: 'pending',
+    payloadHash: 'abc',
+    quantity: 1,
+    unitPrice: 5,
+    totalPrice: 5,
+  });
+  const doc = Array.from(da.docs.values()).find(
+    (d) => d.flags?.market?.kind === 'ledger' && d.flags?.market?.record?.id === result.record.id
+  );
+  // The store launches the arrange best-effort (never awaited); flush it so the
+  // initial Pending placement has settled before asserting.
+  await da.flushOrganizer();
+  const pendingFolder = folderByRole(da.folders, LEDGER_FOLDER_ROLES.pending);
+  assert.equal(doc._source.folder, pendingFolder.id, 'initially placed in Pending');
+
+  // The flags write still succeeds, but the organizer's doc.update throws.
+  doc.failUpdate = true;
+  const updated = await store.updateLedger(result.record.id, { status: 'committed' });
+  assert.equal(updated.status, 'committed', 'status update is committed');
+  // The organizer cannot move the journal now: it stays in Pending.
+  await da.flushOrganizer();
+  assert.equal(doc._source.folder, pendingFolder.id, 'move failed, stays in Pending');
+  assert.equal(doc.flags?.market?.record?.status, 'committed', 'flags record is committed');
+});
+
+test('store ledger-folder sweep moves pending, skips invalid/already-filed, and leaves non-ledger untouched', async () => {
+  const da = createFakeDocAccessWithOrganizer();
+  const store = createStore(da);
+  // Pre-seed root + success folders so an already-filed ledger is not moved.
+  const root = await da.FolderClass.create({
+    name: 'Market Ledgers',
+    type: 'JournalEntry',
+    folder: null,
+    flags: { market: { ledgerRole: LEDGER_FOLDER_ROLES.root } },
+  });
+  const success = await da.FolderClass.create({
+    name: 'Success',
+    type: 'JournalEntry',
+    folder: root.id,
+    flags: { market: { ledgerRole: LEDGER_FOLDER_ROLES.success } },
+  });
+  const mk = (kind, status, folder = null) =>
+    da.makeDoc({
+      name: kind,
+      flags: { market: { schemaVersion: 1, kind, record: { id: makeId(), status } } },
+      folder,
+    });
+  const committed = mk('ledger', 'committed', success.id); // already filed -> skipped
+  const pending = mk('ledger', 'pending'); // moved
+  const invalid = mk('ledger', 'bogus'); // invalid status -> skipped
+  const shop = mk('shop', null); // non-ledger -> skipped
+  const failed = mk('ledger', 'failed', null); // moved
+
+  const summary = await store.organizeLedgerJournals({ isActiveGM: () => true });
+  assert.equal(summary.status, 'ok');
+  assert.equal(summary.moved, 2, 'pending + failed moved');
+  assert.equal(summary.failed, 0);
+  assert.equal(summary.skipped, 3, 'already-filed + invalid + non-ledger skipped');
+
+  const pendingFolder = folderByRole(da.folders, LEDGER_FOLDER_ROLES.pending);
+  const failureFolder = folderByRole(da.folders, LEDGER_FOLDER_ROLES.failure);
+  assert.equal(pending._source.folder, pendingFolder.id);
+  assert.equal(failed._source.folder, failureFolder.id);
+  assert.equal(committed._source.folder, success.id, 'already-filed ledger untouched');
+  assert.equal(shop._source.folder, null, 'non-ledger journal untouched');
+});
+
+test('store ledger-folder sweep is an idle no-op for a non-active GM', async () => {
+  // The organizer's own active-GM gate is also false, so even the create path
+  // no-ops and no folders are ever created.
+  const da = createFakeDocAccessWithOrganizer({ isActiveGM: () => false });
+  const store = createStore(da);
+  await store.createLedger({
+    key: 'u1:r4',
+    status: 'pending',
+    payloadHash: 'abc',
+    quantity: 1,
+    unitPrice: 5,
+    totalPrice: 5,
+  });
+  assert.equal(da.folders.length, 0, 'create no-ops for a non-active GM');
+  const summary = await store.organizeLedgerJournals({ isActiveGM: () => false });
+  assert.deepEqual(summary, { status: 'idle', moved: 0, failed: 0, skipped: 0 });
+  assert.equal(da.folders.length, 0, 'no folders created while not the active GM');
+});
+
+test('store ledger-folder sweep counts a folder-move throw as failed, not a false success', async () => {
+  const da = createFakeDocAccessWithOrganizer();
+  const store = createStore(da);
+  const doc = da.makeDoc({
+    name: 'L',
+    flags: { market: { schemaVersion: 1, kind: 'ledger', record: { id: makeId(), status: 'pending' } } },
+    folder: null,
+  });
+  doc.failUpdate = true; // the organizer's doc.update throws
+  const summary = await store.organizeLedgerJournals({ isActiveGM: () => true });
+  assert.equal(summary.status, 'ok');
+  assert.equal(summary.moved, 0);
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.skipped, 0);
+});
+
+test('store ledger-folder sweep recovers a legacy (schema-v0) ledger journal', async () => {
+  const da = createFakeDocAccessWithOrganizer();
+  const store = createStore(da);
+  // A legacy schema-v0 ledger journal: kind === 'ledger', no schemaVersion.
+  const legacy = da.makeDoc({
+    name: 'Legacy ledger',
+    flags: { market: { kind: 'ledger', record: { id: makeId(), status: 'failed' } } },
+    folder: null,
+  });
+  const summary = await store.organizeLedgerJournals({ isActiveGM: () => true });
+  assert.equal(summary.status, 'ok');
+  assert.equal(summary.moved, 1, 'legacy journal filed');
+  assert.equal(summary.skipped, 0);
+  const failureFolder = folderByRole(da.folders, LEDGER_FOLDER_ROLES.failure);
+  assert.equal(legacy._source.folder, failureFolder.id);
+});
+
+test('createLedger and updateLedger resolve without awaiting a pending folder organizer', async () => {
+  const da = createFakeDocAccessWithOrganizer();
+  // The organizer's placement never settles; the store must NOT await it.
+  da.organizeLedgerJournal = () => new Promise(() => {});
+  const store = createStore(da);
+
+  const created = await store.createLedger({
+    key: 'u:defer',
+    status: 'pending',
+    payloadHash: 'abc',
+    quantity: 1,
+    unitPrice: 5,
+    totalPrice: 5,
+  });
+  assert.equal(created.created, true);
+  assert.equal(created.record.status, 'pending', 'status is correct despite the pending organizer');
+
+  const updated = await store.updateLedger(created.record.id, { status: 'committed' });
+  assert.equal(updated.status, 'committed', 'update resolves and persists the committed status');
+
+  const doc = Array.from(da.docs.values()).find(
+    (d) => d.flags?.market?.kind === 'ledger' && d.flags?.market?.record?.id === created.record.id
+  );
+  assert.ok(doc, 'ledger journal persisted (still owned by the store)');
+  assert.equal(doc.flags?.market?.record?.status, 'committed', 'flags reflect the committed status');
+});
+
+test('default store createLedger stays GM-owned while the folder arrange is pending', async () => {
+  const created = [];
+  const oldGE = globalThis.game;
+  const oldJE = globalThis.JournalEntry;
+  globalThis.JournalEntry = {
+    create: async (data) => {
+      created.push(data);
+      return {
+        id: 'j1',
+        name: data.name,
+        flags: data.flags,
+        ownership: data.ownership,
+        _source: { folder: null },
+        update() {
+          return this;
+        },
+      };
+    },
+  };
+  // The folder document-class create never settles, so the organizer cannot
+  // complete. `createLedger` must still return immediately, untouched.
+  const pendingFolder = {
+    create: () => new Promise(() => {}),
+  };
+  globalThis.game = {
+    journal: { documentClass: globalThis.JournalEntry, filter: () => [] },
+    folders: { documentClass: pendingFolder, filter: () => [] },
+    user: { isGM: true, id: 'gm1' },
+    users: { activeGM: { id: 'gm1' } },
+  };
+  try {
+    const res = await defaultStore.createLedger({
+      key: 'u:rgm',
+      status: 'pending',
+      payloadHash: 'abc',
+      quantity: 1,
+      unitPrice: 1,
+      totalPrice: 1,
+    });
+    assert.ok(res.record.id);
+    assert.equal(res.record.status, 'pending', 'status correct while the folder op is pending');
+    assert.equal(created[0].ownership?.default, 0, 'ledger journal stays GM-only');
+  } finally {
+    globalThis.game = oldGE;
+    globalThis.JournalEntry = oldJE;
+  }
+});
+
+test('default store ledger journal is created GM-only (ownership default 0)', async () => {
+  const created = [];
+  const oldGE = globalThis.game;
+  const oldJE = globalThis.JournalEntry;
+  globalThis.JournalEntry = {
+    create: async (data) => {
+      created.push(data);
+      return {
+        id: 'j1',
+        name: data.name,
+        flags: data.flags,
+        ownership: data.ownership,
+        _source: { folder: null },
+        update() {
+          return this;
+        },
+      };
+    },
+  };
+  globalThis.game = {
+    journal: { documentClass: globalThis.JournalEntry, filter: () => [] },
+    folders: { documentClass: globalThis.JournalEntry, filter: () => [] },
+    user: { isGM: true, id: 'gm1' },
+    users: { activeGM: { id: 'gm1' } },
+  };
+  try {
+    const res = await defaultStore.createLedger({
+      key: 'u:r',
+      status: 'pending',
+      payloadHash: 'abc',
+      quantity: 1,
+      unitPrice: 1,
+      totalPrice: 1,
+    });
+    assert.ok(res.record.id);
+    assert.equal(created[0].ownership?.default, 0, 'ledger journal is GM-only');
+  } finally {
+    globalThis.game = oldGE;
+    globalThis.JournalEntry = oldJE;
+  }
+});
+
+test('default store fire-and-forget ledger folder task after game teardown fails closed without a TypeError', async () => {
+  // The real-world race: a ledger journal is persisted while the Foundry `game`
+  // global is live, and the store's best-effort folder arrange (launched
+  // fire-and-forget, never awaited) settles only AFTER the runtime tears the
+  // `game` global down - between ledger persistence and the scheduled background
+  // task. By that point the organizer consults only its active-GM predicate, so
+  // it must fail closed (return false) on an absent `game`, never throw a
+  // TypeError, and leave the persisted journal record intact.
+  const createdData = [];
+  const createdDocs = [];
+  const oldGE = globalThis.game;
+  const oldJE = globalThis.JournalEntry;
+  const oldFolder = globalThis.Folder;
+  // A deferred create-gate we release only AFTER tearing `game` down. This keeps
+  // the journal-creation microtask chain (which reads `game.journal`) running
+  // while `game` is live, while forcing the fire-and-forget organize to settle
+  // after the teardown - the exact interleaving that used to throw.
+  let resolveCreate;
+  const createGate = new Promise((resolve) => {
+    resolveCreate = resolve;
+  });
+  globalThis.JournalEntry = {
+    create: async (data) => {
+      createdData.push(data);
+      const doc = {
+        // Unique id so the organizer's per-journal queue is never shared with a
+        // stale entry left by another default-store test.
+        id: 'teardown-j1',
+        name: data.name,
+        flags: data.flags,
+        ownership: data.ownership,
+        _source: { folder: null },
+        update() {
+          return this;
+        },
+      };
+      createdDocs.push(doc);
+      return createGate.then(() => doc);
+    },
+  };
+  globalThis.Folder = {
+    create: async (data) => ({
+      id: 'folder-teardown',
+      name: data.name,
+      type: data.type,
+      folder: data.folder ?? null,
+      flags: data.flags,
+    }),
+  };
+  globalThis.game = {
+    journal: { documentClass: globalThis.JournalEntry, filter: () => [] },
+    folders: { documentClass: globalThis.Folder, filter: () => [] },
+    user: { isGM: true, id: 'gm1' },
+    users: { activeGM: { id: 'gm1' } },
+  };
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    const resPromise = defaultStore.createLedger({
+      key: 'u:teardown',
+      status: 'pending',
+      payloadHash: 'abc',
+      quantity: 1,
+      unitPrice: 1,
+      totalPrice: 1,
+    });
+    // Let the microtask chain reach `createJournalEntry` (it reads `game.journal`
+    // and then blocks on the deferred gate). The journal is now persisted while
+    // `game` is still live, but the fire-and-forget organize has not run yet.
+    await sleep(0);
+    // Tear the `game` global down while the organize is still unscheduled.
+    globalThis.game = oldGE;
+    // Release the journal create: insertRecord resumes and schedules the
+    // fire-and-forget organize, which now settles AFTER the teardown.
+    resolveCreate();
+    const res = await resPromise;
+    // Give the best-effort organize a chance to settle after the teardown.
+    await sleep(0);
+    assert.equal(res.created, true, 'ledger record persisted');
+    assert.equal(res.record.status, 'pending', 'journal record remains intact after teardown');
+    assert.equal(createdData.length, 1, 'a single GM-only journal was persisted');
+    assert.equal(createdData[0].ownership?.default, 0, 'journal stays GM-only');
+    assert.equal(
+      createdDocs[0]._source.folder,
+      null,
+      'journal left unfiled when the organizer fails closed'
+    );
+    const thrown = warnings.filter((w) =>
+      /TypeError|ReferenceError|is not a function|Cannot read/i.test(String(w.join(' ')))
+    );
+    assert.equal(
+      thrown.length,
+      0,
+      `no TypeError/throw warned after game teardown (got: ${warnings.map((w) => w.join(' ')).join(' | ')})`
+    );
+  } finally {
+    console.warn = originalWarn;
+    globalThis.game = oldGE;
+    globalThis.JournalEntry = oldJE;
+    globalThis.Folder = oldFolder;
+  }
 });
 
 // ---------------------------------------------------------------- M3 social catalog

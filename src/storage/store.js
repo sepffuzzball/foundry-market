@@ -19,6 +19,7 @@ import {
   REPUTATION_KIND,
   REPUTATION_EVENT_KIND,
   ADVANCED_ORDER_KIND,
+  LEDGER_STATUSES,
   normalizeLocation,
   normalizeShop,
   normalizeInventoryEntry,
@@ -28,6 +29,7 @@ import {
   normalizeAdvancedOrder,
   makeId,
 } from '../services/model.js';
+import { createLedgerFolderOrganizer, journalFolderId } from './ledger-folders.js';
 
 const SCOPE = 'market';
 
@@ -41,9 +43,37 @@ function flagScope(doc) {
  * touches `game`.
  */
 function defaultDocAccess() {
+  // The ledger folder organizer is built lazily, on first use, so importing this
+  // module under Node never touches `game`/`globalThis.Folder`. It is only ever
+  // reached once the runtime is live and a ledger journal exists.
+  let organizer = null;
+  function getOrganizer() {
+    if (organizer) return organizer;
+    organizer = createLedgerFolderOrganizer({
+      folders: globalThis.game?.folders,
+      FolderClass: globalThis.game?.folders?.documentClass || globalThis.Folder,
+      // The active-GM predicate must fail closed (return false) on an absent
+      // `game` global rather than throw: the best-effort ledger folder arrange is
+      // launched fire-and-forget after the ledger write, so it can settle AFTER
+      // the runtime tears `game` down (between persistence and the scheduled
+      // background task). Every access is guarded with optional chaining so this
+      // closure never throws - it simply reports "not the active GM".
+      isActiveGM: () =>
+        !!globalThis.game?.user &&
+        !!globalThis.game?.user?.isGM &&
+        globalThis.game?.user?.id === (globalThis.game?.users?.activeGM?.id ?? null),
+      logger: console,
+    });
+    return organizer;
+  }
   return {
     async listJournalEntries() {
       return game.journal.filter((e) => flagScope(e)?.schemaVersion === SCHEMA_VERSION);
+    },
+    // Enumerate EVERY ledger journal regardless of schema version, so a legacy
+    // (schema-v0) ledger journal is still picked up by the folder sweep.
+    async listLedgerJournals() {
+      return game.journal.filter((e) => flagScope(e)?.kind === LEDGER_KIND);
     },
     async getJournalEntry(id) {
       return game.journal.get(id);
@@ -59,6 +89,9 @@ function defaultDocAccess() {
     },
     async updateJournalEntry(doc, patch) {
       return doc.update(patch);
+    },
+    async organizeLedgerJournal(doc, status) {
+      return getOrganizer().organize(doc, status);
     },
   };
 }
@@ -116,6 +149,18 @@ export function createStore(docAccess) {
       name: name || record.name || kind,
       flags,
     });
+    // Only the ledger journals are organized into the GM-side folder hierarchy.
+    // A folder failure is never allowed to fail the persistence: the record is
+    // stored, and the journal is left un-filed (the ready sweep recovers it).
+    // The organize is launched best-effort and NEVER awaited - a folder
+    // create/move that never settles or throws must not delay or fail the ledger
+    // write, so the record is returned immediately.
+    if (kind === LEDGER_KIND && typeof docAccess.organizeLedgerJournal === 'function') {
+      const status = record.status;
+      Promise.resolve()
+        .then(() => docAccess.organizeLedgerJournal(doc, status))
+        .catch((err) => console.warn('[market] ledger folder organize failed on create', err));
+    }
     const stored = flagScope(doc)?.record;
     return normalizeRecordForKind(kind, stored ?? record);
   }
@@ -223,6 +268,17 @@ export function createStore(docAccess) {
     const next = normalizeLedgerRecord({ ...current, ...patch });
     const flags = { schemaVersion: SCHEMA_VERSION, kind: LEDGER_KIND, record: next };
     await docAccess.updateJournalEntry(doc, { flags: { [SCOPE]: flags } });
+    // First write the flags, then file the journal into its status folder. The
+    // organize is launched best-effort and NEVER awaited: a folder error or a
+    // never-settling move must never turn a committed ledger write into an error
+    // or a compensation - the status is already persisted; the folder is
+    // best-effort and the ready sweep / handover sweep recovers it.
+    if (typeof docAccess.organizeLedgerJournal === 'function') {
+      const status = next.status;
+      Promise.resolve()
+        .then(() => docAccess.organizeLedgerJournal(doc, status))
+        .catch((err) => console.warn('[market] ledger folder organize failed on update', err));
+    }
     return next;
   }
 
@@ -373,6 +429,66 @@ export function createStore(docAccess) {
     return next;
   }
 
+  // --- Ledger folder sweep ---------------------------------------------------
+  // Best-effort, GM-only reconciliation of existing ledger journals into their
+  // canonical status folders, run once at startup by the active GM (and safe to
+  // re-run). The active-GM predicate is re-checked before the read and before
+  // each organize, and a handover stops the sweep cleanly. Returns a bounded
+  // summary, never throws.
+
+  async function organizeLedgerJournals({ isActiveGM } = {}) {
+    const active = typeof isActiveGM === 'function' ? isActiveGM : () => true;
+    if (!active()) return { status: 'idle', moved: 0, failed: 0, skipped: 0 };
+
+    const organize = docAccess.organizeLedgerJournal;
+    if (typeof organize !== 'function') {
+      return { status: 'idle', moved: 0, failed: 0, skipped: 0 };
+    }
+    // Prefer the ledger-wide enumeration (all schema versions) so legacy schema
+    // journals are swept too; fall back to the schema-V1-only list.
+    const listFn =
+      typeof docAccess.listLedgerJournals === 'function'
+        ? docAccess.listLedgerJournals
+        : docAccess.listJournalEntries;
+
+    if (!active()) return { status: 'idle', moved: 0, failed: 0, skipped: 0 };
+    let docs;
+    try {
+      docs = await listFn();
+    } catch (err) {
+      console.warn('[market] ledger folder sweep read failed', err);
+      return { status: 'error', moved: 0, failed: 0, skipped: 0 };
+    }
+
+    let moved = 0;
+    let failed = 0;
+    let skipped = 0;
+    for (const doc of docs) {
+      if (!active()) break;
+      const f = flagScope(doc);
+      if (f?.kind !== LEDGER_KIND) {
+        skipped += 1;
+        continue;
+      }
+      const status = f?.record?.status;
+      if (!LEDGER_STATUSES.includes(status)) {
+        skipped += 1;
+        continue;
+      }
+      const before = journalFolderId(doc);
+      try {
+        await organize(doc, status);
+        const after = journalFolderId(doc);
+        if (after != null && after !== before) moved += 1;
+        else skipped += 1;
+      } catch (err) {
+        failed += 1;
+        console.warn('[market] ledger folder organize failed in sweep', err);
+      }
+    }
+    return { status: 'ok', moved, failed, skipped };
+  }
+
   return {
     listLocations,
     createLocation,
@@ -397,6 +513,7 @@ export function createStore(docAccess) {
     listAdvancedOrders,
     createAdvancedOrder,
     updateAdvancedOrder,
+    organizeLedgerJournals,
     // Utility used by tests and the runtime to create ids.
     makeId,
   };

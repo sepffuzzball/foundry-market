@@ -49,6 +49,86 @@ existed (and therefore must never charge). Exported functions: `listLocations`, 
 `findShop`, and the ledger helpers `listLedgers`, `findLedgerByKey`,
 `createLedger`, `updateLedger`.
 
+### Ledger folder hierarchy (`src/storage/ledger-folders.js`)
+
+The ledger journals are not left loose in the Journal sidebar. A separate,
+deliberately Foundry-free module (`src/storage/ledger-folders.js`) maintains a
+canonical GM-side folder hierarchy and files each ledger journal according to its
+current status. It never touches purchase/ledger persistence - it only moves the
+journal's `folder`. The organizer is wired into the default store's doc access,
+so the only place it is instantiated is the live runtime; under Node it is
+exercised against a fake in-memory folder collection.
+
+The hierarchy is a single root folder `Market Ledgers` with a fixed child per
+status. Neither the root nor a child is ever located or reused by name: a folder
+is recognized only when it is a `JournalEntry` carrying the exact
+`flags.market.ledgerRole` AND the exact parent folder id. An unrelated folder
+that happens to be named "Success" or "Market Ledgers" is therefore never reused,
+and a duplicate hierarchy can never be created by a name collision.
+
+- `Market Ledgers` (role `ledger-root`) - always the single root, parent null.
+- `Success` (role `ledger-success`) - holds `committed` journals.
+- `Failure` (role `ledger-failure`) - holds `failed` journals.
+- `Pending` (role `ledger-pending`) - holds `pending` journals.
+- `Needs Recovery` (role `ledger-needs-recovery`) - holds `needsRecovery` journals.
+
+`createLedgerFolderOrganizer({ folders, FolderClass, isActiveGM, logger })`
+returns `{ organize(doc, status), journalFolderId(doc), flush() }`. `organize`
+places a journal into the folder matching `status`: it creates the root/child
+hierarchy as needed (serialized on a local promise queue so concurrent organizes
+can never create a duplicate root), then moves the document. It returns the
+target folder id on a successful move, `null` on a no-op (not the active GM, a
+non-ledger journal, a failed folder creation, or the journal already in the
+correct folder), and throws on an unknown status. Folder creation is scoped
+strictly to the active GM, and the predicate is re-checked before every
+read/create/move and again after each awaited create, so a GM handover stops a
+half-finished placement cleanly.
+
+In addition to the shared folder-create queue, `organize` is serialized **per
+journal** (keyed on the journal id, never the object identity): a pending
+organize racing a concurrent committed update is resolved in a deterministic
+order. Immediately before the move the organizer re-reads the journal's LIVE
+persisted status (`flags.market.record.status`, when valid) rather than trusting
+the status argument, and recomputes the target folder if the status changed while
+the root/child hierarchy was being awaited. The final folder therefore always
+matches the latest committed status and can never lag as a stale Pending; a
+journal whose status is unknown, or whose `flags.market.kind` is explicitly not
+a ledger, is never moved.
+
+The store wires this in as **best-effort and never awaited**: `insertRecord` (for
+a `ledger` record only) and `updateLedger` fire the organizer as a detached task
+after the flag write, and any folder create/move error is caught and logged so it
+can never turn a persisted ledger write into an error or a compensation. The
+journal is simply left un-filed, and the ready / handover sweep recovers it.
+`flush()` resolves once every queued placement has settled and is used by the
+test harness to await the detached organize deterministically.
+
+`defaultDocAccess` builds the organizer lazily on first use with `game.folders`,
+`game.folders.documentClass || globalThis.Folder`, an active-GM predicate, and
+`console` as the logger, and exposes `organizeLedgerJournal(doc, status)` and
+`listLedgerJournals()` (all `game.journal` entries whose `kind === LEDGER_KIND`,
+regardless of schema version, so legacy schema-v0 journals are enumerated).
+`store.organizeLedgerJournals({ isActiveGM })` is a bounded, never-throwing sweep
+that enumerates the ledger-wide journal list (or falls back to the schema-V1-only
+list), guards on the active GM before the read and before each organize, skips any
+non-ledger / invalid-status / already-filed journal, and counts `moved` /
+`failed` / `skipped`. It only ever moves existing ledger journals; it never
+deletes one and never touches the marker / shop / reputation / advanced-order
+journals that also live in the same collection.
+
+The runtime (`src/core/main.js`) drives this sweep only for the active GM: it
+runs one bounded startup sweep at `ready`, and it registers `userConnected` /
+`updateUser` hooks that track the previous active-GM id. When the active GM id
+CHANGES and becomes THIS client's user, it fires a guarded
+`store.organizeLedgerJournals({ isActiveGM })` (fire-and-forget, caught) so a GM
+handover re-files any journal the previous GM left behind. No sweep is issued
+when the active GM is unchanged or is not this client, the active-GM id is read at
+event time (deferred to a microtask so Foundry's computed state has settled), and
+in-flight sweeps are coalesced into a single follow-up so a handover storm never
+runs duplicate work. A GM who becomes inactive during a deferred `Folder.create`
+simply does not move the journal (the organizer re-checks the active-GM predicate
+after the awaited create).
+
 Records are normalized before persistence (`src/services/model.js`):
 
 - Location: `id, name, description, theme, createdAt`.

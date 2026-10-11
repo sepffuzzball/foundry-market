@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.8`).
+  `download` release pointers, with `version` `0.1.9`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -55,6 +55,32 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
   `ownership: { default: 0 }`. Exposes `listLocations/createLocation/updateLocation`,
   `listShops/createShop/updateShop/addInventoryEntry/findShop`, plus ledger
   helpers, all behind an injectable `docAccess` adapter.
+- Ledger folder organizer (`src/storage/ledger-folders.js`): a Foundry-free
+  module that files each ledger journal into a canonical GM-side folder hierarchy
+  - a single `Market Ledgers` root (`ledger-root`) with `Success`/`Failure`/
+  `Pending`/`Needs Recovery` children (`ledger-success`/`ledger-failure`/
+  `ledger-pending`/`ledger-needs-recovery`) mapped by the ledger status. Folders
+  are located by document type + exact `flags.market.ledgerRole` + exact parent
+  id (never by name), the root/child creation is serialized on a local promise
+  queue, and it is scoped strictly to the active GM (re-checked before every
+  read/create/move and after each awaited create). It is wired into the default
+  store's doc access and only ever moves the journal's `folder`; it never deletes
+  one and never touches the marker/shop/reputation/advanced-order journals.
+  `organize` is additionally serialized **per journal** (keyed on the journal id)
+  and re-reads the journal's live `flags.market.record.status` immediately before
+  the move, recomputing the target if the status changed while the folder
+  hierarchy was awaited - so a pending organize racing a concurrent committed
+  update can never leave a journal stranded in a stale Pending folder, and a
+  non-ledger / unknown-status journal is never moved. The store wiring is
+  **best-effort and never awaited**: `createLedger` / `updateLedger` fire the
+  placement as a detached task after the flag write, so a folder create/move that
+  never settles or throws can never delay or fail a persisted ledger write; an
+  un-filed journal is recovered by the startup / GM-handover sweep
+  (`store.organizeLedgerJournals`, GM-only, bounded, never-throwing). The runtime
+  (`src/core/main.js`) also registers `userConnected` / `updateUser` hooks that
+  detect a GM handover to THIS client and re-run the sweep (coalesced, so a
+  handover storm never duplicates work), and a GM who becomes inactive during a
+  deferred `Folder.create` simply does not move the journal.
 - Schema + normalization (`src/services/model.js`): records validated to safe
   integer minor units; stock modes validated; ids generated locally.
 - Pricing (`src/services/pricing.js`): pure, integer-only quoting, parsing,
@@ -141,7 +167,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.8/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.9/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -174,24 +200,38 @@ the **`0.1.6` patch prerelease**, which has been published and installed. The
 market map marker click via the linked `MarketShop` journal when the Note flags
 are absent (`handleActivateNote` now resolves the shop id from the Note's own
 flags and, when those are absent, from the linked JournalEntry). That marker-routing
-fix is **not yet re-confirmed on a live Foundry VTT 14 install**.
+fix is **not yet re-confirmed on a live Foundry VTT 14 install**. The **`0.1.8`
+patch prerelease** was **published** as well (tag `0.1.8`): after a live dnd5e
+purchase with `0.1.7` surfaced `balance-read-failed` because `Dnd5eAdapter`
+misread `CONFIG.DND5E.currencies[d].conversion` - which is **UNITS PER GP**
+(official release-6.0.5: cp 100, sp 10, ep 2, gp 1, pp 0.1) - as a GP-per-unit
+value, so the derived gold factor was inverted and the wallet normalization
+threw, `0.1.8` corrects the conversion interpretation (the per-denomination copper
+factor is now `conversion.cp / conversion[d]`) and sanitizes the purchase failure
+reporting (`publicPurchaseResult` collapses any raw adapter/store exception to a
+bounded code, and the player chat reads `Purchase failed (<code>).` - never a raw
+`[market] ...` detail). The dnd5e balance fix is **not yet re-confirmed on a live
+Foundry VTT 14 install** (user live retest is still pending - see
+`docs/smoke-test.md` section 22).
 
-However, a **live dnd5e purchase with `0.1.7` could still fail with
-`balance-read-failed`**, because `Dnd5eAdapter` misread
-`CONFIG.DND5E.currencies[d].conversion` - which is **UNITS PER GP** (official
-release-6.0.5: cp 100, sp 10, ep 2, gp 1, pp 0.1) - as a GP-per-unit value, so the
-derived gold factor was inverted and the wallet normalization threw. The
-**prospective `0.1.8` patch prerelease** corrects the conversion interpretation
-(the per-denomination copper factor is now `conversion.cp / conversion[d]`) and
-sanitizes the purchase failure reporting (`publicPurchaseResult` collapses any raw
-adapter/store exception to a bounded code, and the player chat reads
-`Purchase failed (<code>).` - never a raw `[market] ...` detail). It is **not yet
-re-confirmed on a live Foundry VTT 14 install** (user live retest is still
-pending - see `docs/smoke-test.md` section 22), and the `0.1.8` download URL is
-live only once that tag's `release` job completes and publishes the `0.1.8`
-GitHub release. Until then, install by pointing Foundry at the repo directory as a
-module source, or from the published `0.1.7` release (which carries the marker
-routing and storefront fixes but not the conversion fix).
+The **prospective `0.1.9` prerelease** adds the Ledger folder organizer
+(`src/storage/ledger-folders.js`): the active GM lazily creates a single `Market
+Ledgers` root under the Journal directory with `Success`/`Failure`/`Pending`/
+`Needs Recovery` children and files each GM-private ledger journal into the child
+matching its current status, moving an existing ledger journal on a status change
+and rerunning a bounded sweep over every ledger journal on the active GM's
+`ready`/GM-handover (recovering un-filed legacy/schema-v0 journals). Folders are
+located by document type + exact `flags.market.ledgerRole` + exact parent id,
+never by name; the organizer only ever moves a journal's `folder`, never deletes
+a ledger journal, never alters its record/status/idempotency and never touches
+the marker/shop/reputation/advanced-order journals (so it never hides unrelated
+journals); ledger data is preserved and stays GM-only. Placement is best-effort
+and never awaited, so a folder create/move failure cannot block or fail a
+persisted ledger write. The `0.1.9` download URL is live only once that tag's
+`release` job completes and publishes the `0.1.9` GitHub release. Until then,
+install by pointing Foundry at the repo directory as a module source, or from the
+published `0.1.8` release (which carries the conversion and marker-routing fixes
+but not the ledger folder organizer).
 
 ### Known issues / caveats
 
@@ -228,7 +268,7 @@ routing and storefront fixes but not the conversion fix).
 - A **live dnd5e purchase with `0.1.7` reportedly failed with `balance-read-failed`**:
   `Dnd5eAdapter` misread `CONFIG.DND5E.currencies[d].conversion` - which is
   **UNITS PER GP**, not GP per unit - so the derived copper/gold factor was
-  inverted and the wallet normalization threw. This is fixed in the **prospective
+  inverted and the wallet normalization threw. This is fixed in the **published
   `0.1.8` patch prerelease** (the copper factor is now `conversion.cp /
   conversion[d]`), but it is **not yet re-confirmed on a live Foundry VTT 14
   install** - run `docs/smoke-test.md` section 22, purchasing a 1 gp /
@@ -257,6 +297,13 @@ routing and storefront fixes but not the conversion fix).
   handover / concurrent multi-GM processing both clients can see "no record"
   before either persists one and both charge, potentially overselling stock or
   double-debiting a wallet.
+- The Ledger folder organizer (`src/storage/ledger-folders.js`) is Node-tested
+  only against a fake folder collection - the live `Folder.create`/move, the
+  active-GM sweep on `ready`/GM-handover and the player-side folder visibility are
+  **not yet verified on a live Foundry VTT 14 install** (see
+  `docs/smoke-test.md` section 23). It never deletes a ledger journal, never
+  touches the marker/shop/reputation/advanced-order journals (so it never hides
+  unrelated journals), and only ever moves the journal's `folder`.
 - `finite` and `non-restocking` stock modes both currently decrement; the
   restock-policy difference is a later milestone.
 

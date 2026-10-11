@@ -50,32 +50,38 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.8`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.9`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.8/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.9/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
 
-> **`0.1.7` was published as a patch prerelease** (it fixed the map-marker click
-> routing: `handleActivateNote` resolves the shop id from the linked
-> `MarketShop` journal when the Note flags are absent). **However, `0.1.7` could
-> still fail a live dnd5e purchase with `balance-read-failed`**, because
-> `Dnd5eAdapter` misread `CONFIG.DND5E.currencies[d].conversion` - which is
-> **UNITS PER GP** (e.g. `cp.conversion === 100`, `gp.conversion === 1`) - as a
-> GP-per-unit value, so the derived gold factor was inverted and the wallet
-> normalization threw. The **prospective `0.1.8` patch prerelease** corrects the
-> conversion interpretation (the per-denomination copper factor is now
-> `conversion.cp / conversion[d]`) and sanitizes the purchase failure reporting,
-> but it is **not yet re-confirmed on a live Foundry VTT 14 install** (user live
-> retest is still pending - see `docs/smoke-test.md` section 22). The `0.1.8`
-> `download` URL is live only once the `0.1.8` release has been published - the
-> release action must upload `module.zip` and `module.json` to the GitHub release
-> for tag `0.1.8`. Until then, install the module by pointing Foundry at this
+> **`0.1.8` was published as a patch prerelease** (it corrected the dnd5e
+> currency conversion interpretation and sanitized the purchase failure
+> reporting, after `0.1.7` failed a live dnd5e purchase with
+> `balance-read-failed` because `Dnd5eAdapter` misread
+> `CONFIG.DND5E.currencies[d].conversion` - which is **UNITS PER GP** (e.g.
+> `cp.conversion === 100`, `gp.conversion === 1`) - as a GP-per-unit value). The
+> dnd5e balance fix is **not yet re-confirmed on a live Foundry VTT 14 install**
+> (user live retest is still pending - see `docs/smoke-test.md` section 22).
+> **The prospective `0.1.9` prerelease** adds the Ledger folder organizer: it
+> files each GM-private purchase-ledger journal into an automatic `Market
+> Ledgers` folder hierarchy (`Success`/`Failure`/`Pending`/`Needs Recovery`
+> subfolders) by ledger status, and recovers un-filed legacy ledger journals on
+> the active GM's `ready`/GM-handover. It never deletes a ledger journal and
+> never touches the marker/shop/reputation/advanced-order journals, so the
+> folder hierarchy does not hide or reorganize unrelated journals; ledger data
+> is preserved and stays GM-only. Folder placement is best-effort and never
+> awaited, so a folder create/move failure can never block or fail a persisted
+> ledger write (see "Ledger folder organization" below). The `0.1.9` `download`
+> URL is live only once the `0.1.9` release has been published - the release
+> action must upload `module.zip` and `module.json` to the GitHub release for
+> tag `0.1.9`. Until then, install the module by pointing Foundry at this
 > repository directory as a module source (the manifest and `src/core/main.js`
-> are unchanged), or download the zip from the published `0.1.7` release once it
+> are unchanged), or download the zip from the published `0.1.8` release once it
 > is available. **Diagnosing a purchase failure:** the per-user purchase ledger
 > Journal (`Ledger:<user>:<requestId>`, created by the default store) is the
 > expected **GM-private** audit/idempotency record - one per request - not an
@@ -118,6 +124,39 @@ game.modules.get('market').api.openManager();
    **Buy**. The active GM executes the transaction and whispers the result; the
    actor's wallet is debited, the item is delivered, and the shop's stock
    decrements.
+
+### Ledger folder organization
+
+The default store keeps **one GM-only JournalEntry per purchase ledger record**
+(`Ledger:<user>:<requestId>`) in GM-only JournalEntry flags. To keep that
+private audit/idempotency journal manageable, the module automatically files
+each ledger journal into a single **`Market Ledgers`** root folder under the
+Journal directory, with one child per status:
+
+- `Market Ledgers > Success` - a `committed` ledger record.
+- `Market Ledgers > Failure` - a `failed` ledger record.
+- `Market Ledgers > Pending` - a `pending` ledger record.
+- `Market Ledgers > Needs Recovery` - a `needsRecovery` ledger record.
+
+The **active GM** (re-checked before every folder read/create/move) creates the
+root/child hierarchy lazily as ledger journals are written, moves each journal
+into the child matching its **current** persisted status, and reruns a bounded
+sweep over every ledger journal on the active GM's `ready` and on a GM handover
+to this client - so an un-filed ledger journal (including a legacy/schema-v0
+one) is recovered rather than lost. Folders are located by document type + exact
+`flags.market.ledgerRole` + exact parent id, never by name, so renaming a child
+or creating an unrelated folder named `Market Ledgers` does not break placement.
+
+The folder organizer is **scoped strictly to ledger journals**: it only ever
+moves a journal's `folder` field, never deletes a ledger journal, never changes
+its record/status/idempotency, and never touches the marker/shop/reputation/
+advanced-order journals - so the `Market Ledgers` hierarchy never hides or
+reorganizes unrelated journals. Ledger data is preserved and stays **GM-only**
+(`ownership: { default: 0 }`). The placement is **best-effort and never
+awaited**: `createLedger`/`updateLedger` fire it as a detached task after the
+flag write, so a folder create/move that never settles or throws can never delay
+or fail a persisted ledger write; an un-filed journal is recovered by the
+startup/handover sweep instead.
 
 ### Setup examples
 
@@ -180,8 +219,9 @@ generic path - never an invented one.
   shapes, the v14 `FilePicker` constructor, the
   `foundry.audio.AudioHelper.play` call, the `updateWorldTime` automation sweep,
   the RollTable `drawMany` call, the M5 advanced-order request/response flow, the
-  live DC20/Twodsix/Daggerheart adapter field access and the backup import
-  store writes should be re-checked against a real v14 install. Run
+  live DC20/Twodsix/Daggerheart adapter field access, the backup import
+  store writes and the ledger folder organizer's live `Folder.create`/move
+  should be re-checked against a real v14 install. Run
   `docs/smoke-test.md` before trusting a live economy. The M2 CSS themes and
   interactions are Node-tested only, and the themes ship no bundled audio.
   **No live M5/M6 verification has been done yet** - the M5 services/UI and the
@@ -303,6 +343,18 @@ generic path - never an invented one.
   locations and shops, add inventory entries, look up a shop, and access the
   purchase ledger. All persisted in GM-only JournalEntry flag data. Records are
   normalized and validated to safe integer minor units.
+- **Ledger folder organizer** (`src/storage/ledger-folders.js`): the active GM
+  lazily creates a single `Market Ledgers` root under the Journal directory with
+  `Success`/`Failure`/`Pending`/`Needs Recovery` children and files each
+  GM-private ledger journal into the child matching its current status, moving
+  an existing ledger journal on a status change and rerunning a bounded sweep
+  over every ledger journal on the active GM's `ready`/GM-handover (recovering
+  un-filed legacy journals). Folders are located by role + parent id, never by
+  name; the organizer only ever moves a journal's `folder`, never deletes a
+  ledger journal, never alters its record/status/idempotency and never touches
+  the marker/shop/reputation/advanced-order journals (so it never hides
+  unrelated journals). It is best-effort and never awaited, so a folder
+  create/move failure cannot block or fail a persisted ledger write.
 - **Commerce** (`api.commerce`): `purchase({shopId, entryId, actorId, quantity,
   requestId}, authenticatedUserId)` - GM-only. Re-reads fresh data, validates
   open/visible/stock/funds, records a `pending` ledger entry before charging,

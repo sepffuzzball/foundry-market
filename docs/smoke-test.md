@@ -11,7 +11,7 @@ with a fresh world where you can discard the data. You need at least two browser
 clients (one on an **active GM** user, one on a **player** user). The player
 client is the one that exercises the storefront.
 
-This checklist targets the current **0.1.8** prerelease. **No live Foundry VTT
+This checklist targets the current **0.1.9** prerelease. **No live Foundry VTT
 14 verification has been run yet** for M1-M6 - the automated `npm test` suite
 only mocks the Foundry boundaries, so every section below is the intended manual
 real-runtime check and nothing here has yet been confirmed on a live install.
@@ -1043,13 +1043,16 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 
 ## 22. M6 - Dynamic dnd5e currency conversion and system adapters (live runtime)
 
-> **Status: real live failure diagnosed; code fix offline-tested; `0.1.8`
-> retest pending.** A live purchase with `0.1.7` surfaced as `balance-read-failed`
+> **Status: real live failure diagnosed; code fix offline-tested; live retest
+> pending.** A live purchase with `0.1.7` surfaced as `balance-read-failed`
 > because the adapter misread `CONFIG.DND5E.currencies[d].conversion` (which is
 > UNITS PER GP) as GP per unit. The conversion math and purchase failure reporting
-> have been corrected in this **`0.1.8` prerelease** and are verified by the
-> automated `npm test` suite in Node; this section is the intended real-runtime
-> check on a live v14 install. **Note:** the per-user purchase ledger Journal
+> were corrected in the **published `0.1.8` prerelease** (carried forward into
+> this `0.1.9` prerelease) and are verified by the automated `npm test` suite in
+> Node; this section is the intended real-runtime check on a live v14 install.
+> The dnd5e balance fix is **not yet re-confirmed on a live Foundry VTT 14
+> install** - a live retest is still pending, so do not claim it live-confirmed.
+> **Note:** the per-user purchase ledger Journal
 > (`Ledger:<user>:<requestId>`, created by the default store) is the expected
 > **GM-private** audit/idempotency record - one per request - not an extra sale or
 > a bug. Diagnose a purchase failure via that journal's `error`/`detail` fields
@@ -1120,14 +1123,99 @@ real-runtime check and nothing here has yet been confirmed on a live install.
   storefront can transact. Daggerheart has no native item price, so no price path
   is invented - only the GM-configured generic path is used.
 
-## 23. M6 - Accessibility (keyboard, screen reader, contrast, reduced motion)
+## 23. Ledger folder organizer (GM-only folder hierarchy)
+
+> **Status: Node-tested only; live folder verification pending.** The ledger
+> folder organizer (`src/storage/ledger-folders.js`) is new in the **`0.1.9`
+> prerelease** and is exercised by the automated suite in Node against a fake
+> folder collection. This section is the intended real-runtime check on a live
+> v14 install; the live `Folder.create`/move, the active-GM `ready`/GM-handover
+> sweep and the player-side folder visibility are **not yet verified**. The
+> organizer is best-effort: a folder create/move failure never fails the ledger
+> write, so the ledger journal may be left un-filed until the one-time startup
+> sweep recovers it. The organizer only ever moves the journal's `folder` - it
+> never deletes a ledger journal and never touches the marker/shop/reputation/
+> advanced-order journals, so the `Market Ledgers` hierarchy never hides
+> unrelated journals.
+
+### 23.1 GM creates a purchase and confirms the ledger journal is filed
+
+1. As the **active GM**, make a purchase as in section 7 (or trigger any ledger
+   write via `store.createLedger` / `store.updateLedger` from the console).
+2. In the Journal sidebar, confirm a `Market Ledgers` root folder exists under the
+   Journal directory, with a single child per status. A `pending` purchase must
+   land in `Market Ledgers > Pending`.
+3. Open the manager and confirm the `Market Ledgers` folders are not shown to the
+   player Journal sidebar (the journal creation is GM-only; the folder filter
+   should keep them out of the player directory).
+
+**Expected**
+
+- The `Market Ledgers` root and its status child are created under the Journal
+  directory by the active GM.
+- A newly-created `pending` ledger journal is filed into `Market Ledgers >
+  Pending`; a recovered/committed one moves to `Success`, a failed one to
+  `Failure`, and a `needsRecovery` one to `Needs Recovery`.
+- The ledger journal itself remains GM-only (`ownership.default = 0`) and the
+  folder placement never changes the record's status or idempotency.
+
+### 23.2 GM transition updates the folder
+
+1. Resolve a purchase to `committed` (section 7) or force a `failed` /
+   `needsRecovery` transition, then re-open the Journal directory.
+
+**Expected**
+
+- The ledger journal moves from `Pending` into the child matching its new status
+  (`Success` / `Failure` / `Needs Recovery`). The move is best-effort but must
+  never revert the persisted status.
+
+### 23.3 Folder identity is role + parent, never name
+
+1. As the **GM**, rename the `Success` child to something else (e.g. `Won`), or
+   create an unrelated folder named `Market Ledgers` elsewhere in the Journal
+   directory.
+2. Make another purchase that reaches `committed`.
+
+**Expected**
+
+- The ledger journal is still filed into the child that carries
+  `flags.market.ledgerRole === 'ledger-success'` under the real `Market Ledgers`
+  root - never a same-named folder. Renaming the child does not break placement
+  and a same-named unrelated folder is never reused.
+
+### 23.4 Startup sweep recovers un-filed journals
+
+1. With the module loaded, create a legacy/un-filed ledger journal (a journal with
+   `flags.market.kind === 'ledger'` and no `folder`, or a schema-v0 ledger
+   journal), then reload the world as the active GM.
+
+**Expected**
+
+- The one-time startup sweep (`store.organizeLedgerJournals`) enumerates every
+  ledger journal regardless of schema version and files it into the matching
+  status child. A non-ledger journal (shop / marker / reputation / advanced
+  order) is never modified and no journal is ever deleted.
+
+### 23.5 Active-GM handover
+
+1. While the active GM is running the sweep or mid-purchase, hand the active-GM
+   role to another GM client.
+
+**Expected**
+
+- The folder sweep stops cleanly (`status: 'idle'`) and no folder is created or
+  moved by a non-active GM. A handover mid-purchase never fails the ledger write;
+  the journal is simply left un-filed until the next sweep.
+
+## 24. M6 - Accessibility (keyboard, screen reader, contrast, reduced motion)
 
 > **Status: CSS + Node-tested only.** The CSS is present in
 > `styles/market.css` and the Node suite covers the data/UI logic, but there is
 > no automated axe/screen-reader run. This section is the intended manual
 > check on a live install and with a screen reader.
 
-### 23.1 Keyboard focus
+### 24.1 Keyboard focus
 
 1. As the **GM**, open the Market Manager; as the **player**, open the storefront.
 2. Tab through every interactive element on both surfaces (buttons, inputs,
@@ -1143,7 +1231,7 @@ real-runtime check and nothing here has yet been confirmed on a live install.
   `:checked` state (gold fill + visible glyph/check with white-on-gold contrast)
   and an explicit `:focus-visible` outline on the styled art.
 
-### 23.2 Screen reader
+### 24.2 Screen reader
 
 1. With a screen reader active, navigate the storefront and the manager.
 
@@ -1154,7 +1242,7 @@ real-runtime check and nothing here has yet been confirmed on a live install.
   inputs are still exposed to assistive tech (they are only visually hidden, never
   removed from the accessibility tree).
 
-### 23.3 Contrast
+### 24.3 Contrast
 
 1. Inspect the manager (light paper) and storefront (dark iron) surfaces against
    the `--mk-*` token palette.
@@ -1165,7 +1253,7 @@ real-runtime check and nothing here has yet been confirmed on a live install.
   legibility on the warm-paper and dark-iron backgrounds). Record any contrast
   failures here rather than assuming the themed palette is accessible.
 
-### 23.4 Reduced motion
+### 24.4 Reduced motion
 
 1. With the OS "reduce motion/transparency" preference enabled, or by toggling the
    `.motion-off` class on the app/preview, resize/open the storefront and trigger
@@ -1178,12 +1266,12 @@ real-runtime check and nothing here has yet been confirmed on a live install.
   `.preview-panel.motion-off` overrides both disable them, and the reward/glow
   animation does not run.
 
-## 24. M6 - Performance benchmark (offline, optional)
+## 25. M6 - Performance benchmark (offline, optional)
 
 > **Status: Optional, manual, machine-dependent.** This section is NOT a live
 > Foundry VTT 14 profile and is not a CI gate. It is a human-facing timing report.
 
-### 24.1 Run the benchmark
+### 25.1 Run the benchmark
 
 1. From the repository root, run `npm run benchmark` (or
    `node scripts/benchmark.mjs [entryCount]`; default entry count is 1000).
@@ -1195,7 +1283,7 @@ real-runtime check and nothing here has yet been confirmed on a live install.
   run machine only - treat them as indicative, not as a pass/fail gate. A live
   Foundry VTT 14 profile is not yet captured.
 
-### 24.2 Guard
+### 25.2 Guard
 
 1. Run `npm test` and confirm `tests/performance.test.js` passes on a loaded
    machine.
@@ -1207,9 +1295,9 @@ real-runtime check and nothing here has yet been confirmed on a live install.
   only wall-clock assertion is a very generous 10 s catastrophic-regression-only
   guard, so normal CI slowness does not flip it.
 
-## 25. Summary / verdict
+## 26. Summary / verdict
 
-Record a pass/fail + notes row for each section. Take **all** sections (1-24) as
+Record a pass/fail + notes row for each section. Take **all** sections (1-25) as
 the minimum signal for M1/M2/M3/M4/M5/M6 - do not claim completion on the strength
 of `npm test` alone (that only mocks the Foundry boundaries). If you are about to
 run a real economy, treat sections 1, 4 (UI/hook shapes), 12 (last-item
@@ -1218,6 +1306,7 @@ contention), 15.3/15.4 (M2 action dispatch), 16.4 (M3 personalized quote), 17.5
 19.3 (M5 GM advanced-order adjudication), 20.2/20.3 (M5 order adjudication and
 buyback funds/balance), 20.5 (M5 recovery), 21.3/21.4/21.5 (M6 backup import,
 privacy and partial-after-write), 22.1-22.3 (M6 dynamic conversion and system
-adapter runtime), 23.1-23.4 (M6 keyboard/screen-reader accessibility) and
+adapter runtime), 23.1-23.5 (ledger folder organizer), 24.1-24.4 (M6 keyboard/
+screen-reader accessibility) and
 the multi-GM concurrency note as mandatory, and confirm the two blockers in the
 intro are addressed before you trust a live economy to the module.

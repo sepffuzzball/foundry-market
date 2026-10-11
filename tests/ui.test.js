@@ -3907,6 +3907,114 @@ test('runtime automation updateWorldTime sweep only runs for the active GM', asy
   }
 });
 
+// ---- M1: runtime ledger folder handover sweep --------------------------------
+
+test('runtime ledger folder handover sweeps only when the active GM becomes this client, and coalesces', async () => {
+  // Wire enough of the Foundry boundary that main.js can run: module registration
+  // for the api attachment, the settings registry, an empty journal for the
+  // default store reads, and a world-time clock.
+  const modules = {};
+  globalThis.game.modules = { get: (id) => (modules[id] || (modules[id] = {})) };
+  globalThis.game.settings = { register: () => {}, registerMenu: () => {} };
+  globalThis.game.journal = { filter: () => [], get: () => null };
+  globalThis.game.time = { worldTime: 1000 };
+
+  // Run ready as the active GM so the runtime wires the startup sweep and the
+  // handover hooks.
+  const prevUser = globalThis.game.user;
+  const prevUsers = globalThis.game.users;
+  globalThis.game.user = { id: 'gm1', isGM: true };
+  globalThis.game.users = Object.assign({}, prevUsers, {
+    activeGM: { id: 'gm1' },
+    filter: () => [],
+  });
+
+  let store = null;
+  let origSweep = null;
+
+  try {
+    await import('../src/core/main.js');
+    fireHook('init');
+
+    // Patch the sweep BEFORE firing ready, so the startup sweep is counted too.
+    ({ store } = await import('../src/storage/store.js'));
+    origSweep = store.organizeLedgerJournals;
+    let sweepCalls = 0;
+    store.organizeLedgerJournals = async () => {
+      sweepCalls += 1;
+      return { status: 'ok', moved: 0, failed: 0, skipped: 0 };
+    };
+
+    fireHook('ready');
+    // Let the startup sweep settle: it should have run once.
+    await new Promise((r) => setTimeout(r, 5));
+    assert.ok(sweepCalls >= 1, 'startup sweep ran once');
+
+    // A handover to another GM must NOT trigger a sweep on this client.
+    sweepCalls = 0;
+    globalThis.game.users.activeGM = { id: 'gm2' };
+    fireHook('updateUser');
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(sweepCalls, 0, 'no sweep when the active GM is no longer this client');
+
+    // The active GM changes back to THIS client -> exactly one sweep.
+    globalThis.game.users.activeGM = { id: 'gm1' };
+    fireHook('updateUser');
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(sweepCalls, 1, 'exactly one sweep on handover back to this client');
+
+    // Coalescing: hold a sweep in-flight, then fire a burst of triggers. The
+    // in-flight sweep must be the only one running, and the burst must collapse
+    // into exactly ONE follow-up (never one per trigger).
+    const tick = () => new Promise((r) => setTimeout(r, 1));
+    sweepCalls = 0;
+    let releaseSweep;
+    const gate = new Promise((res) => { releaseSweep = res; });
+    store.organizeLedgerJournals = async () => {
+      sweepCalls += 1;
+      await gate;
+      return { status: 'ok', moved: 0, failed: 0, skipped: 0 };
+    };
+
+    // Move away, then back to this client: this records the handover-away FIRST
+    // (letting the deferred active-GM read settle) and then schedules the gated
+    // in-flight sweep.
+    globalThis.game.users.activeGM = { id: 'gm2' };
+    fireHook('userConnected');
+    await tick();
+    globalThis.game.users.activeGM = { id: 'gm1' };
+    fireHook('updateUser');
+    await tick();
+    assert.equal(sweepCalls, 1, 'gated sweep is in-flight');
+
+    // Burst of handover triggers while the sweep is still in-flight: each toggle
+    // back to this client would schedule a sweep, but they must coalesce into a
+    // single follow-up.
+    globalThis.game.users.activeGM = { id: 'gm2' };
+    fireHook('userConnected');
+    await tick();
+    globalThis.game.users.activeGM = { id: 'gm1' };
+    fireHook('updateUser');
+    await tick();
+    globalThis.game.users.activeGM = { id: 'gm2' };
+    fireHook('userConnected');
+    await tick();
+    globalThis.game.users.activeGM = { id: 'gm1' };
+    fireHook('updateUser');
+
+    // Release the gate; the queued follow-up must be exactly ONE.
+    releaseSweep();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(sweepCalls, 2, 'the burst coalesced into exactly one follow-up, not four');
+
+    store.organizeLedgerJournals = origSweep;
+  } finally {
+    if (store && origSweep) store.organizeLedgerJournals = origSweep;
+    globalThis.game.user = prevUser;
+    globalThis.game.users = prevUsers;
+  }
+});
+
 // ---- M4: runtime GM RollTable inventory generation --------------------------
 
 test('runtime api.generateInventory draws a world Item and a compendium pack Item and skips a non-Item result', async () => {
