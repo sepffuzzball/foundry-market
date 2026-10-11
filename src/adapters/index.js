@@ -403,15 +403,16 @@ export function copperToDenominations(copper) {
 // --- dynamic dnd5e currency config ------------------------------------------
 //
 // dnd5e 6.x exposes `CONFIG.DND5E.currencies`: an object keyed by denomination
-// whose `conversion` field is the GP value per unit (e.g. cp.conversion ===
-// 0.01, gp.conversion === 1). The marketplace keeps integer copper as its
-// minor-unit ledger, but it may be configured to read/denominate in other
-// denominations. We accept a currency config whose `conversion` is a GP value
-// per unit (e.g. cp.conversion === 0.02 means one copper piece is worth 0.02
-// gold) and use it directly - no reciprocal is applied. All factor math uses
-// exact decimal-string BigInt rationals -- never binary float rounding -- so a
-// config whose ratios do not resolve to whole copper pieces fails closed before
-// any wallet write.
+// whose `conversion` field is UNITS PER GP - how many units of that denomination
+// make up ONE gold piece (official release-6.0.5: cp.conversion === 100,
+// sp.conversion === 10, ep.conversion === 2, gp.conversion === 1,
+// pp.conversion === 0.1). The marketplace keeps integer copper as its minor-unit
+// ledger, so the per-denomination copper factor is `conversion.cp /
+// conversion[d]` (the reciprocal direction from the prior GP-per-unit reading,
+// which misread the live config as a list of reciprocals and broke the balance
+// read on the official table). All factor math uses exact decimal-string BigInt
+// rationals -- never binary float rounding -- so a config whose ratios do not
+// resolve to whole copper pieces fails closed before any wallet write.
 
 function bigintGcd(a, b) {
   a = a < 0n ? -a : a;
@@ -473,8 +474,10 @@ function decimalToRational(value) {
 }
 
 // Render an exact terminating decimal string from a BigInt fraction. The
-// denominators here only ever carry factors of 2 and 5 (all configured
-// conversions are finite decimals), so the expansion always terminates.
+// fraction must reduce to a denominator of the form 2^a * 5^b (the only
+// denominators that terminate in base 10); anything else is rejected rather than
+// truncated, so a non-terminating GP value (e.g. 1/3 gp) fails closed instead of
+// silently dropping digits.
 function rationalToDecimalString(num, den) {
   if (den === 0n) {
     throw new Error('[market] currency conversion produced a zero denominator');
@@ -489,13 +492,20 @@ function rationalToDecimalString(num, den) {
   if (rem === 0n) {
     return (negative ? '-' : '') + intPart.toString();
   }
+  // A terminating decimal requires the reduced denominator to be 2^a * 5^b.
+  // Strip every factor of 2 and 5; if a factor other than 2 or 5 remains the
+  // fraction would repeat forever and must be rejected.
+  let d = den;
+  while (d % 2n === 0n) d /= 2n;
+  while (d % 5n === 0n) d /= 5n;
+  if (d !== 1n) {
+    throw new Error('[market] currency conversion produced a non-terminating decimal');
+  }
   let frac = '';
-  let guard = 0;
-  while (rem !== 0n && guard < 1000) {
+  while (rem !== 0n) {
     rem *= 10n;
     frac += (rem / den).toString();
     rem %= den;
-    guard += 1;
   }
   frac = frac.replace(/0+$/, '');
   if (frac === '') {
@@ -525,9 +535,11 @@ function readCurrencyConversion(item, denom) {
 
 // Normalize a currency config into per-denomination copper factors. `factors[d]`
 // is how many copper pieces equal one unit of denomination d
-// (`conversion[d] / conversion.cp`, exact BigInt rational). Throws on a
-// malformed conversion, an inexact (fractional-copper) ratio, a factor that is
-// not a positive safe integer, or a gp factor below 1.
+// (`conversion.cp / conversion[d]`, exact BigInt rational) - a config whose
+// `conversion` values are UNITS PER GP so one gold piece equals `conversion.cp`
+// copper and `conversion[d]` units of d. Throws on a malformed conversion, an
+// inexact (fractional-copper) ratio, a factor that is not a positive safe
+// integer, or a gp factor below 1.
 function normalizeCurrencyConfig(config) {
   if (config == null || typeof config !== 'object') {
     throw new Error('[market] currency config must be an object');
@@ -541,15 +553,15 @@ function normalizeCurrencyConfig(config) {
   for (const [denom, item] of Object.entries(config)) {
     const conv = readCurrencyConversion(item, denom);
     const dRational = decimalToRational(conv);
-    // factor[d] = conversion[d] / conversion.cp  (exact BigInt rational)
-    const num = dRational.num * cpRational.den;
-    const den = dRational.den * cpRational.num;
+    // factor[d] = conversion.cp / conversion[d]  (exact BigInt rational)
+    const num = cpRational.num * dRational.den;
+    const den = cpRational.den * dRational.num;
     const g = bigintGcd(num, den);
     const reducedNum = num / g;
     const reducedDen = den / g;
     if (reducedDen !== 1n) {
       throw new Error(
-        `[market] currency '${denom}' factor (${conv} / ${cpConv}) is not a whole number of copper`
+        `[market] currency '${denom}' factor (${cpConv} / ${conv}) is not a whole number of copper`
       );
     }
     if (reducedNum <= 0n || reducedNum > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -571,31 +583,37 @@ export function dndCurrencyFactors(config) {
 }
 
 // Format `copper` (integer copper pieces) as an exact decimal GP string. GP is
-// `copper * (GP value of one cp)`; no floating point is involved.
+// `copper / (cp units per gp)` because `conversion.cp` is how many copper pieces
+// equal one gold piece; no floating point is involved. A ratio that cannot be
+// rendered exactly as a terminating decimal (never a clean 2^a*5^b denominator)
+// fails closed rather than truncating.
 export function formatCopperAsGP(copper, config) {
   const n = toNonNegativeInteger(copper, 'copper');
   const { cpConv } = normalizeCurrencyConfig(config);
   const cpRational = decimalToRational(cpConv);
-  const valueNum = BigInt(n) * cpRational.num;
-  const valueDen = cpRational.den;
+  const valueNum = BigInt(n) * cpRational.den;
+  const valueDen = cpRational.num;
   return rationalToDecimalString(valueNum, valueDen);
 }
 
-// Canonical dnd5e GP-per-unit defaults (1 gp = 100 cp, 1 ep = 0.5 gp, ...).
+// Canonical dnd5e UNITS-PER-GP defaults (1 gp = 100 cp, 1 gp = 10 sp, 1 gp = 2
+// ep, 10 gp = 1 pp) matching the official release-6.0.5 table.
 function defaultCurrencyConfig() {
   return {
-    pp: { conversion: 10 },
+    pp: { conversion: 0.1 },
     gp: { conversion: 1 },
-    ep: { conversion: 0.5 },
-    sp: { conversion: 0.1 },
-    cp: { conversion: 0.01 },
+    ep: { conversion: 2 },
+    sp: { conversion: 10 },
+    cp: { conversion: 100 },
   };
 }
 
 // Read the live dnd5e system config. `CONFIG.DND5E.currencies` carries each
-// denomination's GP value per unit (cp.conversion === 0.01, gp.conversion ===
-// 1), so the value is passed through with no reciprocal. Falls back to the
-// canonical defaults when no CONFIG is present (e.g. Node tests).
+// denomination's UNITS PER GP (cp.conversion === 100, gp.conversion === 1,
+// pp.conversion === 0.1), so the value is passed through with no reciprocal -
+// the opposite direction is handled by the factor math in normalizeCurrencyConfig.
+// Falls back to the canonical defaults when no CONFIG is present (e.g. Node
+// tests).
 function foundryCurrencyConfig() {
   const currencies = globalThis.CONFIG?.DND5E?.currencies;
   if (!currencies || typeof currencies !== 'object') return defaultCurrencyConfig();

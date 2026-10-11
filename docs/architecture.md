@@ -392,38 +392,40 @@ system's wallet/item representation:
 
 `Dnd5eAdapter` no longer hardcodes the classic copper factors. It accepts an
 optional `opts.currencyConfig`, which is either a getter function or a plain
-object. Each configured denomination must be `{ conversion: <GP value per
-unit> }` (a positive finite decimal, e.g. cp.conversion === 0.01). When
-`opts.currencyConfig` is omitted the adapter reads the live
-`CONFIG?.DND5E?.currencies` if present; `CONFIG.DND5E.currencies[d].conversion`
-is already the GP value per unit (cp.conversion === 0.01, gp.conversion === 1),
-so it is passed through with no reciprocal. If neither an explicit config nor a
-usable `CONFIG` is available (for example under Node tests) it falls back to a
-canonical default that reproduces the legacy factors exactly:
-`{ pp: 10, gp: 1, ep: 0.5, sp: 0.1, cp: 0.01 }` GP-per-unit.
+object. Each configured denomination must be `{ conversion: <units per gold
+piece> }` (a positive finite decimal; official release-6.0.5 uses cp.conversion
+=== 100, sp.conversion === 10, ep.conversion === 2, gp.conversion === 1,
+pp.conversion === 0.1). When `opts.currencyConfig` is omitted the adapter reads
+the live `CONFIG?.DND5E?.currencies` if present;
+`CONFIG.DND5E.currencies[d].conversion` is already UNITS PER GP, so it is passed
+through with no reciprocal. If neither an explicit config nor a usable `CONFIG`
+is available (for example under Node tests) it falls back to a canonical default
+that reproduces the legacy factors exactly:
+`{ pp: 0.1, gp: 1, ep: 2, sp: 10, cp: 100 }` UNITS-per-gp.
 
 The config is normalized once per wallet operation into per-denomination copper
-factors, computed as an exact BigInt rational `conversion[d] / conversion.cp`.
-A single snapshot is used for the duration of one `getBalance` / `debit` /
-`credit` / `getItemPrice` call, so a config getter that changes mid-operation
-cannot produce a torn read. Normalization fails closed (before any wallet
-update) on: a missing `cp`/`gp`, a non-finite or non-positive conversion, a
-factor that is not a positive safe integer, a `gp` factor below 1, or a ratio
-that is not a whole number of copper (fractional-copper factors are rejected).
-Every configured denomination is read and written using its factor - no fixed
-`cp`/`sp`/`ep`/`gp`/`pp` constants remain in the adapter - so a custom conversion
-table (for example `{ cp: 0.02, gp: 1 }`) is supported. Unknown denominations
-carrying a nonzero balance are rejected (fail closed); unknown zero balances are
-ignored. `getBalance` reads the configured denominations, `debit`/`credit` write
-back a greedy largest-factor-first breakdown across only the configured
-denominations, and `getItemPrice` converts `item.system.price.value` using the
-factor for `item.system.price.denomination`, multiplying an exact BigInt
-decimal-rational value by the factor and rejecting any fractional copper
-exactly (with no float tolerance), as well as safe-integer overflow. All
-decimal parsing is BigInt-rational based: `decimalToRational` accepts plain and
-scientific-notation decimal strings (`1e-7`, `1.23e+4`) exactly, with a bounded
-exponent and a capped decimal scale so an unsafe scale (e.g. `1e200`) fails
-closed instead of building an unbounded power of ten.
+factors, computed as an exact BigInt rational `conversion.cp / conversion[d]` -
+the number of copper pieces equal to one unit of denomination d. A single
+snapshot is used for the duration of one `getBalance` / `debit` / `credit` /
+`getItemPrice` call, so a config getter that changes mid-operation cannot
+produce a torn read. Normalization fails closed (before any wallet update) on: a
+missing `cp`/`gp`, a non-finite or non-positive conversion, a factor that is not
+a positive safe integer, a `gp` factor below 1, or a ratio that is not a whole
+number of copper (fractional-copper factors are rejected). Every configured
+denomination is read and written using its factor - no fixed `cp`/`sp`/`ep`/`gp`/
+`pp` constants remain in the adapter - so a custom conversion table (for example
+`{ cp: 50, gp: 1 }`) is supported. Unknown denominations carrying a nonzero
+balance are rejected (fail closed); unknown zero balances are ignored.
+`getBalance` reads the configured denominations, `debit`/`credit` write back a
+greedy largest-factor-first breakdown across only the configured denominations,
+and `getItemPrice` converts `item.system.price.value` using the factor for
+`item.system.price.denomination`, multiplying an exact BigInt decimal-rational
+value by the factor and rejecting any fractional copper exactly (with no float
+tolerance), as well as safe-integer overflow. All decimal parsing is BigInt-
+rational based: `decimalToRational` accepts plain and scientific-notation decimal
+strings (`1e-7`, `1.23e+4`) exactly, with a bounded exponent and a capped decimal
+scale so an unsafe scale (e.g. `1e200`) fails closed instead of building an
+unbounded power of ten.
 
 Two module-level helpers are exported for callers that need the same math:
 
@@ -431,7 +433,9 @@ Two module-level helpers are exported for callers that need the same math:
   (for the canonical default this is `{ cp: 1, sp: 10, ep: 50, gp: 100, pp: 1000 }`).
 - `formatCopperAsGP(copper, config)` - formats an integer copper amount as an
   exact decimal GP string (`125` with the canonical config -> `"1.25"`; with
-  `{ cp: { conversion: 0.02 }, gp: { conversion: 1 } }` -> `"2.5"`).
+  `{ cp: { conversion: 50 }, gp: { conversion: 1 } }` -> `"2.5"`). A ratio that
+  cannot be rendered as a terminating decimal (never a clean 2^a * 5^b
+  denominator) fails closed rather than truncating.
   All arithmetic is BigInt-based, so no floating-point error is introduced.
 
 The legacy `DENOMINATIONS` and `DENOMINATION_FACTOR` exports are unchanged and

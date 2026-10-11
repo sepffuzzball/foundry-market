@@ -61,6 +61,7 @@ import {
   publicAdvancedOrder,
   requestMessageData,
   handleMarketChatMessage,
+  buildResponseContent,
   PUBLIC_ENTRY_FIELDS,
   PUBLIC_SHOP_FIELDS,
 } from '../src/core/requests.js';
@@ -2146,16 +2147,22 @@ test('dnd5e credit detects an overflowed balance', async () => {
 });
 
 // ------------------------------------------------------ M6 dynamic currency config
+//
+// Official dnd5e `CONFIG.DND5E.currencies[d].conversion` is UNITS PER GP - how
+// many units of denomination d are worth ONE gold piece - not GP per unit. Every
+// config below uses that meaning, so the copper factor for a denomination is
+// `conversion.cp / conversion[d]` (e.g. the official cp=100, gp=1 gives
+// factor[gp] = 100 copper per gold).
 
-// The canonical gp-per-unit config (1 cp = 0.01 gp ... 1 pp = 10 gp) must
-// reproduce the legacy copper factors exactly and format GP exactly.
+// The canonical units-per-gp config (1 gp = 100 cp, 10 sp, 2 ep; 10 gp = 1 pp)
+// must reproduce the legacy copper factors exactly and format GP exactly.
 test('M6: canonical currency config reproduces legacy copper factors', () => {
   const config = {
-    cp: { conversion: 0.01 },
-    sp: { conversion: 0.1 },
-    ep: { conversion: 0.5 },
+    cp: { conversion: 100 },
+    sp: { conversion: 10 },
+    ep: { conversion: 2 },
     gp: { conversion: 1 },
-    pp: { conversion: 10 },
+    pp: { conversion: 0.1 },
   };
   assert.deepEqual(dndCurrencyFactors(config), { cp: 1, sp: 10, ep: 50, gp: 100, pp: 1000 });
   assert.equal(formatCopperAsGP(125, config), '1.25');
@@ -2163,19 +2170,19 @@ test('M6: canonical currency config reproduces legacy copper factors', () => {
 });
 
 test('M6: scientific-notation conversion strings parse exactly', () => {
-  // cp 1e-2 == 0.01 gp-per-unit, gp 1: factor[gp] is exactly 100.
+  // cp 1e2 == 100 cp per gp, gp 1: factor[gp] is exactly 100.
   assert.deepEqual(
-    dndCurrencyFactors({ cp: { conversion: '1e-2' }, gp: { conversion: 1 } }),
+    dndCurrencyFactors({ cp: { conversion: '1e2' }, gp: { conversion: 1 } }),
     { cp: 1, gp: 100 }
   );
-  // 1.23e+4 gp vs 1e+2 cp: factor[gp] = 12300 / 100 = 123.
+  // pp 1e-1 == 0.1 pp per gp (10 gp = 1 pp): factor[pp] is exactly 1000.
   assert.deepEqual(
-    dndCurrencyFactors({ cp: { conversion: '1e+2' }, gp: { conversion: '1.23e+4' } }),
-    { cp: 1, gp: 123 }
+    dndCurrencyFactors({ cp: { conversion: 100 }, gp: { conversion: 1 }, pp: { conversion: '1e-1' } }),
+    { cp: 1, gp: 100, pp: 1000 }
   );
-  // The exact rational is used for GP formatting too: 125 cp * 0.01 gp = 1.25 gp.
+  // The exact rational is used for GP formatting too: 125 cp / 100 cp-per-gp = 1.25 gp.
   assert.equal(
-    formatCopperAsGP(125, { cp: { conversion: '1e-2' }, gp: { conversion: 1 } }),
+    formatCopperAsGP(125, { cp: { conversion: '1e2' }, gp: { conversion: 1 } }),
     '1.25'
   );
 });
@@ -2199,11 +2206,11 @@ test('M6: Dnd5eAdapter honors CONFIG.DND5E.currencies when present', async () =>
   globalThis.CONFIG = {
     DND5E: {
       currencies: {
-        pp: { conversion: 10 },
+        pp: { conversion: 0.1 },
         gp: { conversion: 1 },
-        ep: { conversion: 0.5 },
-        sp: { conversion: 0.1 },
-        cp: { conversion: 0.01 },
+        ep: { conversion: 2 },
+        sp: { conversion: 10 },
+        cp: { conversion: 100 },
       },
     },
   };
@@ -2212,7 +2219,7 @@ test('M6: Dnd5eAdapter honors CONFIG.DND5E.currencies when present', async () =>
     const actor = createMockActor({ currency: { gp: 5 } });
     assert.equal(await adapter.getBalance(actor), 500);
     assert.deepEqual(dndCurrencyFactors({
-      cp: { conversion: 0.01 },
+      cp: { conversion: 100 },
       gp: { conversion: 1 },
     }), { cp: 1, gp: 100 });
   } finally {
@@ -2222,8 +2229,10 @@ test('M6: Dnd5eAdapter honors CONFIG.DND5E.currencies when present', async () =>
 });
 
 test('M6: custom dynamic currency config converts through derived factors', async () => {
-  const config = { cp: { conversion: 0.02 }, gp: { conversion: 1 } };
-  assert.deepEqual(dndCurrencyFactors(config), { cp: 1, gp: 50 });
+  // A GM-configured non-default rate: 1 gp = 50 cp and 1 sp = 10 cp. The factors
+  // are derived as conversion.cp / conversion[d], never hardcoded.
+  const config = { cp: { conversion: 50 }, sp: { conversion: 5 }, gp: { conversion: 1 } };
+  assert.deepEqual(dndCurrencyFactors(config), { cp: 1, sp: 10, gp: 50 });
   assert.equal(formatCopperAsGP(105, config), '2.1');
   assert.equal(formatCopperAsGP(125, config), '2.5');
 
@@ -2241,7 +2250,7 @@ test('M6: custom dynamic currency config converts through derived factors', asyn
 });
 
 test('M6: getAdapter forwards a currencyConfig to the dnd5e adapter', async () => {
-  const adapter = getAdapter('dnd5e', { currencyConfig: { cp: { conversion: 0.02 }, gp: { conversion: 1 } } });
+  const adapter = getAdapter('dnd5e', { currencyConfig: { cp: { conversion: 50 }, gp: { conversion: 1 } } });
   assert.ok(adapter instanceof Dnd5eAdapter);
   const actor = createMockActor({ currency: { gp: 2, cp: 5 } });
   assert.equal(await adapter.getBalance(actor), 105);
@@ -2261,9 +2270,9 @@ test('M6: malformed conversion, inexact ratio and overflow fail closed before an
   await assert.rejects(() => inexact.debit(b, 1), /factor|whole number/);
   assert.equal(b.patchLog.length, 0, 'no patch applied');
 
-  // factor overflow (1 gp / 1e-18 cp overflows a safe integer)
+  // factor overflow (1e25 copper per gp overflows a safe integer)
   const overflow = new Dnd5eAdapter({
-    currencyConfig: { cp: { conversion: '0.000000000000000001' }, gp: { conversion: 1 } },
+    currencyConfig: { cp: { conversion: '10000000000000000000000000' }, gp: { conversion: 1 } },
   });
   const c = createMockActor({ currency: { gp: 1 } });
   await assert.rejects(() => overflow.debit(c, 1), /safe integer|factor/);
@@ -2271,7 +2280,7 @@ test('M6: malformed conversion, inexact ratio and overflow fail closed before an
 });
 
 test('M6: an unknown currency denomination with nonzero balance is rejected', async () => {
-  const adapter = new Dnd5eAdapter({ currencyConfig: { cp: { conversion: 0.02 }, gp: { conversion: 1 } } });
+  const adapter = new Dnd5eAdapter({ currencyConfig: { cp: { conversion: 50 }, gp: { conversion: 1 } } });
   // ep is not configured and carries a nonzero balance -> reject.
   const actor = createMockActor({ currency: { gp: 1, ep: 1 } });
   await assert.rejects(() => adapter.getBalance(actor), /unknown currency/);
@@ -2281,7 +2290,7 @@ test('M6: an unknown currency denomination with nonzero balance is rejected', as
 });
 
 test('M6: item price rejects fractional minor units and overflow under a dynamic factor', async () => {
-  const adapter = new Dnd5eAdapter({ currencyConfig: { cp: { conversion: 0.02 }, gp: { conversion: 1 } } });
+  const adapter = new Dnd5eAdapter({ currencyConfig: { cp: { conversion: 50 }, gp: { conversion: 1 } } });
   // 0.03 gp * 50 cp/gp = 1.5 cp -> not representable.
   await assert.rejects(
     () => adapter.getItemPrice({ system: { price: { value: 0.03, denomination: 'gp' } } }),
@@ -2306,6 +2315,106 @@ test('M6: item price rejects fractional copper exactly with no tolerance', async
   // A large exact integer value still converts to an exact safe integer.
   const ok = await adapter.getItemPrice({ system: { price: { value: 1000000, denomination: 'gp' } } });
   assert.equal(ok.minorUnits, 100000000, '1000000 gp is exactly 100000000 cp');
+});
+
+test('M6: purchase succeeds and debits once under the live official CONFIG', async () => {
+  const saved = globalThis.CONFIG;
+  globalThis.CONFIG = {
+    DND5E: {
+      currencies: {
+        pp: { conversion: 0.1 },
+        gp: { conversion: 1 },
+        ep: { conversion: 2 },
+        sp: { conversion: 10 },
+        cp: { conversion: 100 },
+      },
+    },
+  };
+  try {
+    const store = createMockStore();
+    store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+    const actor = createMockActor({ currency: { gp: 1 } });
+    const adapter = new Dnd5eAdapter();
+    const originalDebit = adapter.debit.bind(adapter);
+    let debitCount = 0;
+    adapter.debit = async (a, amount) => {
+      debitCount += 1;
+      return originalDebit(a, amount);
+    };
+    const commerce = createCommerce(
+      makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter })
+    );
+    const result = await commerce.purchase(
+      { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, requestId: 'req1', userId: 'user1' },
+      'gm1'
+    );
+    assert.equal(result.status, 'committed');
+    assert.equal(debitCount, 1, 'debits exactly once');
+    assert.equal(actor.system.currency.gp, 0, '1 gp spent on a 100-cp item');
+    const ledger = getLedgerForUser(store, 'user1:');
+    assert.ok(ledger, 'a ledger record exists');
+    assert.equal(ledger.status, 'committed');
+    assert.equal(ledger.totalPrice, 100);
+  } finally {
+    if (saved === undefined) delete globalThis.CONFIG;
+    else globalThis.CONFIG = saved;
+  }
+});
+
+test('M6: a raw purchase exception is sanitized but the ledger keeps the diagnostic', async () => {
+  // The real-world bug scenario: the adapter throws a raw `[market] ...` detail
+  // while reading the balance. Commerce records a failed ledger carrying the
+  // bounded `balance-read-failed` code and returns the raw detail on the result;
+  // the public projection (and the chat content) expose only the bounded code,
+  // never the raw adapter message.
+  const store = createMockStore();
+  store._shops.set('shop1', makeShop({ price: 100, quantity: 10 }));
+  const actor = createMockActor({ currency: { gp: 1 } });
+  const failing = new Dnd5eAdapter();
+  failing.getBalance = async () => {
+    throw new Error("[market] currency 'gp' factor (100 / 1) is not a whole number of copper");
+  };
+  const commerce = createCommerce(
+    makeCommerceCtx({ store, actor, itemSource: makeSourceItem(), adapter: failing })
+  );
+
+  // The raw commerce result keeps the bounded code AND the raw diagnostic detail.
+  const raw = await commerce.purchase(
+    { shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, requestId: 'req1', userId: 'user1' },
+    'gm1'
+  );
+  assert.equal(raw.status, 'failed');
+  assert.equal(raw.error, 'balance-read-failed');
+  assert.ok(raw.detail.includes('whole number of copper'), 'raw detail retained for GM diagnosis');
+
+  // The GM-only ledger retains the diagnostic error code.
+  const ledger = getLedgerForUser(store, 'user1:');
+  assert.ok(ledger, 'a ledger record exists');
+  assert.equal(ledger.error, 'balance-read-failed');
+  assert.equal(actor.system.currency.gp, 1, 'no charge on a failed read');
+
+  // The player-facing projection and chat never leak the raw adapter message.
+  const safe = publicPurchaseResult(raw);
+  assert.equal(safe.error, 'balance-read-failed');
+  assert.equal(safe.status, 'failed');
+  assert.ok(!('detail' in safe), 'raw detail stripped from the public projection');
+  assert.equal(buildResponseContent({ type: 'purchase', result: safe }), 'Purchase failed (balance-read-failed).');
+});
+
+test('M6: an unknown/raw purchase error collapses to server-error in response and chat', async () => {
+  const commerce = {
+    purchase: async () => ({ status: 'error', error: new Error('[market] something exploded at runtime') }),
+  };
+  const ctx = makeMessageCtx({ commerce });
+  const data = await handleMarketChatMessage(
+    makePurchaseMessage({ shopId: 'shop1', entryId: 'entry1', actorId: 'actor1', quantity: 1, requestId: 'req' }),
+    'user1',
+    ctx
+  );
+  assert.equal(data.type, 'purchase');
+  assert.equal(data.result.error, 'server-error', 'raw error collapses to server-error');
+  assert.equal(buildResponseContent(data), 'Purchase failed (server-error).');
+  assert.ok(!data.result.error.includes('exploded'), 'no raw text leaks into the response');
 });
 
 // --------------------------------------------------------------- store default

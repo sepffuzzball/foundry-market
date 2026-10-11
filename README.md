@@ -50,29 +50,37 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.7`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.8`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.7/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.8/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
 
-> **With `0.1.6` installed, a market map marker click may open the Journal sheet
-> instead of the storefront.** The `activateNote` handler previously read only
-> `note.document.flags.market.shopId`, so a market marker whose Note carried no
-> such flag (e.g. a Market journal dragged from the Journal sidebar, or a
-> directly-created marker) fell through to the default Journal sheet. This
-> **prospective `0.1.7` prerelease** routes a marker click via the linked
-> `MarketShop` journal when the Note flags are absent - and it is **not yet
-> re-confirmed on a live Foundry VTT 14 install** (live retest is still pending).
-> The `0.1.7` `download` URL is live only once the `0.1.7` release has been
-> published - the release action must upload `module.zip` and `module.json` to the
-> GitHub release for tag `0.1.7`. Until then, install the module by pointing
-> Foundry at this repository directory as a module source (the manifest and
-> `src/core/main.js` are unchanged), or download the zip from the published
-> `0.1.7` release once it is available.
+> **`0.1.7` was published as a patch prerelease** (it fixed the map-marker click
+> routing: `handleActivateNote` resolves the shop id from the linked
+> `MarketShop` journal when the Note flags are absent). **However, `0.1.7` could
+> still fail a live dnd5e purchase with `balance-read-failed`**, because
+> `Dnd5eAdapter` misread `CONFIG.DND5E.currencies[d].conversion` - which is
+> **UNITS PER GP** (e.g. `cp.conversion === 100`, `gp.conversion === 1`) - as a
+> GP-per-unit value, so the derived gold factor was inverted and the wallet
+> normalization threw. The **prospective `0.1.8` patch prerelease** corrects the
+> conversion interpretation (the per-denomination copper factor is now
+> `conversion.cp / conversion[d]`) and sanitizes the purchase failure reporting,
+> but it is **not yet re-confirmed on a live Foundry VTT 14 install** (user live
+> retest is still pending - see `docs/smoke-test.md` section 22). The `0.1.8`
+> `download` URL is live only once the `0.1.8` release has been published - the
+> release action must upload `module.zip` and `module.json` to the GitHub release
+> for tag `0.1.8`. Until then, install the module by pointing Foundry at this
+> repository directory as a module source (the manifest and `src/core/main.js`
+> are unchanged), or download the zip from the published `0.1.7` release once it
+> is available. **Diagnosing a purchase failure:** the per-user purchase ledger
+> Journal (`Ledger:<user>:<requestId>`, created by the default store) is the
+> expected **GM-private** audit/idempotency record - one per request - not an
+> extra sale and not a bug. Check that journal's `error`/`detail` fields rather
+> than treating each `Ledger:` entry as a spurious transaction.
 
 ### Enable in a world
 
@@ -117,11 +125,13 @@ game.modules.get('market').api.openManager();
 read from `system.price.value`/`denomination`, so no configuration is needed
 beyond Items whose price is set. Since M6 the conversion is **data-driven**: the
 adapter reads the live `CONFIG.DND5E.currencies` (or an explicit
-`opts.currencyConfig`) and converts each denomination by its exact GP value per
-unit (e.g. `cp.conversion === 0.01`) using exact BigInt rationals - never binary
-float rounding - so a GM-configured exchange rate is honoured while every
-existing integer-copper record reads/writes unchanged. A config whose ratios do
-not resolve to whole copper pieces fails closed before any wallet write.
+`opts.currencyConfig`) and treats each denomination's `conversion` as UNITS per
+gold piece (e.g. `cp.conversion === 100` means 100 copper = 1 gp), deriving the
+per-denomination copper factor as `conversion.cp / conversion[d]` using exact
+BigInt rationals - never binary float rounding - so a GM-configured exchange rate
+is honoured while every existing integer-copper record reads/writes unchanged.
+A config whose ratios do not resolve to whole copper pieces fails closed before
+any wallet write.
 
 ```js
 game.modules.get('market').api.getAdapter('dnd5e'); // supported
@@ -432,10 +442,11 @@ generic path - never an invented one.
   `details`/`compensation`/`outcome`.
 - **M6 dynamic dnd5e currency conversion** (`src/adapters/index.js`): the
   `Dnd5eAdapter` no longer hardcodes copper factors. It reads the live
-  `CONFIG.DND5E.currencies` (or an explicit `opts.currencyConfig`) and converts
-  each denomination by its exact GP-per-unit `conversion` using BigInt rationals
-  and exact decimal parsing (including scientific notation) - never binary float
-  rounding - with safe-integer overflow detection and fail-closed normalization
+  `CONFIG.DND5E.currencies` (or an explicit `opts.currencyConfig`) and treats
+  each denomination's `conversion` as UNITS per gold piece, deriving the copper
+  factor as `conversion.cp / conversion[d]` using BigInt rationals and exact
+  decimal parsing (including scientific notation) - never binary float rounding -
+  with safe-integer overflow detection and fail-closed normalization
   (a missing `cp`/`gp`, a non-finite/non-positive or fractional-copper factor
   throws before any wallet write). The legacy `DENOMINATIONS`/
   `DENOMINATION_FACTOR` exports and the canonical default that reproduces the
@@ -540,11 +551,12 @@ shop for the storefront to use it.
 The Marketplace is currency-agnostic: prices are stored as integer **minor
 units** (the smallest currency unit). For dnd5e the minor unit is copper, and
 since M6 the copper factors are read dynamically from the live
-`CONFIG.DND5E.currencies` (or `opts.currencyConfig`) using exact GP-per-unit
-conversion - never a hardcoded table, never float rounding - so a GM-configured
-exchange rate is honoured while existing integer-copper records read/write
-unchanged. For generic systems you choose the integer scale and configure the
-paths.
+`CONFIG.DND5E.currencies` (or `opts.currencyConfig`), treating each
+denomination's `conversion` as UNITS per gold piece and deriving the copper
+factor as `conversion.cp / conversion[d]` - never a hardcoded table, never float
+rounding - so a GM-configured exchange rate is honoured while existing
+integer-copper records read/write unchanged. For generic systems you choose the
+integer scale and configure the paths.
 
 Settings (world-scoped, under `market`):
 

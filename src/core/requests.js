@@ -76,11 +76,66 @@ export function pickFields(obj, fields) {
 }
 
 /**
+ * Allowlisted stable error codes a public purchase result may expose verbatim.
+ * Mirrors `SELL_RESULT_ERROR_CODES` on the purchase path: any raw adapter or
+ * store exception message, an internal detail string, or an unknown future code
+ * collapses to the generic `server-error`, so a player never sees a stack trace
+ * or a `[market] ...` detail.
+ */
+const PURCHASE_RESULT_ERROR_CODES = new Set([
+  'server-error',
+  'missing-entry-id',
+  'missing-request-id',
+  'not-a-gm',
+  'shop-not-found',
+  'actor-not-found',
+  'actor-not-owned',
+  'entry-not-found',
+  'invalid-world-time',
+  'shop-closed',
+  'entry-hidden',
+  'insufficient-stock',
+  'rep-read-failed',
+  'entry-restricted',
+  'total-overflow',
+  'service-refused',
+  'adapter-unsupported',
+  'balance-read-failed',
+  'insufficient-funds',
+  'merchant-funds-overflow',
+  'ledger-read-failed',
+  'ledger-create-failed',
+  'ledger-write-failed',
+  'ledger-pending',
+  'conflicting duplicate payload',
+  'ledger-commit-missing',
+]);
+
+/**
+ * Map an arbitrary purchase-result error to a stable, bounded code. Mirrors
+ * `sanitizeSellResultError`: a known code is kept verbatim, a known code with an
+ * internal detail after a colon keeps only the bounded prefix, and any raw
+ * exception message / detail string / unknown code collapses to `server-error`.
+ * A null/undefined error produces `undefined` so the public `error` property
+ * stays present with a safe value. Never echoes a stack trace or a
+ * `[market] ...` detail to a player.
+ */
+function sanitizePurchaseResultError(error) {
+  if (error == null) return undefined;
+  const value = typeof error === 'string' ? error : String(error);
+  if (PURCHASE_RESULT_ERROR_CODES.has(value)) return value;
+  const prefix = value.split(':')[0].trim();
+  if (PURCHASE_RESULT_ERROR_CODES.has(prefix)) return prefix;
+  return 'server-error';
+}
+
+/**
  * Reduce a raw commerce purchase result to the safe, allowlisted response
  * fields. Never leaks the raw ledger record (replay/conflict `record`,
  * `existing`, `expected`, `conflict`, etc.) regardless of the internal
  * commerce outcome. Only `{status, ledgerId, error, total, quantity,
- * compensation}` is ever exposed.
+ * compensation}` is ever exposed, and `error` is always a stable bounded code
+ * (see `sanitizePurchaseResultError`), never a raw exception message.
  */
 export function publicPurchaseResult(result = {}) {
   const record = result.record || {};
@@ -88,7 +143,7 @@ export function publicPurchaseResult(result = {}) {
   return {
     status: result.status,
     ledgerId: result.ledgerId ?? record.id ?? existing.id,
-    error: result.error,
+    error: sanitizePurchaseResultError(result.error),
     total: result.total ?? record.totalPrice ?? existing.totalPrice,
     quantity: result.quantity ?? record.quantity ?? existing.quantity,
     compensation: result.compensation ?? record.compensation ?? existing.compensation,
@@ -1024,7 +1079,13 @@ export function buildRequestContent(payload = {}) {
 export function buildResponseContent(data = {}) {
   if (data?.type === 'catalog') return 'Market catalog.';
   if (data?.type === 'purchase') {
-    const status = data.result?.status || 'error';
+    const result = data.result || {};
+    const status = result.status || 'error';
+    // Any purchase outcome that carries an error code (failed / needsRecovery /
+    // conflict / pending / error) reports ONLY a stable bounded code - never a
+    // raw exception message - in the chat content.
+    const code = result.error == null ? undefined : sanitizePurchaseResultError(result.error);
+    if (code != null) return `Purchase failed (${code}).`;
     return `Purchase ${status}.`;
   }
   return 'Market response.';

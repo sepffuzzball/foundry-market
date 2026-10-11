@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.7`).
+  `download` release pointers, with `version` `0.1.8`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -141,7 +141,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.7/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.8/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -169,18 +169,29 @@ published** as a prerelease (tag `0.1.5`), so its download URL is live and
 installable - but its storefront is broken: the GM "View storefront" path throws
 a Handlebars parse error because `templates/shop.hbs` left a `{{#if}}` block
 unterminated (see `docs/smoke-test.md` section 6). That parse failure was fixed in
-the **`0.1.6` patch prerelease**, which has been published and installed. A further
-routing gap remains: with `0.1.6` installed, a market map marker click may open the
-Journal sheet instead of the storefront, because the `activateNote` handler
-previously read only `note.document.flags.market.shopId` from the Note itself. This
-**`0.1.7` patch prerelease** routes a marker click via the linked `MarketShop`
-journal when the Note flags are absent (`handleActivateNote` now resolves the shop
-id from the Note's own flags and, when those are absent, from the linked
-JournalEntry). It is **not yet re-confirmed on a live Foundry VTT 14 install**, and
-the `0.1.7` download URL is live only once that tag's `release` job completes and
-publishes the `0.1.7` GitHub release. Until then, install by pointing Foundry at
-the repo directory as a module source, or from the published `0.1.6` release
-(which carries the storefront fix but not the marker-routing fix).
+the **`0.1.6` patch prerelease**, which has been published and installed. The
+**`0.1.7` patch prerelease** was then **published** too (tag `0.1.7`): it routes a
+market map marker click via the linked `MarketShop` journal when the Note flags
+are absent (`handleActivateNote` now resolves the shop id from the Note's own
+flags and, when those are absent, from the linked JournalEntry). That marker-routing
+fix is **not yet re-confirmed on a live Foundry VTT 14 install**.
+
+However, a **live dnd5e purchase with `0.1.7` could still fail with
+`balance-read-failed`**, because `Dnd5eAdapter` misread
+`CONFIG.DND5E.currencies[d].conversion` - which is **UNITS PER GP** (official
+release-6.0.5: cp 100, sp 10, ep 2, gp 1, pp 0.1) - as a GP-per-unit value, so the
+derived gold factor was inverted and the wallet normalization threw. The
+**prospective `0.1.8` patch prerelease** corrects the conversion interpretation
+(the per-denomination copper factor is now `conversion.cp / conversion[d]`) and
+sanitizes the purchase failure reporting (`publicPurchaseResult` collapses any raw
+adapter/store exception to a bounded code, and the player chat reads
+`Purchase failed (<code>).` - never a raw `[market] ...` detail). It is **not yet
+re-confirmed on a live Foundry VTT 14 install** (user live retest is still
+pending - see `docs/smoke-test.md` section 22), and the `0.1.8` download URL is
+live only once that tag's `release` job completes and publishes the `0.1.8`
+GitHub release. Until then, install by pointing Foundry at the repo directory as a
+module source, or from the published `0.1.7` release (which carries the marker
+routing and storefront fixes but not the conversion fix).
 
 ### Known issues / caveats
 
@@ -201,9 +212,9 @@ the repo directory as a module source, or from the published `0.1.6` release
   **not yet re-confirmed on a live Foundry VTT 14 install** - see
   `docs/smoke-test.md` section 6, which remains the manual real-runtime check and
   should not be marked live-tested until retested there.
-- The map-marker click routing is fixed only in this **prospective `0.1.7`
-  patch prerelease** and is **not yet re-confirmed on a live Foundry VTT 14
-  install**. With `0.1.6` installed, a market map marker click may open the
+- The map-marker click routing is fixed in the **published `0.1.7` patch
+  prerelease** and is **not yet re-confirmed on a live Foundry VTT 14 install**.
+  With `0.1.6` installed, a market map marker click may open the
   Journal sheet instead of the storefront, because the `activateNote` handler
   previously read only the Note's own `flags.market.shopId`. `handleActivateNote`
   now resolves the shop id from the Note's own flags and, when those are absent,
@@ -214,6 +225,19 @@ the repo directory as a module source, or from the published `0.1.6` release
   storefront; a direct click on the market JournalEntry in the Journal directory is
   a separate, intentionally unhandled path that still opens the plain Journal
   sheet. Run `docs/smoke-test.md` section 6 before trusting the marker routing.
+- A **live dnd5e purchase with `0.1.7` reportedly failed with `balance-read-failed`**:
+  `Dnd5eAdapter` misread `CONFIG.DND5E.currencies[d].conversion` - which is
+  **UNITS PER GP**, not GP per unit - so the derived copper/gold factor was
+  inverted and the wallet normalization threw. This is fixed in the **prospective
+  `0.1.8` patch prerelease** (the copper factor is now `conversion.cp /
+  conversion[d]`), but it is **not yet re-confirmed on a live Foundry VTT 14
+  install** - run `docs/smoke-test.md` section 22, purchasing a 1 gp /
+  low-priced item and confirming one debit / one delivery / a committed ledger
+  record, and a failed purchase surfacing only a bounded safe code. **Note:** the
+  per-user purchase ledger Journal (`Ledger:<user>:<requestId>`, created by the
+  default store) is the expected **GM-private** audit/idempotency record - one
+  per request - not an extra sale or a bug; diagnose a failure via that journal's
+  `error`/`detail` fields rather than treating each `Ledger:` entry as spurious.
 - The `Daggerheart` adapter only reports support once the GM configures the
   generic adapter path settings; `DC20` and `Twodsix` are first-class and report
   support regardless (use `getAdapter('generic', config)` for a custom generic
@@ -1827,19 +1851,25 @@ resolved and covered by the test suite:
   claimed; verifying and hardening this against two live GM clients is deferred
   to M6 testing.
 
-## Milestone 6 - Dynamic dnd5e currency conversion, system adapters, portable backup & M6 review (implemented locally; live Foundry VTT 14 smoke pending)
+## Milestone 6 - Dynamic dnd5e currency conversion, system adapters, portable backup & M6 review (real live failure diagnosed; code fix offline-tested; retest pending)
 
-M6 is **implemented locally and Node-tested, but not yet verified against a live
-Foundry VTT 14 install** - so it is **not** claimed complete until the user runs
-the corresponding smoke sections on a real v14 runtime and confirms the
-behavior. The M6 work covers several independent slices. First, it removes the
-hardcoded dnd5e copper factors from `Dnd5eAdapter` and makes currency conversion
-data-driven from a validated GP-per-unit table, so a campaign that runs a custom
-exchange rate (for example the canonical default `cp: 0.01`, a COS-style
-`cp: 0.02`, or the live `CONFIG.DND5E.currencies`) is respected without any code
-change; the adoption curve is preserved, the canonical fallback reproduces the
-legacy factors exactly, and all existing integer-copper records continue to read
-and write unchanged. Second, it adds a pure portable import/export backup format
+A **live purchase failure** was reported and diagnosed: a purchase surfaced as
+`balance-read-failed` because `Dnd5eAdapter` read
+`CONFIG.DND5E.currencies[d].conversion` - which is UNITS PER GP (official
+release-6.0.5: cp 100, sp 10, ep 2, gp 1, pp 0.1) - as a GP-per-unit value, so
+the derived gold factor was 1/100 instead of 100 and the wallet normalization
+threw. The conversion factor math and the purchase failure reporting are now
+corrected and covered by the automated Node suite; the live smoke retest is
+still pending. M6 is otherwise **implemented locally and Node-tested**, so it is
+**not** claimed complete until the user runs the corresponding smoke sections on
+a real v14 runtime and confirms the behavior. The M6 work covers several
+independent slices. First, it removes the hardcoded dnd5e copper factors from
+`Dnd5eAdapter` and makes currency conversion data-driven from a validated
+UNITS-per-gp table, so a campaign that runs a custom exchange rate (for example
+the canonical default `cp: 100`, a COS-style `cp: 50`, or the live
+`CONFIG.DND5E.currencies`) is respected without any code change; the adoption
+curve is preserved, the canonical fallback reproduces the legacy factors exactly,
+and all existing integer-copper records continue to read and write unchanged. Second, it adds a pure portable import/export backup format
 (`src/storage/backup-format.js`) that validates and normalizes a self-contained
 GM-private backup of every location and shop and plans a collision-safe import
 into a target world, plus the GM-only portable backup service
@@ -1854,20 +1884,22 @@ Node-tested only - no live verification has been run.
 
 - **Dynamic currency config (`opts.currencyConfig`).** `Dnd5eAdapter` accepts an
   optional `currencyConfig` getter or object. Each denomination must be
-  `{ conversion: <GP value per unit> }` (a positive finite decimal). When
+  `{ conversion: <units per gold piece> }` (a positive finite decimal). When
   omitted, the adapter reads the live `CONFIG?.DND5E?.currencies`, whose
-  `conversion` is already the GP value per unit (e.g. cp.conversion === 0.01,
-  gp.conversion === 1), and passes it through with no reciprocal; if no usable
-  `CONFIG` is present it falls back to a canonical default
-  (`{ pp: 10, gp: 1, ep: 0.5, sp: 0.1, cp: 0.01 }`) that reproduces the legacy
-  factors.
+  `conversion` is already UNITS PER GP (e.g. cp.conversion === 100,
+  gp.conversion === 1, pp.conversion === 0.1), and passes it through with no
+  reciprocal; if no usable `CONFIG` is present it falls back to a canonical
+  default (`{ pp: 0.1, gp: 1, ep: 2, sp: 10, cp: 100 }`) that reproduces the
+  legacy factors.
 - **Exact, fail-closed normalization.** The config is normalized per operation
   into per-denomination copper factors using BigInt rational arithmetic
-  (`conversion[d] / conversion.cp`). Normalization throws before any wallet
-  update on: a missing `cp`/`gp`, a non-finite or non-positive conversion, a
-  factor that is not a positive safe integer, a `gp` factor below 1, or a ratio
-  that is not a whole number of copper. Unknown denominations with a nonzero
-  balance are rejected; unknown zero balances are ignored.
+  (`conversion.cp / conversion[d]`, the UNITS-per-gp direction - never the GP-
+  per-unit reciprocal that caused the live `balance-read-failed`). Normalization
+  throws before any wallet update on: a missing `cp`/`gp`, a non-finite or
+  non-positive conversion, a factor that is not a positive safe integer, a `gp`
+  factor below 1, or a ratio that is not a whole number of copper. Unknown
+  denominations with a nonzero balance are rejected; unknown zero balances are
+  ignored.
 - **Factor-driven wallet and items.** `getBalance` / `debit` / `credit` read and
   write every configured denomination using its factor (no fixed
   `cp`/`sp`/`ep`/`gp`/`pp` constants remain), decompose balances greedily in
@@ -1886,6 +1918,16 @@ Node-tested only - no live verification has been run.
   copper factors, and `formatCopperAsGP(copper, config)` renders an integer
   copper amount as an exact decimal GP string (BigInt-backed, no float error).
   `DENOMINATIONS` and `DENOMINATION_FACTOR` remain for legacy callers.
+- **Purchase failure reporting is sanitized.** `publicPurchaseResult` collapses
+  any raw adapter/store exception or unknown detail to a bounded `server-error`
+  code (preserving known codes like `balance-read-failed` and
+  `insufficient-funds`), and the player chat content reads `Purchase failed
+  (<code>).` - never a raw `[market] ...` message. **Note:** the per-user purchase
+  ledger Journal (`Ledger:<user>:<requestId>`, created by the default store) is
+  the expected **GM-private** idempotency record - one per request - not an extra
+  sale and not a bug. Diagnosing a purchase failure therefore means checking that
+  journal's `error`/`detail` fields, not treating each `Ledger:` entry as a
+  spurious transaction.
 - **Portable import/export backup format (`src/storage/backup-format.js`).** A
   pure, Node-importable, no-store-write module that validates and normalizes a
   `foundry-market-portable` backup (`{ format, formatVersion: 1, locations,
@@ -2062,12 +2104,17 @@ Node-tested only - no live verification has been run.
 
 - **Live Foundry VTT 14 smoke.** The dynamic conversion behavior (CONFIG-driven
   read, the COS-style custom-rate rosette, and the GP-equivalent formatter) has
-  only been exercised in Node unit tests; confirm on a real v14 runtime that a
-  GM-configured exchange rate drives wallet/item conversion and that no
-  existing integer-copper records break. The portable backup format's
-  validate + import-plan flow is likewise only Node-tested; confirm on a live
-  v14 runtime that a normalized backup's exports can be verified and that the
-  planned import ids/references are accepted by the real store.
+  only been exercised in Node unit tests, and a real-live purchase reported
+  `balance-read-failed` from the misread GP-per-unit reciprocal. The code fix
+  (UNITS-per-gp factor math plus sanitized purchase failure reporting) is
+  offline-tested; the retest is pending. Confirm on a real v14 runtime that a
+  GM-configured exchange rate drives wallet/item conversion and that no existing
+  integer-copper records break, and that a purchase under the live
+  `CONFIG.DND5E.currencies` no longer surfaces a raw `[market] ...` detail. The
+  portable backup format's validate + import-plan flow is likewise only
+  Node-tested; confirm on a live v14 runtime that a normalized backup's exports
+  can be verified and that the planned import ids/references are accepted by the
+  real store.
 - **No UI surface.** Currency configuration is supplied to the adapter via
   `opts.currencyConfig`; there is no manager/storefront control for a GM to
   edit a conversion table in-game yet. (The portable backup now has a manager

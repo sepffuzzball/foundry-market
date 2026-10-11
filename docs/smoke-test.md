@@ -11,7 +11,7 @@ with a fresh world where you can discard the data. You need at least two browser
 clients (one on an **active GM** user, one on a **player** user). The player
 client is the one that exercises the storefront.
 
-This checklist targets the current **0.1.7** prerelease. **No live Foundry VTT
+This checklist targets the current **0.1.8** prerelease. **No live Foundry VTT
 14 verification has been run yet** for M1-M6 - the automated `npm test` suite
 only mocks the Foundry boundaries, so every section below is the intended manual
 real-runtime check and nothing here has yet been confirmed on a live install.
@@ -1043,23 +1043,52 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 
 ## 22. M6 - Dynamic dnd5e currency conversion and system adapters (live runtime)
 
-> **Status: Node-tested only.** The dynamic dnd5e CONFIG-driven conversion, the
-> DC20/Twodsix runtime adapters and the Daggerheart-configured-generic adapter are
-> verified by the automated `npm test` suite in Node. This section is the intended
-> real-runtime check on a live v14 install.
+> **Status: real live failure diagnosed; code fix offline-tested; `0.1.8`
+> retest pending.** A live purchase with `0.1.7` surfaced as `balance-read-failed`
+> because the adapter misread `CONFIG.DND5E.currencies[d].conversion` (which is
+> UNITS PER GP) as GP per unit. The conversion math and purchase failure reporting
+> have been corrected in this **`0.1.8` prerelease** and are verified by the
+> automated `npm test` suite in Node; this section is the intended real-runtime
+> check on a live v14 install. **Note:** the per-user purchase ledger Journal
+> (`Ledger:<user>:<requestId>`, created by the default store) is the expected
+> **GM-private** audit/idempotency record - one per request - not an extra sale or
+> a bug. Diagnose a purchase failure via that journal's `error`/`detail` fields
+> rather than treating each `Ledger:` entry as a spurious transaction.
 
-### 22.1 dnd5e dynamic CONFIG conversion
+### 22.1 dnd5e dynamic CONFIG conversion and live 1 gp purchase
 
 1. As the **GM**, use a dnd5e 6.x world. Configure a non-default currency config
    via `opts.currencyConfig` (or rely on the live `CONFIG.DND5E.currencies`).
 2. As the **player**, buy an item and confirm the wallet debit and the item price
    are read through the conversion table.
+3. As the **player**, purchase a **low-priced item** (e.g. a 1 gp item -
+   `system.price.value: 1`, denomination `gp`) and confirm the wallet is debited
+   **exactly once**, the Item is delivered **exactly once**, and a
+   **committed** ledger record exists. In the GM client, locate the per-request
+   ledger Journal (`Ledger:<user>:<requestId>`, created by the default store) and
+   confirm it reports `committed` - this GM-private journal is the expected
+   audit/idempotency record, one per request, **not** an extra sale or a bug.
+4. Force a purchase failure (e.g. an item costing more than the actor's wallet, or
+   the `balance-read-failed` path) and confirm the player-facing storefront/whisper
+   reports **only a stable bounded code** (e.g. `Purchase failed
+   (balance-read-failed).`) - never a raw stack trace or a `[market] ...` detail.
+   Inspect the same GM-private ledger journal's `error`/`detail` for the real
+   diagnostic; the ledger is where you look, not the chat.
 
 **Expected**
 
 - The read/write uses the live `CONFIG.DND5E.currencies` factors: each
-  denomination's `conversion` is the GP value per unit (e.g. `cp.conversion ===
-  0.01`, `gp.conversion === 1`) and is used directly - no reciprocal is applied.
+  denomination's `conversion` is UNITS PER GP (e.g. `cp.conversion === 100`,
+  `gp.conversion === 1`, `pp.conversion === 0.1`) and the copper factor is
+  derived as `conversion.cp / conversion[d]` - never confused with a GP-per-unit
+  reciprocal.
+- A 1 gp / low-priced dnd5e purchase records **one** wallet debit, **one** item
+  delivery and a **committed** ledger record - the `Ledger:<user>:<requestId>`
+  GM-private journal. That journal is the expected per-request audit/idempotency
+  record, not an extra transaction.
+- A failing purchase surfaces only a bounded safe code in the player-facing
+  content (never a raw exception message / `[market] ...` detail), while the
+  GM-private ledger Journal retains the diagnostic `error`/`detail`.
 - No existing integer-copper records break under a GM-configured exchange rate.
 - All factor math uses exact decimal-string BigInt rationals, never binary float
   rounding; a config whose ratios do not resolve to whole copper pieces fails
