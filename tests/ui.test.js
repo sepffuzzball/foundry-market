@@ -2859,17 +2859,139 @@ test('storefront _prepareContext derives priceLines and relationship modifierTex
   const lines = ctx.inventory[0].priceLines;
   assert.ok(Array.isArray(lines), 'priceLines derived from the breakdown');
   const byLabel = Object.fromEntries(lines.map((l) => [l.label, l.value]));
-  assert.equal(byLabel['Base price'], '100');
+  assert.equal(byLabel['Base price'], '100 cp');
   assert.equal(byLabel['Shop adjustment'], '+15%');
   assert.equal(byLabel['Reputation adjustment'], '+40%');
   assert.equal(byLabel['Total adjustment'], '+55%');
-  assert.equal(byLabel['Final price'], '155');
+  assert.equal(byLabel['Final price'], '1.55 gp');
   assert.equal(ctx.relationship.title, 'Hated');
   assert.equal(ctx.relationship.score, -100);
   assert.ok(ctx.relationship.modifierText.includes('Hated'), 'modifierText derived from the band');
   assert.ok(ctx.relationship.modifierText.includes('+40%'), 'modifierText reflects the quote');
   assert.ok(!('partyId' in ctx.relationship), 'no private party id leaked');
   assert.ok(!('priceLines' in app._data.inventory[0]), 'raw inventory entry untouched');
+});
+
+test('storefront projects dnd5e cp/gp display prices without mutating raw data', () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: {} });
+  app._data.selectedActorId = 'a1';
+  app._data.shop = {
+    id: 'shop1',
+    appearance: {},
+    open: true,
+    services: [{ id: 's1', name: 'Rations', price: 1000 }],
+    specials: [{ id: 'sp1', title: 'Bundle', description: '', entryId: 'e1', price: 150 }],
+  };
+  const priceBreakdown = {
+    quantity: 1,
+    unitBase: 100,
+    baseTotal: 100,
+    shopBps: 1500,
+    personalityBps: 0,
+    reputationBps: 0,
+    haggleBps: 0,
+    adjustmentBps: 1500,
+    unitPrice: 155,
+    total: 155,
+    band: { title: 'Neutral', threshold: 0 },
+  };
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', category: 'C', price: 100, basePrice: 90, quantity: 1, stockMode: 'finite', priceBreakdown },
+    { id: 'e2', name: 'Sword', category: 'C', price: 50000, quantity: 1, stockMode: 'finite' },
+    { id: 'e3', name: 'Odd', category: 'C', price: 101, quantity: 1, stockMode: 'finite' },
+    { id: 'e4', name: 'Free', category: 'C', price: 0, quantity: 1, stockMode: 'finite' },
+  ];
+  app._data.cartLines = [{ entryId: 'e1', quantity: 2, specialId: '' }];
+  const ctx = app._prepareContext();
+
+  // Card / detail display fields render cp/gp from the raw copper integer.
+  assert.equal(ctx.inventory[0].priceDisplay, '100 cp');
+  assert.equal(ctx.inventory[0].basePriceDisplay, '90 cp');
+  assert.equal(ctx.inventory[1].priceDisplay, '500 gp');
+  assert.equal(ctx.inventory[2].priceDisplay, '1.01 gp');
+  assert.equal(ctx.inventory[3].priceDisplay, '0 cp');
+
+  // Breakdown lines carry the complete formatted amount with a unit.
+  const lines = ctx.inventory[0].priceLines;
+  const byLabel = Object.fromEntries(lines.map((l) => [l.label, l.value]));
+  assert.equal(byLabel['Base price'], '100 cp');
+  assert.equal(byLabel['Final price'], '1.55 gp');
+
+  // Selected entry detail projections.
+  app._data.selectedEntryId = 'e1';
+  const detailCtx = app._prepareContext();
+  assert.equal(detailCtx.selectedEntry.priceDisplay, '100 cp');
+  assert.equal(detailCtx.selectedEntry.basePriceDisplay, '90 cp');
+
+  // Service / special display prices projected from their raw price.
+  assert.equal(ctx.shop.services[0].displayPrice, '10 gp');
+  assert.equal(ctx.shop.specials[0].displayPrice, '1.5 gp');
+
+  // Cart line and cart total display use the complete formatted amount.
+  assert.equal(ctx.cartLines[0].totalDisplay, '2 gp');
+  assert.equal(ctx.cartTotalDisplay, '2 gp');
+
+  // Raw `_data` is untouched: numeric fields intact and no display projections
+  // leaked onto the raw catalog / shop records.
+  assert.equal(app._data.inventory[0].price, 100);
+  assert.equal(app._data.inventory[1].price, 50000);
+  assert.ok(!('priceDisplay' in app._data.inventory[0]), 'raw entry has no priceDisplay');
+  assert.equal(app._data.shop.services[0].price, 1000);
+  assert.ok(!('displayPrice' in app._data.shop.services[0]), 'raw service not projected');
+  assert.equal(app._data.shop.specials[0].price, 150);
+  assert.ok(!('displayPrice' in app._data.shop.specials[0]), 'raw special not projected');
+});
+
+test('storefront preserves numeric value for a non-dnd5e system', () => {
+  const app = new MarketStorefront({ shopId: 'shop1', deps: { systemId: () => 'twodsix' } });
+  app._data.selectedActorId = 'a1';
+  app._data.shop = {
+    id: 'shop1',
+    appearance: {},
+    open: true,
+    services: [{ id: 's1', name: 'Rations', price: 1000 }],
+    specials: [{ id: 'sp1', title: 'Bundle', description: '', entryId: 'e1', price: 150 }],
+  };
+  const priceBreakdown = {
+    quantity: 1,
+    unitBase: 100,
+    baseTotal: 100,
+    shopBps: 1500,
+    unitPrice: 155,
+    total: 155,
+  };
+  app._data.inventory = [
+    { id: 'e1', name: 'Potion', category: 'C', price: 100, basePrice: 90, quantity: 1, stockMode: 'finite', priceBreakdown },
+  ];
+  app._data.cartLines = [{ entryId: 'e1', quantity: 2, specialId: '' }];
+  const ctx = app._prepareContext();
+
+  assert.equal(ctx.inventory[0].priceDisplay, '100');
+  assert.equal(ctx.inventory[0].basePriceDisplay, '90');
+  const lines = ctx.inventory[0].priceLines;
+  const byLabel = Object.fromEntries(lines.map((l) => [l.label, l.value]));
+  assert.equal(byLabel['Base price'], '100');
+  assert.equal(byLabel['Final price'], '155');
+  assert.equal(ctx.shop.services[0].displayPrice, '1000');
+  assert.equal(ctx.shop.specials[0].displayPrice, '150');
+  assert.equal(ctx.cartLines[0].totalDisplay, '200');
+  assert.equal(ctx.cartTotalDisplay, '200');
+});
+
+test('storefront falls back to raw cp when the dnd5e formatter fails', () => {
+  const saved = globalThis.CONFIG;
+  globalThis.CONFIG = { DND5E: { currencies: {} } };
+  try {
+    const app = new MarketStorefront({ shopId: 'shop1', deps: {} });
+    app._data.inventory = [
+      { id: 'e1', name: 'Potion', category: 'C', price: 100, quantity: 1, stockMode: 'finite' },
+    ];
+    const ctx = app._prepareContext();
+    assert.equal(ctx.inventory[0].priceDisplay, '100 cp');
+  } finally {
+    if (saved === undefined) delete globalThis.CONFIG;
+    else globalThis.CONFIG = saved;
+  }
 });
 
 test('storefront rejects a purchase on a canBuy false (Hated) entry', async () => {

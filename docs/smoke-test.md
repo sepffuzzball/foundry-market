@@ -11,7 +11,7 @@ with a fresh world where you can discard the data. You need at least two browser
 clients (one on an **active GM** user, one on a **player** user). The player
 client is the one that exercises the storefront.
 
-This checklist targets the current **0.1.10** prerelease. **No live Foundry VTT
+This checklist targets the current **0.1.11** prerelease. **No live Foundry VTT
 14 verification has been run yet** for M1-M6 - the automated `npm test` suite
 only mocks the Foundry boundaries, so every section below is the intended manual
 real-runtime check and nothing here has yet been confirmed on a live install.
@@ -1048,7 +1048,7 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 > because the adapter misread `CONFIG.DND5E.currencies[d].conversion` (which is
 > UNITS PER GP) as GP per unit. The conversion math and purchase failure reporting
 > were corrected in the **published `0.1.8` prerelease** (carried forward into
-> this `0.1.10` prerelease) and are verified by the automated `npm test` suite in
+> this `0.1.11` prerelease) and are verified by the automated `npm test` suite in
 > Node; this section is the intended real-runtime check on a live v14 install.
 > **The `0.1.9` live retest appeared to fail but was diagnosed as a stale
 > browser-loaded adapter module, not a code bug** - the browser served a cached
@@ -1129,6 +1129,45 @@ real-runtime check and nothing here has yet been confirmed on a live install.
 - After configuring the generic paths, the adapter reports support and the
   storefront can transact. Daggerheart has no native item price, so no price path
   is invented - only the GM-configured generic path is used.
+
+### 22.4 dnd5e storefront price display (cp vs gp)
+
+> **Status: Node-tested only; live confirmation pending.** This is the
+> **prospective `0.1.11` patch prerelease**. The storefront now projects dnd5e
+> entry prices **display-only** through `formatDnd5eDisplayPrice`: an amount
+> strictly above one gold piece renders as an exact decimal gp string (50000 cp ->
+> '500 gp', 101 cp -> '1.01 gp') and every other amount stays in copper (100 cp ->
+> '100 cp'). The conversion never changes the amount charged or the amount a GM
+> typed - the raw numeric `price`/`total` fields, the request payloads and the
+> ledger/copper arithmetic are untouched, so sorting and the GM's input price are
+> unchanged. It also never replaces the user's prior live purchase/folder/page
+> success (sections 7, 23.1-23.6, 26) - those remain valid; only the `>1 gp`
+> storefront rendering is still pending a live retest.
+
+1. As the **GM**, in a dnd5e 6.x world, add an inventory entry named e.g.
+   **Banded Mail** whose copper price is above 100 cp (e.g. 50000 cp), plus a
+   value at or below 100 cp (e.g. 100 cp) and a boundary value of exactly 101 cp.
+2. As the **player**, open the storefront and confirm the card/detail price, the
+   price breakdown Base/Final amounts, any service/special offer and the cart
+   line/total all render with a unit (e.g. '500 gp', '10 gp', '1.5 gp') and never
+   a bare number followed by a separate label.
+3. Confirm **Banded Mail at 50000 cp renders as '500 gp'**, a **101 cp entry
+   renders as '1.01 gp'**, and a **100 cp entry stays '100 cp'** (and 0 cp stays
+   '0 cp'); confirm a non-dnd5e system (e.g. twodsix) still shows the numeric
+   value and its label exactly as before.
+4. Confirm the GM's stored copper price and the wallet debit for the same purchase
+   are unchanged - the rendered '500 gp' is display-only and never alters the
+   numeric `price`/`total` or the amount charged.
+
+**Expected**
+
+- A dnd5e entry above 100 cp displays as an exact decimal gp string (50000 cp ->
+  '500 gp'); a 101 cp entry renders '1.01 gp'; 100 cp and 0 cp stay '100 cp' /
+  '0 cp'.
+- The numeric `price`/`total` still drive sorting and the request payload and the
+  amount charged; no display string is ever sent to the GM and the GM's input
+  copper price is unchanged.
+- A non-dnd5e storefront display is unchanged.
 
 ## 23. Ledger folder organizer (GM-only folder hierarchy)
 

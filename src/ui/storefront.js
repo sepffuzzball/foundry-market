@@ -7,6 +7,7 @@
 // current user owns (`actor.testUserPermission(game.user, OWNER)`).
 
 import { makeId, ACCENT_COLOR_RE, sanitizeMediaPath } from '../services/model.js';
+import { formatDnd5eDisplayPrice } from '../adapters/index.js';
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
 
@@ -165,13 +166,27 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     // `_data.inventory`, which M1 tests and purchase/catalog logic read.
     const list = this._catalogEntries();
     const id = this._data.selectedEntryId;
-    // Add a safe, display-only `priceLines` array to each entry so the template
-    // never needs to interpret a raw price breakdown. The raw `_data.inventory`
-    // entries (and their validated `priceBreakdown`) stay untouched.
-    const entries = list.map((e) => ({ ...e, priceLines: this._priceLinesFor(e) }));
+    // Add safe, display-only projections to each entry so the template never
+    // needs to interpret a raw price, base price or breakdown. `priceDisplay` /
+    // `basePriceDisplay` are the player-facing formatted amounts (cp/gp for
+    // dnd5e, otherwise the numeric value with the currency label) and `priceLines`
+    // is the human-readable breakdown. The raw `_data.inventory` entries (and
+    // their validated `priceBreakdown`) stay untouched so sorting, requests and
+    // copper comparisons keep reading the numeric fields.
+    const entries = list.map((e) => ({
+      ...e,
+      priceDisplay: this._formatDisplayPrice(e.price),
+      ...(e.basePrice != null
+        ? { basePriceDisplay: this._formatDisplayPrice(e.basePrice) }
+        : {}),
+      priceLines: this._priceLinesFor(e),
+    }));
     const selectedEntry = (id && entries.find((e) => e.id === id)) || null;
     return {
       ...this._data,
+      // Overlay the display-projected shop (services/specials `displayPrice`)
+      // without mutating `_data.shop`.
+      shop: this._projectShop(this._data.shop),
       inventory: entries,
       categories: this._catalogCategories(),
       selectedEntry,
@@ -191,6 +206,7 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       // annotates it rather than presenting the total as a firm quote.
       cartLines: this._cartDisplay(),
       cartTotal: this._cartTotal(),
+      cartTotalDisplay: this._formatDisplayPrice(this._cartTotal()),
       cartEstimate: !this._data.selectedActorId,
       sellItems: this._sellableItems(),
       barterItems: this._sellableItems(),
@@ -256,7 +272,9 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
     if (!pd || typeof pd !== 'object') return [];
     const out = [];
     const base = pd.unitBase ?? pd.baseTotal;
-    if (typeof base === 'number') out.push({ label: 'Base price', value: String(base) });
+    if (typeof base === 'number') {
+      out.push({ label: 'Base price', value: this._formatDisplayPrice(base) });
+    }
     const components = [
       ['Shop', pd.shopBps],
       ['Personality', pd.personalityBps],
@@ -272,7 +290,9 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
       out.push({ label: 'Total adjustment', value: this._bpsLabel(pd.adjustmentBps) });
     }
     const final = pd.unitPrice ?? pd.total;
-    if (typeof final === 'number') out.push({ label: 'Final price', value: String(final) });
+    if (typeof final === 'number') {
+      out.push({ label: 'Final price', value: this._formatDisplayPrice(final) });
+    }
     return out;
   }
 
@@ -327,6 +347,56 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
   _systemId() {
     if (this._deps.systemId) return this._deps.systemId();
     return String(game?.system?.id || '');
+  }
+
+  /**
+   * Format a numeric copper amount for player-facing display. For dnd5e the
+   * amount is rendered through the exact gp-vs-cp display helper, so a price
+   * strictly above one gold piece shows as a decimal gp string and everything
+   * else stays in copper (100 cp stays '100 cp', 101 cp is '1.01 gp'). For any
+   * other system the raw numeric value is preserved and the configured currency
+   * label is appended (e.g. '1500 cp'), matching the storefront's prior behavior
+   * exactly. A formatter failure (e.g. a malformed CONFIG) falls back to the raw
+   * value with the 'cp' label so the storefront never renders a blank price.
+   * This is display-only: the numeric `price`/`total` fields and `this._data`
+   * are never changed, so sorting, requests and copper comparisons stay intact.
+   */
+  _formatDisplayPrice(value) {
+    const n = Number(value);
+    const label = this._currencyLabel();
+    if (this._systemId() === 'dnd5e') {
+      try {
+        return formatDnd5eDisplayPrice(n);
+      } catch (err) {
+        return `${n} cp`;
+      }
+    }
+    return label ? `${n} ${label}` : String(n);
+  }
+
+  /**
+   * Project a shop for display only, returning a shallow copy whose services and
+   * specials carry a `displayPrice` (the player-facing formatted amount). The raw
+   * numeric `shop.services[].price` / `shop.specials[].price` values are left
+   * untouched on `this._data.shop`, so server-side requests and ledger arithmetic
+   * never read a display string.
+   */
+  _projectShop(shop) {
+    if (!shop) return shop;
+    const out = { ...shop };
+    if (Array.isArray(shop.services)) {
+      out.services = shop.services.map((s) => ({
+        ...s,
+        displayPrice: this._formatDisplayPrice(s.price),
+      }));
+    }
+    if (Array.isArray(shop.specials)) {
+      out.specials = shop.specials.map((s) => ({
+        ...s,
+        displayPrice: this._formatDisplayPrice(s.price),
+      }));
+    }
+    return out;
   }
 
   _hasActiveGM() {
@@ -1095,6 +1165,7 @@ export class MarketStorefront extends HandlebarsApplicationMixin(ApplicationV2) 
         quantity: qty,
         unitPrice,
         total: unitPrice * qty,
+        totalDisplay: this._formatDisplayPrice(unitPrice * qty),
         specialId: line.specialId || '',
       });
     }

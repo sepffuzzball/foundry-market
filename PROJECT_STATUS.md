@@ -17,7 +17,7 @@ smoke checklist in `docs/smoke-test.md` is the intended real-runtime check.
 
 - Manifest `module.json` (id `market`, Foundry 14 min/verified/max, ES modules,
   `socket: false`, `styles: ["styles/market.css"]`, plus `manifest`/`url`/
-  `download` release pointers, with `version` `0.1.10`).
+  `download` release pointers, with `version` `0.1.11`).
 - UI wiring (`src/ui/manager.js`, `src/ui/storefront.js`,
   `src/canvas/placements.js`): a GM-only market manager, a player storefront and
   canvas shop markers, all built on `HandlebarsApplicationMixin(ApplicationV2)`.
@@ -184,7 +184,7 @@ manifest URL; the manifest in turn carries the download URL used to fetch the
 module zip.
 
 - Manifest URL (install): `https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json`
-- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.10/module.zip`
+- Download URL (from the manifest): `https://github.com/sepffuzzball/foundry-market/releases/download/0.1.11/module.zip`
 
 The release is driven by `.github/workflows/release.yml`, which runs on pushes to
 `main`, on tags matching `[0-9]*`, and on `workflow_dispatch`. The `build` job
@@ -255,24 +255,44 @@ code is correct; the retest hit browser/Foundry module caching, not
 `balance-read-failed`. After any update, hard-refresh / reopen ALL Foundry tabs
 and clients and then run a NEW purchase rather than trusting an attempt made by
 the previously cached adapter.
-**The prospective `0.1.10` prerelease** adds the GM-readable purchase ledger
-pages (`src/storage/ledger-summary.js`): each ledger journal gains a module-owned
-`Purchase summary` text page (rendered escaped HTML) showing status / attempted
-buy / shop / quantity / quoted copper unit-total (or `Not quoted` for a pre-quote
-failure) / reason + diagnostic detail on failure / compensation / timestamps,
-with names best-effort and ids as fallback; the record persists an optional
-bounded `detail` string (max 500 chars) that is never sent to players, the sync
-is best-effort/non-blocking and never fails the ledger write, it is serialized
-per journal so a committed render always wins, and the startup / GM-handover
-sweep backfills a summary for existing journals. That sweep only reads and
-renders - it never replays or re-executes an old transaction, so an old failed
+**The `0.1.10` prerelease was published** (tag `0.1.10`), adding the GM-readable
+purchase ledger pages (`src/storage/ledger-summary.js`): each ledger journal gains
+a module-owned `Purchase summary` text page (rendered escaped HTML) showing status
+/ attempted buy / shop / quantity / quoted copper unit-total (or `Not quoted` for
+a pre-quote failure) / reason + diagnostic detail on failure / compensation /
+timestamps, with names best-effort and ids as fallback; the record persists an
+optional bounded `detail` string (max 500 chars) that is never sent to players,
+the sync is best-effort/non-blocking and never fails the ledger write, it is
+serialized per journal so a committed render always wins, and the startup /
+GM-handover sweep backfills a summary for existing journals. That sweep only reads
+and renders - it never replays or re-executes an old transaction, so an old failed
 purchase is left exactly as recorded and never charged again, and the diagnostic
-`detail` lives only on the GM-private page/record (never in player chat). The
-`0.1.10` download URL is live only once that tag's `release` job completes and
-publishes the `0.1.10` GitHub release. Until then, install by pointing Foundry at
-the repo directory as a module source, or from the published `0.1.9` release
-(which carries the folder organizer but not the GM-readable purchase ledger
-pages).
+`detail` lives only on the GM-private page/record (never in player chat).
+**The prospective `0.1.11` patch prerelease** adds the M6 dnd5e storefront
+display-only **`>1 gp` formatting**: for dnd5e the player storefront renders an
+entry price strictly above one gold piece as an exact decimal gp string (50000 cp
+-> `'500 gp'`, 101 cp -> `'1.01 gp'`) and every other amount stays in copper
+(100 cp -> `'100 cp'`, 0 cp -> `'0 cp'`), through the exported
+`formatDnd5eDisplayPrice(copper, config?)` formatter. The conversion is
+**display-only** and data-driven through the same validated
+`CONFIG.DND5E.currencies` / `opts.currencyConfig` factors: the raw numeric
+`price`/`total` fields, the request payloads, the sort order and the ledger /
+copper arithmetic are never changed, so **the amount a player is charged and the
+amount a GM typed are unchanged** by the rendered label. The rendering is
+**offline / Node-tested only** (covered by the automated `npm test` suite); a
+live Foundry VTT 14 confirmation is **still pending** - the intended real-runtime
+check is `docs/smoke-test.md` section 22.4, including a live retest of an entry
+named e.g. **Banded Mail at 50000 cp rendering as `'500 gp'`** and the boundary
+cases **100 cp staying `'100 cp'`** and **101 cp rendering `'1.01 gp'`**. This
+patch prerelease is **prospective until the `0.1.11` tag is published**: the
+`0.1.11` download URL is live only once that tag's `release` job completes and
+publishes the `0.1.11` GitHub release. Until then, install by pointing Foundry at
+the repo directory as a module source, or from the published `0.1.10` release
+(which carries the folder organizer and the GM-readable purchase ledger pages but
+not the dnd5e storefront `>1 gp` formatting). It does **not** claim to replace the
+user's prior live purchase/folder/page success - the user-reported live results
+(sections 7, 23.1-23.6, 26 of `docs/smoke-test.md`) are retained and remain valid;
+only the live dnd5e `>1 gp` storefront rendering is still pending.
 
 ### Known issues / caveats
 
@@ -2025,6 +2045,22 @@ Node-tested only - no live verification has been run.
   copper factors, and `formatCopperAsGP(copper, config)` renders an integer
   copper amount as an exact decimal GP string (BigInt-backed, no float error).
   `DENOMINATIONS` and `DENOMINATION_FACTOR` remain for legacy callers.
+- **M6 storefront dnd5e price display (`formatDnd5eDisplayPrice`).**
+  `src/adapters/index.js` now exports
+  `formatDnd5eDisplayPrice(copper, config?)`, which renders a dnd5e player-facing
+  price **display-only**: an amount strictly above one gold piece (the configured
+  `factors.gp` threshold) is an exact decimal gp string with a unit (50000 cp ->
+  '500 gp'), and every other amount stays in copper (100 cp -> '100 cp', 0 cp ->
+  '0 cp'). The storefront (`src/ui/storefront.js`, `templates/shop.hbs`) uses it
+  for dnd5e only, projecting `priceDisplay`/`basePriceDisplay` on catalog cards
+  and detail, `displayPrice` on services/specials, `totalDisplay` on cart lines
+  and `cartTotalDisplay` on the cart total, plus the price-breakdown Base/Final
+  amounts; the raw numeric `price`/`total` fields and the private `_data` are
+  never touched, so sorting, request payloads, ledger arithmetic and copper
+  comparisons are unchanged. A non-dnd5e system keeps the numeric value and its
+  existing label, and a formatter error falls back to the raw copper value with
+  the `cp` label rather than a blank price. Node-tested only; pending a live
+  Foundry VTT 14 confirmation.
 - **Purchase failure reporting is sanitized.** `publicPurchaseResult` collapses
   any raw adapter/store exception or unknown detail to a bounded `server-error`
   code (preserving known codes like `balance-read-failed` and
@@ -2218,6 +2254,10 @@ Node-tested only - no live verification has been run.
   GM-configured exchange rate drives wallet/item conversion and that no existing
   integer-copper records break, and that a purchase under the live
   `CONFIG.DND5E.currencies` no longer surfaces a raw `[market] ...` detail. The
+  storefront dnd5e price display (cp/gp) is likewise Node-tested only; confirm on
+  a live v14 runtime that an entry above 100 cp renders as an exact decimal gp
+  string, that 100 cp / 0 cp stay in copper, and that the raw numeric prices
+  still drive sorting, request payloads and copper arithmetic. The
   portable backup format's validate + import-plan flow is likewise only
   Node-tested; confirm on a live v14 runtime that a normalized backup's exports
   can be verified and that the planned import ids/references are accepted by the

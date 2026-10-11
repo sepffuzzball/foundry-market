@@ -583,17 +583,36 @@ export function dndCurrencyFactors(config) {
 }
 
 // Format `copper` (integer copper pieces) as an exact decimal GP string. GP is
-// `copper / (cp units per gp)` because `conversion.cp` is how many copper pieces
-// equal one gold piece; no floating point is involved. A ratio that cannot be
-// rendered exactly as a terminating decimal (never a clean 2^a*5^b denominator)
-// fails closed rather than truncating.
+// `copper / factors.gp` - `factors.gp` is the validated cp-per-gp factor derived
+// from the currency config (`conversion.cp / conversion.gp`, exact BigInt
+// rational), i.e. the number of copper pieces equal to one gold piece. Using the
+// validated factor (rather than `conversion.cp` alone) keeps GP exact even when a
+// custom CONFIG sets `gp.conversion` to something other than 1; no floating point
+// is involved. A ratio that cannot be rendered exactly as a terminating decimal
+// (never a clean 2^a*5^b denominator) fails closed rather than truncating.
 export function formatCopperAsGP(copper, config) {
   const n = toNonNegativeInteger(copper, 'copper');
-  const { cpConv } = normalizeCurrencyConfig(config);
-  const cpRational = decimalToRational(cpConv);
-  const valueNum = BigInt(n) * cpRational.den;
-  const valueDen = cpRational.num;
+  const { factors } = normalizeCurrencyConfig(config);
+  const valueNum = BigInt(n);
+  const valueDen = BigInt(factors.gp);
   return rationalToDecimalString(valueNum, valueDen);
+}
+
+// Format an integer copper amount for the player-facing dnd5e storefront. If the
+// amount is strictly greater than one gold piece (the configured `factors.gp`
+// threshold, i.e. how many copper make one gp), it is rendered as an exact decimal
+// GP string with a unit; otherwise it is rendered as a copper count. The threshold
+// is strict: 100 cp stays '100 cp' and 101 cp is '1.01 gp'. Invalid copper or a
+// malformed config throws rather than rendering a wrong unit. When `config` is
+// omitted the validated live CONFIG.DND5E.currencies / canonical defaults are used.
+export function formatDnd5eDisplayPrice(copper, config) {
+  const n = toNonNegativeInteger(copper, 'copper');
+  const resolved = config == null ? foundryCurrencyConfig() : config;
+  const { factors } = normalizeCurrencyConfig(resolved);
+  if (n > factors.gp) {
+    return `${formatCopperAsGP(n, resolved)} gp`;
+  }
+  return `${n} cp`;
 }
 
 // Canonical dnd5e UNITS-PER-GP defaults (1 gp = 100 cp, 1 gp = 10 sp, 1 gp = 2

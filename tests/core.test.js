@@ -42,6 +42,7 @@ import {
   priceValueToCopper,
   dndCurrencyFactors,
   formatCopperAsGP,
+  formatDnd5eDisplayPrice,
 } from '../src/adapters/index.js';
 import {
   createCommerce,
@@ -2268,6 +2269,75 @@ test('M6: canonical currency config reproduces legacy copper factors', () => {
   assert.deepEqual(dndCurrencyFactors(config), { cp: 1, sp: 10, ep: 50, gp: 100, pp: 1000 });
   assert.equal(formatCopperAsGP(125, config), '1.25');
   assert.equal(formatCopperAsGP(1250, config), '12.5');
+});
+
+test('M6: formatDnd5eDisplayPrice renders gp above the strict 1 gp threshold', () => {
+  const config = {
+    cp: { conversion: 100 },
+    sp: { conversion: 10 },
+    ep: { conversion: 2 },
+    gp: { conversion: 1 },
+    pp: { conversion: 0.1 },
+  };
+  // Strict `>` threshold derived from factors.gp: 100 cp stays copper, and an
+  // amount above one gold piece is rendered as an exact decimal gp string.
+  assert.equal(formatDnd5eDisplayPrice(100, config), '100 cp');
+  assert.equal(formatDnd5eDisplayPrice(0, config), '0 cp');
+  assert.equal(formatDnd5eDisplayPrice(101, config), '1.01 gp');
+  assert.equal(formatDnd5eDisplayPrice(50000, config), '500 gp');
+});
+
+test('M6: formatDnd5eDisplayPrice obeys a custom units-per-gp config', () => {
+  const custom = { cp: { conversion: 50 }, sp: { conversion: 5 }, gp: { conversion: 1 } };
+  // The threshold is factors.gp = 50: 50 cp stays copper and 75 cp is 1.5 gp.
+  assert.equal(formatDnd5eDisplayPrice(50, custom), '50 cp');
+  assert.equal(formatDnd5eDisplayPrice(75, custom), '1.5 gp');
+});
+
+test('M6: GP display uses the validated cp-per-gp factor, never copper/cpConv', () => {
+  // A custom CONFIG whose gp.conversion is not 1: conversion.cp=100 and
+  // conversion.gp=2 give factor[gp]=50, so one gold piece is 50 copper. GP must be
+  // rendered from the validated factors.gp (copper / factors.gp), not from
+  // conversion.cp alone (which would wrongly render 100 cp as '1 gp').
+  const config = {
+    cp: { conversion: 100 },
+    gp: { conversion: 2 },
+    sp: { conversion: 10 },
+  };
+  assert.equal(formatCopperAsGP(100, config), '2');
+  assert.equal(formatCopperAsGP(75, config), '1.5');
+  assert.equal(formatCopperAsGP(50, config), '1');
+  // The storefront threshold is strict `>` over factors.gp = 50, so 50 cp stays
+  // copper while 100 cp and 75 cp render as exact decimal GP.
+  assert.equal(formatDnd5eDisplayPrice(50, config), '50 cp');
+  assert.equal(formatDnd5eDisplayPrice(100, config), '2 gp');
+  assert.equal(formatDnd5eDisplayPrice(75, config), '1.5 gp');
+});
+
+test('M6: GP display does not float-round a non-terminating ratio', () => {
+  // factor[gp] = 600 / 100 = 6 is a valid whole number of copper, but GP = 1 cp /
+  // 6 = 1/6 is a non-terminating decimal, so it fails closed rather than
+  // truncating. No float rounding error is ever produced.
+  const sixth = { cp: { conversion: 600 }, gp: { conversion: 100 } };
+  assert.equal(formatCopperAsGP(6, sixth), '1');
+  assert.throws(() => formatCopperAsGP(1, sixth), /non-terminating/);
+  // 7 cp > factor[gp]=6, so the storefront tries to render 7/6 gp and fails closed.
+  assert.throws(() => formatDnd5eDisplayPrice(7, sixth), /non-terminating/);
+});
+
+test('M6: formatDnd5eDisplayPrice rejects invalid copper and config', () => {
+  assert.throws(() => formatDnd5eDisplayPrice(-1), />= 0/);
+  assert.throws(() => formatDnd5eDisplayPrice(1.5), /safe integer/);
+  // A missing gp config fails closed rather than rendering a wrong unit.
+  assert.throws(
+    () => formatDnd5eDisplayPrice(200, { cp: { conversion: 100 } }),
+    /requires 'cp' and 'gp'/
+  );
+  // A non-positive conversion fails closed.
+  assert.throws(
+    () => formatDnd5eDisplayPrice(200, { cp: { conversion: 0 }, gp: { conversion: 1 } }),
+    /positive finite decimal/
+  );
 });
 
 test('M6: scientific-notation conversion strings parse exactly', () => {

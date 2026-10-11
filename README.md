@@ -50,11 +50,11 @@ runtime source.
    https://raw.githubusercontent.com/sepffuzzball/foundry-market/main/module.json
    ```
 
-   Foundry reads the manifest, which pins module id `market`, version `0.1.10`
+   Foundry reads the manifest, which pins module id `market`, version `0.1.11`
    and the **download URL** it uses to fetch the module zip:
 
    ```
-   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.10/module.zip
+   https://github.com/sepffuzzball/foundry-market/releases/download/0.1.11/module.zip
    ```
 
 3. Install, then enable the `market` module in the target world.
@@ -76,10 +76,10 @@ runtime source.
 > `balance-read-failed`. After any update, **hard-refresh / reopen ALL Foundry
 > tabs and clients** (not just the one that looks stale) and then perform a
 > **NEW purchase** rather than trusting an attempt made by the previously cached
-> adapter. The dnd5e conversion fix is carried forward into `0.1.10` but still
+> adapter. The dnd5e conversion fix is carried forward into `0.1.11` but still
 > needs a valid live retest (the `0.1.9` attempt was invalidated by the cache -
 > see `docs/smoke-test.md` section 22).
-> **The prospective `0.1.10` prerelease** adds the GM-readable purchase ledger
+> **The `0.1.10` prerelease was published** and adds the GM-readable purchase ledger
 > pages (see "Ledger summary page" below): each GM-private purchase-ledger
 > journal gains a module-owned `Purchase summary` text page with the status /
 > attempted buy / quoted copper price (or `Not quoted`) / failure reason and
@@ -88,20 +88,41 @@ runtime source.
 > active GM's `ready`/GM-handover sweep; that sweep only reads and renders - it
 > never replays or re-executes an old transaction, so an old failed purchase is
 > left exactly as recorded and never charged again, and the diagnostic `detail`
-> lives only on the GM-private page/record (never in player chat). This patch
-> does **not** claim a live purchase/folder/page success by itself - the real-
+> lives only on the GM-private page/record (never in player chat). It does **not**
+> claim a live purchase/folder/page success by itself - the real-
 > runtime confirmation is `docs/smoke-test.md` (see the adapter-cache and
-> ledger-page sections). The `0.1.10` `download` URL is live only once the
-> `0.1.10` release has been published - the release action must upload
-> `module.zip` and `module.json` to the GitHub release for tag `0.1.10`. Until
-> then, install the module by pointing Foundry at this repository directory as a
-> module source (the manifest and `src/core/main.js` are unchanged), or download
-> the zip from the published `0.1.9` release once it is available. **Diagnosing a
+> ledger-page sections). The `0.1.10` `download` URL is live (the release action
+> uploaded `module.zip` and `module.json` to the GitHub release for tag
+> `0.1.10`). **Diagnosing a
 > purchase failure:** the per-user purchase ledger Journal
 > (`Ledger:<user>:<requestId>`, created by the default store) is the expected
 > **GM-private** audit/idempotency record - one per request - not an extra sale
 > and not a bug. Check that journal's `error`/`detail` fields rather than treating
 > each `Ledger:` entry as a spurious transaction.
+> **The prospective `0.1.11` patch prerelease** adds the M6 dnd5e storefront
+> display-only **`>1 gp` formatting**: for dnd5e the player storefront renders an
+> entry price strictly above one gold piece as an exact decimal gp string (50000
+> cp -> `'500 gp'`, 101 cp -> `'1.01 gp'`) and every other amount stays in copper
+> (100 cp -> `'100 cp'`, 0 cp -> `'0 cp'`), through the exported
+> `formatDnd5eDisplayPrice(copper, config?)` formatter. The conversion is
+> **display-only** and data-driven through the same validated
+> `CONFIG.DND5E.currencies` / `opts.currencyConfig` factors: the raw numeric
+> `price`/`total` fields, the request payloads, the sort order and the ledger /
+> copper arithmetic are never changed, so **the amount a player is charged and the
+> amount a GM typed are unchanged** by the rendered label. The rendering is
+> **offline / Node-tested only** (covered by the automated `npm test` suite); a
+> live Foundry VTT 14 confirmation is **still pending** - the intended real-runtime
+> check is `docs/smoke-test.md` section 22.4, including a live retest of an entry
+> named e.g. **Banded Mail at 50000 cp rendering as `'500 gp'`** and the boundary
+> cases **100 cp staying `'100 cp'`** and **101 cp rendering `'1.01 gp'`**. This
+> patch prerelease is **prospective until the `0.1.11` tag is published**: the
+> `0.1.11` `download` URL is live only once the release action uploads
+> `module.zip` and `module.json` to the GitHub release for tag `0.1.11`. Until
+> then, install the module by pointing Foundry at this repository directory as a
+> module source, or from the published `0.1.10` release. It does **not** claim to
+> replace the user's prior live purchase/folder/page success - those are recorded
+> separately in `docs/smoke-test.md` (sections 7, 23.1-23.6, 26) and remain
+> valid; only the live dnd5e `>1 gp` storefront rendering is still pending.
 
 ### Enable in a world
 
@@ -559,6 +580,25 @@ generic path - never an invented one.
   `DENOMINATION_FACTOR` exports and the canonical default that reproduces the
   legacy factors are preserved, and `dndCurrencyFactors`/`formatCopperAsGP` are
   exported for callers.
+- **M6 storefront dnd5e price display** (`src/ui/storefront.js`,
+  `templates/shop.hbs`, `src/adapters/index.js`): for dnd5e the player storefront
+  now renders an entry price strictly above one gold piece as an exact decimal gp
+  string (e.g. 50000 cp -> '500 gp', 101 cp -> '1.01 gp') and every other amount
+  in copper (100 cp stays '100 cp', 0 cp stays '0 cp'), using the new exported
+  `formatDnd5eDisplayPrice(copper, config?)` formatter. The conversion is
+  **display-only** and data-driven through the same validated
+  `CONFIG.DND5E.currencies` / `opts.currencyConfig` factors: the card/detail
+  price and base price (`priceDisplay`/`basePriceDisplay`), the price-breakdown
+  Base/Final amounts, the service/special offers (`displayPrice`) and the cart
+  line/total (`totalDisplay`/`cartTotalDisplay`) are all projected as complete
+  formatted strings carrying a unit, while the raw numeric `price`/`total`
+  fields and the private `_data` are never touched - so sorting, request
+  payloads, ledger arithmetic and copper comparisons are unchanged. A non-dnd5e
+  system keeps the numeric value and its existing label exactly. A formatter
+  error falls back to the raw copper value with the `cp` label rather than a
+  blank price. Node-tested only; pending a live Foundry VTT 14 confirmation
+  (this is the prospective `0.1.11` patch prerelease - see the install note
+  above).
 - **M6 first-class system adapters (offline fixtures, runtime unverified)**:
   `DC20Adapter` (dc20rpg 0.10.7.0: `system.currency.{cp,sp,gp,pp}` in cp factors
   1/10/100/1000, item `system.price.{value,currency}` default `gp`,

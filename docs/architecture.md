@@ -562,7 +562,12 @@ Two module-level helpers are exported for callers that need the same math:
   (for the canonical default this is `{ cp: 1, sp: 10, ep: 50, gp: 100, pp: 1000 }`).
 - `formatCopperAsGP(copper, config)` - formats an integer copper amount as an
   exact decimal GP string (`125` with the canonical config -> `"1.25"`; with
-  `{ cp: { conversion: 50 }, gp: { conversion: 1 } }` -> `"2.5"`). A ratio that
+  `{ cp: { conversion: 50 }, gp: { conversion: 1 } }` -> `"2.5"`; with
+  `{ cp: { conversion: 100 }, gp: { conversion: 2 } }` -> `"2"`). The GP value is
+  always `copper / factors.gp` where `factors.gp` is the validated cp-per-gp
+  factor (the exact BigInt rational `conversion.cp / conversion.gp`), never
+  `copper / conversion.cp` - so a custom config whose `gp.conversion` is not `1`
+  still renders exact GP. A ratio that
   cannot be rendered as a terminating decimal (never a clean 2^a * 5^b
   denominator) fails closed rather than truncating.
   All arithmetic is BigInt-based, so no floating-point error is introduced.
